@@ -212,7 +212,7 @@ def _build_captcha_section() -> str:
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key}
+API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
 API base: https://api.capsolver.com
 
 CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
@@ -266,6 +266,15 @@ browser_evaluate function: () => {{{{
     const el = document.querySelector('[data-sitekey]');
     if (el) {{{{ r.type = 'recaptchav2'; r.sitekey = el.dataset.sitekey; }}}}
   }}}}
+  // 5. FunCaptcha (Arkose Labs)
+  if (!r.type) {{{{
+    const fc = document.querySelector('#FunCaptcha, [data-pkey], .funcaptcha');
+    if (fc) {{{{ r.type = 'funcaptcha'; r.sitekey = fc.dataset.pkey; }}}}
+  }}}}
+  if (!r.type && document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) {{{{
+    const el = document.querySelector('[data-pkey]');
+    if (el) {{{{ r.type = 'funcaptcha'; r.sitekey = el.dataset.pkey; }}}}
+  }}}}
   if (r.type) {{{{ r.url = url; return r; }}}}
   return null;
 }}}}
@@ -300,6 +309,7 @@ TASK_TYPE values (use EXACTLY these strings):
   recaptchav2  -> ReCaptchaV2TaskProxyLess
   recaptchav3  -> ReCaptchaV3TaskProxyLess
   turnstile    -> AntiTurnstileTaskProxyLess
+  funcaptcha   -> FunCaptchaTaskProxyLess
 
 PAGE_URL = the url from detect result. SITE_KEY = the sitekey from detect result.
 For recaptchav3: add "pageAction": "submit" to the task object (or the actual action found in page scripts).
@@ -368,6 +378,15 @@ browser_evaluate function: () => {{{{
   const inp = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
   if (inp) inp.value = token;
   if (window.turnstile) try {{{{ const w = document.querySelector('.cf-turnstile'); if (w) window.turnstile.getResponse(w); }}}} catch(e) {{{{}}}}
+  return 'injected';
+}}}}
+
+For FunCaptcha:
+browser_evaluate function: () => {{{{
+  const token = 'THE_TOKEN';
+  const inp = document.querySelector('#FunCaptcha-Token, input[name="fc-token"]');
+  if (inp) inp.value = token;
+  if (window.ArkoseEnforcement) try {{{{ window.ArkoseEnforcement.setConfig({{{{data: {{{{blob: token}}}}}}}}) }}}} catch(e) {{{{}}}}
   return 'injected';
 }}}}
 

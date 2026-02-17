@@ -117,3 +117,15 @@ sites:
   - name: "TopStartups"
     url: "https://topstartups.io/jobs/?job_location=Remote"
     type: static
+
+  - name: "Jobspresso"
+    url: "https://jobspresso.co/remote-work/remote-software-development/"
+    type: static
+
+  - name: "FlexJobs"
+    url: "https://www.flexjobs.com/remote-jobs/computer-it"
+    type: static
+
+  - name: "Otta"
+    url: "https://otta.com/jobs/all?title=software+engineer&remote=true"
+    type: search

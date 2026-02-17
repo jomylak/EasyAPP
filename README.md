@@ -46,7 +46,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 46 Workday employer portals + 28 direct career sites |
+| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences — only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job — reorganizes, emphasizes relevant experience, adds keywords. Never fabricates. |
@@ -101,7 +101,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 46 Workday employer portals (configurable in `employers.yaml`). Hits 28 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data → CSS selector patterns → AI-powered extraction for unknown layouts.
@@ -129,9 +129,7 @@ Claude Code launches a browser, navigates to each application page, detects the 
 
 - [x] Streaming pipeline (`--stream` — concurrent stages with DB as conveyor belt)
 
-### In Progress
-
-- [ ] Config parity with HydraCrawl (search queries, sites, CAPTCHA polish)
+- [x] Config parity with HydraCrawl (search queries, sites, CAPTCHA polish)
 
 ### Planned
 
