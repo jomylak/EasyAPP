@@ -147,13 +147,10 @@ def run_scoring(limit: int = 50, rescore: bool = False) -> dict:
 
         results.append(result)
 
-        if completed % 10 == 0 or completed == len(jobs):
-            elapsed = time.time() - t0
-            rate = completed / elapsed if elapsed > 0 else 0
-            log.info(
-                "%d/%d scored (%d errors) [%.1f jobs/sec]",
-                completed, len(jobs), errors, rate,
-            )
+        log.info(
+            "[%d/%d] score=%d  %s",
+            completed, len(jobs), result["score"], job.get("title", "?")[:60],
+        )
 
     # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()

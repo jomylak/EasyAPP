@@ -11,6 +11,12 @@ from rich.table import Table
 
 from applypilot import __version__
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 app = typer.Typer(
     name="applypilot",
     help="AI-powered end-to-end job application pipeline.",
