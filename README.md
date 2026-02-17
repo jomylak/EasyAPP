@@ -125,11 +125,11 @@ Claude Code launches a browser, navigates to each application page, detects the 
 ### Done
 
 - [x] Parallel auto-apply workers (`--workers N` — N Chrome instances, thread-safe job queue)
+- [x] Tiered setup wizard (lock/unlock features by installed dependencies)
 
 ### In Progress
 
-- [ ] Tiered setup wizard (lock/unlock features by installed dependencies)
-- [ ] Streaming pipeline (concurrent stages with DB as conveyor belt)
+- [ ] Streaming pipeline (`--stream` — concurrent stages with DB as conveyor belt)
 - [ ] Config parity with HydraCrawl (search queries, sites, CAPTCHA polish)
 
 ### Planned
