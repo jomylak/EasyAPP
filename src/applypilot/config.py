@@ -120,3 +120,83 @@ def load_env():
         load_dotenv(ENV_PATH)
     # Also try CWD .env as fallback
     load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Tier system — feature gating by installed dependencies
+# ---------------------------------------------------------------------------
+
+TIER_LABELS = {
+    1: "Discovery",
+    2: "AI Scoring & Tailoring",
+    3: "Full Auto-Apply",
+}
+
+TIER_COMMANDS: dict[int, list[str]] = {
+    1: ["init", "run discover", "run enrich", "status", "dashboard"],
+    2: ["run score", "run tailor", "run cover", "run pdf", "run"],
+    3: ["apply"],
+}
+
+
+def get_tier() -> int:
+    """Detect the current tier based on available dependencies.
+
+    Tier 1 (Discovery):            Python + pip
+    Tier 2 (AI Scoring & Tailoring): + LLM API key
+    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    """
+    load_env()
+
+    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    if not has_llm:
+        return 1
+
+    has_claude = shutil.which("claude") is not None
+    try:
+        get_chrome_path()
+        has_chrome = True
+    except FileNotFoundError:
+        has_chrome = False
+
+    if has_claude and has_chrome:
+        return 3
+
+    return 2
+
+
+def check_tier(required: int, feature: str) -> None:
+    """Raise SystemExit with a clear message if the current tier is too low.
+
+    Args:
+        required: Minimum tier needed (1, 2, or 3).
+        feature: Human-readable description of the feature being gated.
+    """
+    current = get_tier()
+    if current >= required:
+        return
+
+    from rich.console import Console
+    _console = Console(stderr=True)
+
+    missing: list[str] = []
+    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 3:
+        if not shutil.which("claude"):
+            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        try:
+            get_chrome_path()
+        except FileNotFoundError:
+            missing.append("Chrome/Chromium — install or set CHROME_PATH")
+
+    _console.print(
+        f"\n[red]'{feature}' requires {TIER_LABELS.get(required, f'Tier {required}')} (Tier {required}).[/red]\n"
+        f"Current tier: {TIER_LABELS.get(current, f'Tier {current}')} (Tier {current})."
+    )
+    if missing:
+        _console.print("\n[yellow]Missing:[/yellow]")
+        for m in missing:
+            _console.print(f"  - {m}")
+    _console.print()
+    raise SystemExit(1)

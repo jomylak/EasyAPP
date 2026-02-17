@@ -339,15 +339,34 @@ def run_wizard() -> None:
     _setup_auto_apply()
     console.print()
 
-    # Done
+    # Done — show tier status
+    from applypilot.config import get_tier, TIER_LABELS, TIER_COMMANDS
+
+    tier = get_tier()
+
+    tier_lines: list[str] = []
+    for t in range(1, 4):
+        label = TIER_LABELS[t]
+        cmds = ", ".join(f"[bold]{c}[/bold]" for c in TIER_COMMANDS[t])
+        if t <= tier:
+            tier_lines.append(f"  [green]✓ Tier {t} — {label}[/green]  ({cmds})")
+        elif t == tier + 1:
+            tier_lines.append(f"  [yellow]→ Tier {t} — {label}[/yellow]  ({cmds})")
+        else:
+            tier_lines.append(f"  [dim]✗ Tier {t} — {label}  ({cmds})[/dim]")
+
+    unlock_hint = ""
+    if tier == 1:
+        unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
+    elif tier == 2:
+        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+
     console.print(
         Panel.fit(
             "[bold green]Setup complete![/bold green]\n\n"
-            "Next steps:\n"
-            "  [bold]applypilot run discover[/bold]   — find jobs\n"
-            "  [bold]applypilot run[/bold]             — full pipeline (discover → cover letter)\n"
-            "  [bold]applypilot apply[/bold]           — autonomous applications\n"
-            "  [bold]applypilot status[/bold]          — view pipeline stats",
+            f"[bold]Your tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]\n\n"
+            + "\n".join(tier_lines)
+            + unlock_hint,
             border_style="green",
         )
     )

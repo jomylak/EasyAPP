@@ -96,17 +96,11 @@ def run(
             )
             raise typer.Exit(code=1)
 
-    # Validate LLM configuration for stages that need it
+    # Gate AI stages behind Tier 2
     llm_stages = {"score", "tailor", "cover"}
     if any(s in stage_list for s in llm_stages) or "all" in stage_list:
-        import os
-        has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
-        if not has_llm:
-            console.print(
-                "[red]No LLM configured.[/red] Stages 'score', 'tailor', and 'cover' require an AI provider.\n"
-                "Run [bold]applypilot init[/bold] to configure one, or set GEMINI_API_KEY / OPENAI_API_KEY in your .env file."
-            )
-            raise typer.Exit(code=1)
+        from applypilot.config import check_tier
+        check_tier(2, "AI scoring/tailoring")
 
     result = run_pipeline(
         stages=stage_list,
@@ -131,18 +125,11 @@ def apply(
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
-    import shutil as _shutil
-    from applypilot.config import PROFILE_PATH as _profile_path
+    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
-    # Check 1: Claude Code CLI
-    if not _shutil.which("claude"):
-        console.print(
-            "[red]Claude Code CLI not found.[/red]\n"
-            "Auto-apply requires Claude Code to drive browser interactions.\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]"
-        )
-        raise typer.Exit(code=1)
+    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
     if not _profile_path.exists():
