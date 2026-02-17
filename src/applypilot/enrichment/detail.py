@@ -15,6 +15,7 @@ import logging
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
@@ -47,24 +48,10 @@ def set_proxy(proxy_str: str | None):
 
 # -- URL resolution ----------------------------------------------------------
 
-SITE_BASE_URLS = {
-    "Job Bank Canada": "https://www.jobbank.gc.ca",
-    "CareerJet Canada": "https://www.careerjet.ca",
-    "BuiltIn Remote": "https://builtin.com",
-    "Hacker News Jobs": "https://news.ycombinator.com/",
-    "RemoteOK": None,
-    "WelcomeToTheJungle": None,
-    "Workopolis": "https://www.workopolis.com",
-    "WeWorkRemotely": "https://weworkremotely.com",
-    "Startup.jobs": "https://startup.jobs",
-    "Nodesk": "https://nodesk.co",
-    "Talent.com": "https://www.talent.com",
-    "JustRemote": "https://justremote.co",
-    "Arc.dev": "https://arc.dev",
-    "Himalayas": "https://himalayas.app",
-    "Techstars Jobs": "https://www.techstars.com",
-    "Randstad Canada": "https://www.randstad.ca/jobs/search/",
-}
+def _load_base_urls() -> dict[str, str | None]:
+    """Load site base URLs from config/sites.yaml."""
+    from applypilot.config import load_base_urls
+    return load_base_urls()
 
 
 def resolve_url(raw_url: str, site: str) -> str | None:
@@ -84,7 +71,7 @@ def resolve_url(raw_url: str, site: str) -> str | None:
     if site == "4DayWeek" and raw_url in ("/", "/jobs"):
         return None
 
-    base = SITE_BASE_URLS.get(site)
+    base = _load_base_urls().get(site)
     if not base:
         return None
 
@@ -705,8 +692,13 @@ def _run_detail_scraper(
     conn: sqlite3.Connection,
     sites: list[str] | None = None,
     max_per_site: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """Groups pending jobs by site and processes each batch.
+
+    Sequential by default. When workers > 1, processes multiple site batches
+    in parallel using ThreadPoolExecutor (each thread gets its own browser
+    and DB connection).
 
     Returns aggregate stats dict.
     """
@@ -727,7 +719,7 @@ def _run_detail_scraper(
             continue
         site_jobs.setdefault(site, []).append((url, title))
 
-    log.info("Pending: %d jobs across %d sites", len(rows), len(site_jobs))
+    log.info("Pending: %d jobs across %d sites (workers=%d)", len(rows), len(site_jobs), workers)
     for site, jobs in site_jobs.items():
         log.info("  %s: %d jobs", site, len(jobs))
 
@@ -740,21 +732,42 @@ def _run_detail_scraper(
 
     total_stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
 
-    for site in order:
-        jobs = site_jobs[site]
-        delay = SITE_DELAYS.get(site, 2.0)
-        log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
-
-        stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
-
+    def _merge_stats(stats: dict) -> None:
         for k in ("processed", "ok", "partial", "error"):
             total_stats[k] += stats[k]
         for t, count in stats["tiers"].items():
             total_stats["tiers"][t] = total_stats["tiers"].get(t, 0) + count
 
-        log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
-                 stats["ok"], stats["partial"], stats["error"],
-                 stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
+    if workers > 1 and len(order) > 1:
+        # Parallel mode: each site batch runs in its own thread with its own
+        # DB connection (conn=None tells scrape_site_batch to create one)
+        def _scrape_site(site: str) -> dict:
+            jobs = site_jobs[site]
+            delay = SITE_DELAYS.get(site, 2.0)
+            log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
+            stats = scrape_site_batch(None, site, jobs, delay=delay, max_jobs=max_per_site)
+            log.info("%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+                     site, stats["ok"], stats["partial"], stats["error"],
+                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
+            return stats
+
+        with ThreadPoolExecutor(max_workers=min(workers, len(order))) as pool:
+            futures = {pool.submit(_scrape_site, site): site for site in order}
+            for future in as_completed(futures):
+                _merge_stats(future.result())
+    else:
+        # Sequential mode (default)
+        for site in order:
+            jobs = site_jobs[site]
+            delay = SITE_DELAYS.get(site, 2.0)
+            log.info("%s -- %d jobs (delay=%.1fs)", site, len(jobs), delay)
+
+            stats = scrape_site_batch(conn, site, jobs, delay=delay, max_jobs=max_per_site)
+            _merge_stats(stats)
+
+            log.info("Site summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",
+                     stats["ok"], stats["partial"], stats["error"],
+                     stats["tiers"].get(1, 0), stats["tiers"].get(2, 0), stats["tiers"].get(3, 0))
 
     log.info("TOTAL: %d processed | %d ok | %d partial | %d error",
              total_stats["processed"], total_stats["ok"], total_stats["partial"], total_stats["error"])
@@ -842,7 +855,7 @@ def stream_detail(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_enrichment(limit: int = 100) -> dict:
+def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     """Main entry point for detail page enrichment.
 
     Fetches pending jobs from the database (those without full_description),
@@ -851,6 +864,7 @@ def run_enrichment(limit: int = 100) -> dict:
 
     Args:
         limit: Maximum number of jobs per site to process.
+        workers: Number of parallel threads for site batch processing. Default 1 (sequential).
 
     Returns:
         Dict with stats: processed, ok, partial, error, tiers.
@@ -875,6 +889,6 @@ def run_enrichment(limit: int = 100) -> dict:
             log.info("WTTJ: %d URLs updated", updated)
 
     # Run the detail scraper
-    stats = _run_detail_scraper(conn, max_per_site=limit)
+    stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers)
 
     return stats

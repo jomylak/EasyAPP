@@ -38,15 +38,13 @@ from applypilot.apply.dashboard import (
 
 logger = logging.getLogger(__name__)
 
-# Sites to skip -- too problematic for automation
-BLOCKED_SITES: set[str] = {"glassdoor", "google", "accenture", "AccentureCareers", "Workopolis"}
-BLOCKED_URL_PATTERNS: list[str] = [
-    "%glassdoor%", "%google.com/about/careers%", "%google.jobs%",
-    "%accenture%", "%workopolis.com/out%",
-]
+# Blocked sites loaded from config/sites.yaml
+def _load_blocked():
+    from applypilot.config import load_blocked_sites
+    return load_blocked_sites()
 
 # How often to poll the DB when the queue is empty (seconds)
-POLL_INTERVAL = 60
+POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
@@ -74,7 +72,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
                 "args": [
                     "@playwright/mcp@latest",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
-                    "--viewport-size=1280x900",
+                    f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
             },
             "gmail": {
@@ -117,15 +115,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 LIMIT 1
             """, (target_url, target_url, like, like)).fetchone()
         else:
-            site_filter = " AND ".join(f"site != '{s}'" for s in BLOCKED_SITES)
-            url_filter = " AND ".join(f"url NOT LIKE '{p}'" for p in BLOCKED_URL_PATTERNS)
+            blocked_sites, blocked_patterns = _load_blocked()
+            site_filter = " AND ".join(f"site != '{s}'" for s in blocked_sites) if blocked_sites else "1=1"
+            url_filter = " AND ".join(f"url NOT LIKE '{p}'" for p in blocked_patterns) if blocked_patterns else "1=1"
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < 3)
+                  AND (apply_attempts IS NULL OR apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
                   AND apply_status != 'in_progress'
                   AND fit_score >= ?
                   AND {site_filter}
@@ -138,12 +137,25 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             conn.rollback()
             return None
 
+        # Skip manual ATS sites (unsolvable CAPTCHAs)
+        from applypilot.config import is_manual_ats
+        apply_url = row["application_url"] or row["url"]
+        if is_manual_ats(apply_url):
+            conn.execute(
+                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                (row["url"],),
+            )
+            conn.commit()
+            logger.info("Skipping manual ATS: %s", row["url"][:80])
+            return None
+
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
-                           apply_error = ?
+                           agent_id = ?,
+                           last_attempted_at = ?
             WHERE url = ?
-        """, (f"worker-{worker_id}", row["url"]))
+        """, (f"worker-{worker_id}", now, row["url"]))
         conn.commit()
 
         return dict(row)
@@ -153,23 +165,26 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 
 def mark_result(url: str, status: str, error: str | None = None,
-                permanent: bool = False) -> None:
+                permanent: bool = False, duration_ms: int | None = None,
+                task_id: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL
+                           apply_error = NULL, agent_id = NULL,
+                           apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
-        """, (now, url))
+        """, (now, duration_ms, task_id, url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}
+                           apply_attempts = {attempts}, agent_id = NULL,
+                           apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
-        """, (status, error or "unknown", url))
+        """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
 
 
@@ -177,10 +192,94 @@ def release_lock(url: str) -> None:
     """Release the in_progress lock without changing status."""
     conn = get_connection()
     conn.execute(
-        "UPDATE jobs SET apply_status = NULL WHERE url = ? AND apply_status = 'in_progress'",
+        "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ? AND apply_status = 'in_progress'",
         (url,),
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
+# ---------------------------------------------------------------------------
+
+def gen_prompt(target_url: str, min_score: int = 7,
+               model: str = "sonnet", worker_id: int = 0) -> Path | None:
+    """Generate a prompt file and print the Claude CLI command for manual debugging.
+
+    Returns:
+        Path to the generated prompt file, or None if no job found.
+    """
+    job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id)
+    if not job:
+        return None
+
+    # Read resume text
+    resume_path = job.get("tailored_resume_path")
+    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
+    resume_text = ""
+    if txt_path and txt_path.exists():
+        resume_text = txt_path.read_text(encoding="utf-8")
+
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+
+    # Release the lock so the job stays available
+    release_lock(job["url"])
+
+    # Write prompt file
+    config.ensure_dirs()
+    site_slug = (job.get("site") or "unknown")[:20].replace(" ", "_")
+    prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+
+    # Write MCP config for reference
+    port = BASE_CDP_PORT + worker_id
+    mcp_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+
+    return prompt_file
+
+
+def mark_job(url: str, status: str, reason: str | None = None) -> None:
+    """Manually mark a job's apply status in the database.
+
+    Args:
+        url: Job URL to mark.
+        status: Either 'applied' or 'failed'.
+        reason: Failure reason (only for status='failed').
+    """
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    if status == "applied":
+        conn.execute("""
+            UPDATE jobs SET apply_status = 'applied', applied_at = ?,
+                           apply_error = NULL, agent_id = NULL
+            WHERE url = ?
+        """, (now, url))
+    else:
+        conn.execute("""
+            UPDATE jobs SET apply_status = 'failed', apply_error = ?,
+                           apply_attempts = 99, agent_id = NULL
+            WHERE url = ?
+        """, (reason or "manual", url))
+    conn.commit()
+
+
+def reset_failed() -> int:
+    """Reset all failed jobs so they can be retried.
+
+    Returns:
+        Number of jobs reset.
+    """
+    conn = get_connection()
+    cursor = conn.execute("""
+        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                       apply_attempts = 0, agent_id = NULL
+        WHERE apply_status = 'failed'
+          OR (apply_status IS NOT NULL AND apply_status != 'applied'
+              AND apply_status != 'in_progress')
+    """)
+    conn.commit()
+    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +287,12 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> str:
+            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
-        Status string: 'applied', 'expired', 'captcha', 'login_issue',
+        Tuple of (status_string, duration_ms). Status is one of:
+        'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
     # Read tailored resume text
@@ -206,6 +306,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
+        dry_run=dry_run,
     )
 
     # Write per-worker MCP config
@@ -337,10 +438,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         if returncode and returncode < 0:
-            return "skipped"
+            return "skipped", int((time.time() - start) * 1000)
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
+        duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
@@ -360,7 +462,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower()
+                return result_status.lower(), duration_ms
 
         if "RESULT:FAILED" in output:
             for out_line in output.split("\n"):
@@ -376,26 +478,28 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason
+                        return reason, duration_ms
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}"
-            return "failed:unknown"
+                    return f"failed:{reason}", duration_ms
+            return "failed:unknown", duration_ms
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line"
+        return "failed:no_result_line", duration_ms
 
     except subprocess.TimeoutExpired:
+        duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout"
+        return "failed:timeout", duration_ms
     except Exception as e:
+        duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}"
+        return f"failed:{str(e)[:100]}", duration_ms
     finally:
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
@@ -489,22 +593,23 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result = run_job(job, port=port, worker_id=worker_id,
-                             model=model, dry_run=dry_run)
+            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+                                            model=model, dry_run=dry_run)
 
             if result == "skipped":
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied")
+                mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result))
+                            permanent=_is_permanent_failure(result),
+                            duration_ms=duration_ms)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

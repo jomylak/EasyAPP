@@ -29,13 +29,15 @@
     "salary_expectation": "85000",
     "salary_currency": "USD",
     "salary_range_min": "80000",
-    "salary_range_max": "100000"
+    "salary_range_max": "100000",
+    "currency_conversion_note": ""
   },
   "experience": {
     "years_of_experience_total": "3",
     "education_level": "Bachelor's Degree",
     "current_job_title": "",
-    "current_company": ""
+    "current_company": "",
+    "target_role": "software engineer"
   },
   "skills_boundary": {
     "languages": ["Python", "SQL", "JavaScript"],

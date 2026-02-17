@@ -130,13 +130,25 @@ def _build_salary_section(profile: dict) -> str:
     floor = comp["salary_expectation"]
     range_min = comp.get("salary_range_min", floor)
     range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
+    conversion_note = comp.get("currency_conversion_note", "")
 
-    # Compute example hourly rates for common salary levels
+    # Compute example hourly rates at 3 salary levels
     try:
         floor_int = int(floor)
-        floor_hourly = floor_int // 2080
+        examples = [
+            (f"${floor_int // 1000}K", floor_int // 2080),
+            (f"${(floor_int + 25000) // 1000}K", (floor_int + 25000) // 2080),
+            (f"${(floor_int + 55000) // 1000}K", (floor_int + 55000) // 2080),
+        ]
+        hourly_line = ", ".join(f"{sal} = ${hr}/hr" for sal, hr in examples)
     except (ValueError, TypeError):
-        floor_hourly = 40
+        hourly_line = "Divide annual salary by 2080"
+
+    # Currency conversion guidance
+    if conversion_note:
+        convert_line = f"Posting is in a different currency? -> {conversion_note}"
+    else:
+        convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
 
     return f"""== SALARY (think, don't just copy) ==
 ${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
@@ -144,10 +156,10 @@ ${floor} {currency} is the FLOOR. Never go below it. But don't always use it eit
 Decision tree:
 1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
 2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
-3. Posting is in a different currency? -> Target midpoint of their range. Convert if needed.
+3. {convert_line}
 4. No salary info anywhere? -> Use ${floor} {currency}.
 5. Asked for a range? -> Give posted midpoint minus 10% to midpoint plus 10%. No posted range? -> "${range_min}-${range_max} {currency}".
-6. Hourly rate? -> Divide your annual answer by 2080. (${floor} = ${floor_hourly}/hr approximately)"""
+6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
 
 
 def _build_screening_section(profile: dict) -> str:
@@ -156,6 +168,7 @@ def _build_screening_section(profile: dict) -> str:
     exp = profile.get("experience", {})
     city = personal.get("city", "their city")
     years = exp.get("years_of_experience_total", "multiple")
+    target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
@@ -165,7 +178,7 @@ Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
-Skills and tools -> be confident. This candidate is a software engineer with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
+Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
 
 Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
 
@@ -405,7 +418,8 @@ If CapSolver genuinely failed (errorId > 0):
 
 
 def build_prompt(job: dict, tailored_resume: str,
-                 cover_letter: str | None = None) -> str:
+                 cover_letter: str | None = None,
+                 dry_run: bool = False) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -416,6 +430,7 @@ def build_prompt(job: dict, tailored_resume: str,
              application_url, fit_score, tailored_resume_path).
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
+        dry_run: If True, tell the agent not to click Submit.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -483,19 +498,20 @@ def build_prompt(job: dict, tailored_resume: str,
     # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())
 
-    # SSO domains the agent cannot sign into
-    blocked_sso = [
-        "accounts.google.com",
-        "login.microsoftonline.com",
-        "okta.com",
-        "auth0.com",
-        "sso.cisco.com",
-    ]
+    # SSO domains the agent cannot sign into (loaded from config/sites.yaml)
+    from applypilot.config import load_blocked_sso
+    blocked_sso = load_blocked_sso()
 
     # Preferred display name
     preferred_name = personal.get("preferred_name", full_name.split()[0])
     last_name = full_name.split()[-1] if " " in full_name else ""
     display_name = f"{preferred_name} {last_name}".strip()
+
+    # Dry-run: override submit instruction
+    if dry_run:
+        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+    else:
+        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
@@ -564,7 +580,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.
-10. BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct.
+10. {submit_instruction}
 11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
 12. Output your result.
 

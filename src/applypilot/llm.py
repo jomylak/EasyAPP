@@ -83,6 +83,13 @@ class LLMClient:
         max_tokens: int = 4096,
     ) -> str:
         """Send a chat completion request and return the assistant message text."""
+        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
+        # reasoning, saving tokens on structured extraction tasks.
+        if "qwen" in self.model.lower() and messages:
+            first = messages[0]
+            if first.get("role") == "user" and not first["content"].startswith("/no_think"):
+                messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"

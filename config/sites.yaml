@@ -3,6 +3,56 @@
 # Use {location_encoded} placeholder for location (URL-encoded).
 # Use {query_encoded} placeholder for search terms (URL-encoded).
 
+# ── Manual-Only ATS Domains ──────────────────────────────────────────────
+# These ATS platforms have unsolvable CAPTCHAs. Jobs routing through them
+# are flagged as "manual" during apply — bot skips, user applies by hand.
+manual_ats:
+  - "ibegin.tcsapps.com"       # TCS iBegin — unsolvable CAPTCHA every time
+
+# ── Blocked sites — too problematic for automation ───────────────────────
+blocked:
+  sites:
+    - "glassdoor"
+    - "google"
+    - "accenture"
+    - "AccentureCareers"
+    - "Workopolis"
+  url_patterns:
+    - "%glassdoor%"
+    - "%google.com/about/careers%"
+    - "%google.jobs%"
+    - "%accenture%"
+    - "%workopolis.com/out%"
+
+# ── Blocked SSO domains — cannot authenticate through these ──────────────
+blocked_sso:
+  - "accounts.google.com"
+  - "login.microsoftonline.com"
+  - "okta.com"
+  - "auth0.com"
+  - "sso.cisco.com"
+
+# ── Base URLs for URL resolution ─────────────────────────────────────────
+# Used by detail enrichment to resolve relative URLs scraped from sites.
+# Sites not listed here (or with null) cannot have relative URLs resolved.
+base_urls:
+  "Job Bank Canada": "https://www.jobbank.gc.ca"
+  "CareerJet Canada": "https://www.careerjet.ca"
+  "BuiltIn Remote": "https://builtin.com"
+  "Hacker News Jobs": "https://news.ycombinator.com/"
+  "RemoteOK": null
+  "WelcomeToTheJungle": null
+  "Workopolis": "https://www.workopolis.com"
+  "WeWorkRemotely": "https://weworkremotely.com"
+  "Startup.jobs": "https://startup.jobs"
+  "Nodesk": "https://nodesk.co"
+  "Talent.com": "https://www.talent.com"
+  "JustRemote": "https://justremote.co"
+  "Arc.dev": "https://arc.dev"
+  "Himalayas": "https://himalayas.app"
+  "Techstars Jobs": "https://www.techstars.com"
+  "Randstad Canada": "https://www.randstad.ca/jobs/search/"
+
 sites:
   # ── Searchable sites (URL includes query + location params) ──────────
   # Canada-specific

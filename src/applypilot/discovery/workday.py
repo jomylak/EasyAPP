@@ -13,6 +13,7 @@ import re
 import sqlite3
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -389,10 +390,12 @@ def scrape_employers(
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
 
-    Processes employers sequentially.
+    Sequential by default. When workers > 1, processes employers in parallel
+    using ThreadPoolExecutor.
     """
     if employer_keys is None:
         employer_keys = list(employers.keys())
@@ -413,23 +416,49 @@ def scrape_employers(
 
     valid_keys = [k for k in employer_keys if k in employers]
 
-    completed = 0
-    for key in valid_keys:
-        result = _process_one(
-            key, employers, search_text,
-            location_filter, accept_locs, reject_locs,
-        )
-        completed += 1
-        total_new += result["new"]
-        total_existing += result["existing"]
-        total_found += result["found"]
-        if "error" in result:
-            errors += 1
+    if workers > 1 and len(valid_keys) > 1:
+        # Parallel mode
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(workers, len(valid_keys))) as pool:
+            futures = {
+                pool.submit(
+                    _process_one, key, employers, search_text,
+                    location_filter, accept_locs, reject_locs,
+                ): key
+                for key in valid_keys
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                total_new += result["new"]
+                total_existing += result["existing"]
+                total_found += result["found"]
+                if "error" in result:
+                    errors += 1
 
-        if completed % 10 == 0 or completed == len(valid_keys):
-            elapsed = time.time() - t0
-            log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
-                     search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
+                if completed % 10 == 0 or completed == len(valid_keys):
+                    elapsed = time.time() - t0
+                    log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
+                             search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
+    else:
+        # Sequential mode (default)
+        completed = 0
+        for key in valid_keys:
+            result = _process_one(
+                key, employers, search_text,
+                location_filter, accept_locs, reject_locs,
+            )
+            completed += 1
+            total_new += result["new"]
+            total_existing += result["existing"]
+            total_found += result["found"]
+            if "error" in result:
+                errors += 1
+
+            if completed % 10 == 0 or completed == len(valid_keys):
+                elapsed = time.time() - t0
+                log.info("[%s] Progress: %d/%d employers (%d new, %d dupes, %d errors) [%.0fs]",
+                         search_text, completed, len(valid_keys), total_new, total_existing, errors, elapsed)
 
     elapsed = time.time() - t0
     log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
@@ -440,7 +469,7 @@ def scrape_employers(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_workday_discovery(employers: dict | None = None) -> dict:
+def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> dict:
     """Main entry point for Workday-based corporate job discovery.
 
     Loads employer registry from config/employers.yaml (or uses the provided
@@ -449,6 +478,7 @@ def run_workday_discovery(employers: dict | None = None) -> dict:
 
     Args:
         employers: Override the employer registry. If None, loads from YAML.
+        workers: Number of parallel threads for employer scraping. Default 1 (sequential).
 
     Returns:
         Dict with stats: found, new, existing, queries.
@@ -482,7 +512,7 @@ def run_workday_discovery(employers: dict | None = None) -> dict:
 
     location_filter = search_cfg.get("workday_location_filter", True)
 
-    log.info("Workday crawl: %d queries x %d employers", len(queries), len(employers))
+    log.info("Workday crawl: %d queries x %d employers (workers=%d)", len(queries), len(employers), workers)
 
     grand_new = 0
     grand_existing = 0
@@ -496,6 +526,7 @@ def run_workday_discovery(employers: dict | None = None) -> dict:
             location_filter=location_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            workers=workers,
         )
         grand_new += result["new"]
         grand_existing += result["existing"]

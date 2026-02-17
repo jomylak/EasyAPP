@@ -78,6 +78,7 @@ def run(
         ),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
 ) -> None:
@@ -108,6 +109,7 @@ def run(
         min_score=min_score,
         dry_run=dry_run,
         stream=stream,
+        workers=workers,
     )
 
     if result.get("errors"):
@@ -123,12 +125,40 @@ def apply(
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
+    url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
+    mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
+    mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
+    fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
+    reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
+
+    # --- Utility modes (no Chrome/Claude needed) ---
+
+    if mark_applied:
+        from applypilot.apply.launcher import mark_job
+        mark_job(mark_applied, "applied")
+        console.print(f"[green]Marked as applied:[/green] {mark_applied}")
+        return
+
+    if mark_failed:
+        from applypilot.apply.launcher import mark_job
+        mark_job(mark_failed, "failed", reason=fail_reason)
+        console.print(f"[yellow]Marked as failed:[/yellow] {mark_failed} ({fail_reason or 'manual'})")
+        return
+
+    if reset_failed:
+        from applypilot.apply.launcher import reset_failed as do_reset
+        count = do_reset()
+        console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+        return
+
+    # --- Full apply mode ---
 
     # Check 1: Tier 3 required (Claude Code CLI + Chrome)
     check_tier(3, "auto-apply")
@@ -141,17 +171,38 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist
-    conn = get_connection()
-    ready = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
-    ).fetchone()[0]
-    if ready == 0:
+    # Check 3: Tailored resumes exist (skip for --gen with --url)
+    if not (gen and url):
+        conn = get_connection()
+        ready = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
+        ).fetchone()[0]
+        if ready == 0:
+            console.print(
+                "[red]No tailored resumes ready.[/red]\n"
+                "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+            )
+            raise typer.Exit(code=1)
+
+    if gen:
+        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        target = url or ""
+        if not target:
+            console.print("[red]--gen requires --url to specify which job.[/red]")
+            raise typer.Exit(code=1)
+        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        if not prompt_file:
+            console.print("[red]No matching job found for that URL.[/red]")
+            raise typer.Exit(code=1)
+        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
+        console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
+        console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            "[red]No tailored resumes ready.[/red]\n"
-            "Run [bold]applypilot run score tailor[/bold] first to prepare applications."
+            f"  claude --model {model} -p "
+            f"--mcp-config {mcp_path} "
+            f"--permission-mode bypassPermissions < {prompt_file}"
         )
-        raise typer.Exit(code=1)
+        return
 
     from applypilot.apply.launcher import main as apply_main
 
@@ -163,10 +214,13 @@ def apply(
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
+    if url:
+        console.print(f"  Target:   {url}")
     console.print()
 
     apply_main(
         limit=effective_limit,
+        target_url=url,
         min_score=min_score,
         headless=headless,
         model=model,

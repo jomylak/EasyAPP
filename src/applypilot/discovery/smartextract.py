@@ -18,6 +18,7 @@ import re
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -1011,12 +1012,17 @@ def build_scrape_targets(
 
 # -- Run all sites -----------------------------------------------------------
 
-def _run_all_sequential(
+def _run_all(
     targets: list[dict],
     accept_locs: list[str],
     reject_locs: list[str],
+    workers: int = 1,
 ) -> dict:
-    """Run smart extract sequentially on all targets."""
+    """Run smart extract on all targets.
+
+    Sequential by default. When workers > 1, scrapes multiple sites in parallel
+    using ThreadPoolExecutor. DB storage is still serialized after each result.
+    """
     conn = init_db()
     pre_stats = get_stats(conn)
     log.info("Database: %d jobs already stored, %d pending detail scrape",
@@ -1026,15 +1032,8 @@ def _run_all_sequential(
     total_new = 0
     total_existing = 0
 
-    for i, target in enumerate(targets):
-        label = target["name"]
-        if target.get("query"):
-            label = f"{target['name']} [{target['query']}]"
-        log.info("[%d/%d] %s", i + 1, len(targets), label)
-
-        r = _run_one_site(target["name"], target["url"])
-        results.append(r)
-
+    def _process_result(r: dict, target: dict) -> None:
+        nonlocal total_new, total_existing
         jobs = r.get("jobs", [])
         if jobs:
             new, existing = _store_jobs_filtered(conn, jobs, target["name"],
@@ -1043,6 +1042,30 @@ def _run_all_sequential(
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
+
+    if workers > 1 and len(targets) > 1:
+        # Parallel mode
+        with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
+            future_to_target = {
+                pool.submit(_run_one_site, target["name"], target["url"]): target
+                for target in targets
+            }
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                r = future.result()
+                results.append(r)
+                _process_result(r, target)
+    else:
+        # Sequential mode (default)
+        for i, target in enumerate(targets):
+            label = target["name"]
+            if target.get("query"):
+                label = f"{target['name']} [{target['query']}]"
+            log.info("[%d/%d] %s", i + 1, len(targets), label)
+
+            r = _run_one_site(target["name"], target["url"])
+            results.append(r)
+            _process_result(r, target)
 
     # Summary
     for r in results:
@@ -1064,6 +1087,7 @@ def _run_all_sequential(
 
 def run_smart_extract(
     sites: list[dict] | None = None,
+    workers: int = 1,
 ) -> dict:
     """Main entry point for AI-powered smart extraction.
 
@@ -1072,6 +1096,7 @@ def run_smart_extract(
 
     Args:
         sites: Override the site list. If None, loads from YAML.
+        workers: Number of parallel threads for site scraping. Default 1 (sequential).
 
     Returns:
         Dict with stats: total_new, total_existing, passed, total.
@@ -1087,7 +1112,7 @@ def run_smart_extract(
 
     search_sites = sum(1 for s in (sites or load_sites()) if s.get("type") == "search")
     static_sites = sum(1 for s in (sites or load_sites()) if s.get("type") != "search")
-    log.info("Sites: %d searchable, %d static | Total targets: %d",
-             search_sites, static_sites, len(targets))
+    log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
+             search_sites, static_sites, len(targets), workers)
 
-    return _run_all_sequential(targets, accept_locs, reject_locs)
+    return _run_all(targets, accept_locs, reject_locs, workers=workers)

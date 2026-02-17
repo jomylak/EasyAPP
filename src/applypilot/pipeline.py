@@ -59,7 +59,7 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
-def _run_discover() -> dict:
+def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
     stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
 
@@ -78,7 +78,7 @@ def _run_discover() -> dict:
     console.print("  [cyan]Workday corporate scraper...[/cyan]")
     try:
         from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery()
+        run_workday_discovery(workers=workers)
         stats["workday"] = "ok"
     except Exception as e:
         log.error("Workday scraper failed: %s", e)
@@ -89,7 +89,7 @@ def _run_discover() -> dict:
     console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
     try:
         from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract()
+        run_smart_extract(workers=workers)
         stats["smartextract"] = "ok"
     except Exception as e:
         log.error("Smart extract failed: %s", e)
@@ -99,11 +99,11 @@ def _run_discover() -> dict:
     return stats
 
 
-def _run_enrich() -> dict:
+def _run_enrich(workers: int = 1) -> dict:
     """Stage: Detail enrichment — scrape full descriptions and apply URLs."""
     try:
         from applypilot.enrichment.detail import run_enrichment
-        run_enrichment()
+        run_enrichment(workers=workers)
         return {"status": "ok"}
     except Exception as e:
         log.error("Enrichment failed: %s", e)
@@ -260,6 +260,7 @@ def _run_stage_streaming(
     tracker: _StageTracker,
     stop_event: threading.Event,
     min_score: int = 7,
+    workers: int = 1,
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -271,6 +272,8 @@ def _run_stage_streaming(
     kwargs: dict = {}
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
+    if stage in ("discover", "enrich"):
+        kwargs["workers"] = workers
 
     upstream = _UPSTREAM[stage]
 
@@ -318,7 +321,7 @@ def _run_stage_streaming(
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int) -> dict:
+def _run_sequential(ordered: list[str], min_score: int, workers: int = 1) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -338,6 +341,8 @@ def _run_sequential(ordered: list[str], min_score: int) -> dict:
             kwargs: dict = {}
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
+            if name in ("discover", "enrich"):
+                kwargs["workers"] = workers
             result = runner(**kwargs)
             elapsed = time.time() - t0
 
@@ -368,7 +373,7 @@ def _run_sequential(ordered: list[str], min_score: int) -> dict:
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int) -> dict:
+def _run_streaming(ordered: list[str], min_score: int, workers: int = 1) -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -390,7 +395,7 @@ def _run_streaming(ordered: list[str], min_score: int) -> dict:
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score),
+            args=(name, tracker, stop_event, min_score, workers),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -436,6 +441,7 @@ def run_pipeline(
     min_score: int = 7,
     dry_run: bool = False,
     stream: bool = False,
+    workers: int = 1,
 ) -> dict:
     """Run pipeline stages.
 
@@ -444,6 +450,7 @@ def run_pipeline(
         min_score: Minimum fit score for tailor/cover stages.
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
+        workers: Number of parallel threads for discovery/enrichment stages.
 
     Returns:
         Dict with keys: stages (list of result dicts), errors (dict), elapsed (float).
@@ -466,6 +473,7 @@ def run_pipeline(
         border_style="blue",
     ))
     console.print(f"  Min score: {min_score}")
+    console.print(f"  Workers:   {workers}")
     console.print(f"  Stages:    {' -> '.join(ordered)}")
 
     # Pre-run stats
@@ -482,9 +490,9 @@ def run_pipeline(
 
     # Execute
     if stream:
-        result = _run_streaming(ordered, min_score)
+        result = _run_streaming(ordered, min_score, workers=workers)
     else:
-        result = _run_sequential(ordered, min_score)
+        result = _run_sequential(ordered, min_score, workers=workers)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

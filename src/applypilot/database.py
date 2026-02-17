@@ -71,7 +71,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
       - Scoring:    fit_score, score_reasoning, scored_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
-      - Apply:      applied_at, apply_status, apply_error, apply_attempts
+      - Apply:      applied_at, apply_status, apply_error, apply_attempts,
+                   agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
+                   verification_confidence
 
     Args:
         db_path: Override the default DB_PATH.
@@ -122,7 +124,12 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             applied_at            TEXT,
             apply_status          TEXT,
             apply_error           TEXT,
-            apply_attempts        INTEGER DEFAULT 0
+            apply_attempts        INTEGER DEFAULT 0,
+            agent_id              TEXT,
+            last_attempted_at     TEXT,
+            apply_duration_ms     INTEGER,
+            apply_task_id         TEXT,
+            verification_confidence TEXT
         )
     """)
     conn.commit()
@@ -168,6 +175,11 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_status": "TEXT",
     "apply_error": "TEXT",
     "apply_attempts": "INTEGER DEFAULT 0",
+    "agent_id": "TEXT",
+    "last_attempted_at": "TEXT",
+    "apply_duration_ms": "INTEGER",
+    "apply_task_id": "TEXT",
+    "verification_confidence": "TEXT",
 }
 
 
