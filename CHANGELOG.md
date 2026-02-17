@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`config.DEFAULTS`** - centralized dict for magic numbers (`min_score`, `max_apply_attempts`,
   `poll_interval`, `apply_timeout`, `viewport`)
 
+### Fixed
+- **numpy install failure** - added `numpy>=2.0` to dependencies so pip resolves pre-built
+  wheels instead of backtracking to source-only versions that require a C++ compiler
+
 ### Changed
 - **Blocked sites externalized** - moved from hardcoded sets in launcher.py to
   `config/sites.yaml` under `blocked:` key
