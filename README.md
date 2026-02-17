@@ -20,7 +20,8 @@ ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs a
 Three commands. That's it.
 
 ```bash
-pip install --only-binary :all: applypilot
+pip install applypilot
+pip install --no-deps python-jobspy    # installed separately (broken numpy pin in jobspy metadata)
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
@@ -91,7 +92,7 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|
 | CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
 
-> **Note:** The `--only-binary :all:` flag tells pip to use pre-built wheels instead of compiling from source. This avoids needing C++ build tools. python-jobspy pins an older numpy version in its metadata, but works fine with modern numpy at runtime.
+> **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
 
 ---
 

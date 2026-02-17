@@ -27,8 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/applypilot/config/` so YAML files (employers, sites, searches) ship with `pip install`
 - **Search config format mismatch** - wizard wrote `searches:` key but discovery code
   expected `queries:` with tier support. Aligned wizard output and example config
-- **JobSpy API restored** - pinned python-jobspy>=1.1.14 to get full API (hours_old,
-  description_format, linkedin_fetch_description)
+- **JobSpy install isolation** - removed python-jobspy from package dependencies due to
+  broken numpy==1.26.3 exact pin in jobspy metadata. Installed separately with `--no-deps`
 
 ### Changed
 - **Blocked sites externalized** - moved from hardcoded sets in launcher.py to
