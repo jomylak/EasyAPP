@@ -23,12 +23,11 @@ dependencies = [
     "httpx>=0.24",
     "beautifulsoup4>=4.12",
     "playwright>=1.40",
-    "python-jobspy>=1.1.13,<1.1.14",
+    "python-jobspy>=1.1.14",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "pandas>=2.0",
-    "numpy>=2.0",
-]
+    ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]
