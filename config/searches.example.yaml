@@ -1,0 +1,56 @@
+# ApplyPilot search configuration
+# Copy to ~/.applypilot/searches.yaml and customize for your role and location.
+
+# Search queries -- grouped by priority tier.
+# Higher tiers are searched first and more frequently.
+queries:
+  tier1:  # High-priority, exact role matches
+    - "software engineer"
+    - "backend developer"
+  tier2:  # Strong matches, broader scope
+    - "python developer"
+    - "full stack developer"
+    - "DevOps engineer"
+    - "data engineer"
+  tier3:  # Wide net, higher volume but lower precision
+    - "developer"
+    - "engineer"
+    - "cloud engineer"
+    - "platform engineer"
+
+# Location configuration
+location:
+  primary: "San Francisco, CA"
+  radius_miles: 25
+  remote_ok: true
+  # Patterns to accept in job location text (case-insensitive)
+  accept_patterns:
+    - "San Francisco"
+    - "Bay Area"
+    - "SF"
+    - "California"
+    - "Remote"
+    - "Anywhere"
+  # Patterns to reject when job is NOT remote (case-insensitive)
+  reject_patterns:
+    - "New York"
+    - "Seattle"
+    - "Austin"
+    - "Chicago"
+    - "Los Angeles"
+    - "London, UK"
+
+# Country for Indeed/LinkedIn searches
+country: "USA"
+
+# JobSpy source boards
+boards:
+  - indeed
+  - linkedin
+  - glassdoor
+  - zip_recruiter
+
+# Search defaults
+defaults:
+  results_per_site: 100
+  hours_old: 72  # Only show jobs posted within this many hours
