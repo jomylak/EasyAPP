@@ -21,7 +21,8 @@ Three commands. That's it.
 
 ```bash
 pip install applypilot
-pip install --no-deps python-jobspy    # installed separately (broken numpy pin in jobspy metadata)
+pip install --no-deps python-jobspy    # separate install (broken numpy pin in metadata)
+pip install pydantic tls-client requests markdownify regex  # jobspy runtime deps skipped by --no-deps
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
