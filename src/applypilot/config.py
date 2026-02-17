@@ -27,7 +27,7 @@ APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
-CONFIG_DIR = PACKAGE_DIR.parent.parent / "config"
+CONFIG_DIR = PACKAGE_DIR / "config"
 
 
 def get_chrome_path() -> str:

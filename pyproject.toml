@@ -48,6 +48,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/applypilot"]
 
+[tool.hatch.build]
+artifacts = ["src/applypilot/config/*.yaml"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120
