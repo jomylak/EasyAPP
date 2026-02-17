@@ -216,17 +216,12 @@ def _run_one_search(
             "search_term": s["query"],
             "location": s["location"],
             "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
             "country_indeed": defaults.get("country_indeed", "usa"),
-            "verbose": 0,
         }
         if s.get("remote"):
             kwargs["is_remote"] = True
         if proxy_config:
-            kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
-            kwargs["linkedin_fetch_description"] = True
+            kwargs["proxy"] = proxy_config["jobspy"]
         try:
             df = _scrape_with_retry(kwargs, max_retries=max_retries)
             all_dfs.append(df)
@@ -240,14 +235,11 @@ def _run_one_search(
             "search_term": s["query"],
             "location": gd_location,
             "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
-            "verbose": 0,
         }
         if s.get("remote"):
             gd_kwargs["is_remote"] = True
         if proxy_config:
-            gd_kwargs["proxies"] = [proxy_config["jobspy"]]
+            gd_kwargs["proxy"] = proxy_config["jobspy"]
         try:
             gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
             all_dfs.append(gd_df)
@@ -312,20 +304,14 @@ def search_jobs(
         "search_term": query,
         "location": location,
         "results_wanted": results_per_site,
-        "hours_old": hours_old,
-        "description_format": "markdown",
         "country_indeed": country_indeed,
-        "verbose": 2,
     }
 
     if remote_only:
         kwargs["is_remote"] = True
 
     if proxy_config:
-        kwargs["proxies"] = [proxy_config["jobspy"]]
-
-    if "linkedin" in sites:
-        kwargs["linkedin_fetch_description"] = True
+        kwargs["proxy"] = proxy_config["jobspy"]
 
     try:
         df = scrape_jobs(**kwargs)
