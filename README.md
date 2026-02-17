@@ -21,9 +21,12 @@ Three commands. That's it.
 
 ```bash
 pip install applypilot
-applypilot init    # one-time setup: resume, profile, preferences, API keys
-applypilot run     # discover → enrich → score → tailor → cover letters
-applypilot apply   # autonomous browser-driven submission (--workers N for parallel)
+applypilot init          # one-time setup: resume, profile, preferences, API keys
+applypilot run           # discover → enrich → score → tailor → cover letters
+applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
+applypilot apply         # autonomous browser-driven submission
+applypilot apply -w 3    # parallel apply (3 Chrome instances)
+applypilot apply --dry-run  # fill forms without submitting
 ```
 
 ---
@@ -118,6 +121,35 @@ Writes a targeted cover letter per job referencing the specific company, role, a
 ### Auto-Apply
 Claude Code launches a browser, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
+```bash
+# Utility modes (no Chrome/Claude needed)
+applypilot apply --mark-applied URL    # manually mark a job as applied
+applypilot apply --mark-failed URL     # manually mark a job as failed
+applypilot apply --reset-failed        # reset all failed jobs for retry
+applypilot apply --gen --url URL       # generate prompt file for manual debugging
+```
+
+---
+
+## CLI Reference
+
+```
+applypilot init                         # First-time setup wizard
+applypilot run [stages...]              # Run pipeline stages (or 'all')
+applypilot run --workers 4              # Parallel discovery/enrichment
+applypilot run --stream                 # Concurrent stages (streaming mode)
+applypilot run --min-score 8            # Override score threshold
+applypilot run --dry-run                # Preview without executing
+applypilot apply                        # Launch auto-apply
+applypilot apply --workers 3            # Parallel browser workers
+applypilot apply --dry-run              # Fill forms without submitting
+applypilot apply --continuous           # Run forever, polling for new jobs
+applypilot apply --headless             # Headless browser mode
+applypilot apply --url URL              # Apply to a specific job
+applypilot status                       # Pipeline statistics
+applypilot dashboard                    # Open HTML results dashboard
+```
+
 ---
 
 ## Roadmap
@@ -126,10 +158,9 @@ Claude Code launches a browser, navigates to each application page, detects the 
 
 - [x] Parallel auto-apply workers (`--workers N` — N Chrome instances, thread-safe job queue)
 - [x] Tiered setup wizard (lock/unlock features by installed dependencies)
-
 - [x] Streaming pipeline (`--stream` — concurrent stages with DB as conveyor belt)
-
 - [x] Config parity with HydraCrawl (search queries, sites, CAPTCHA polish)
+- [x] Full feature parity — apply utility modes, parallel discovery/enrichment, manual ATS detection, config externalization
 
 ### Planned
 
