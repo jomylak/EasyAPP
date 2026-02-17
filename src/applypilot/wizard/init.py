@@ -198,11 +198,15 @@ def _setup_searches() -> None:
         "  hours_old: 72",
         "  results_per_site: 50",
         "",
-        "searches:",
+        "locations:",
+        f'  - location: "{location}"',
+        f"    remote: {str(distance == 0).lower()}",
+        "",
+        "queries:",
     ]
-    for role in roles:
+    for i, role in enumerate(roles):
         lines.append(f'  - query: "{role}"')
-        lines.append(f'    location: "{location}"')
+        lines.append(f"    tier: {min(i + 1, 3)}")
 
     SEARCH_CONFIG_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
     console.print(f"[green]Search config saved to {SEARCH_CONFIG_PATH}[/green]")
