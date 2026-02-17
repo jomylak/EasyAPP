@@ -4,7 +4,7 @@ version = "0.2.0"
 description = "AI-powered end-to-end job application pipeline"
 readme = "README.md"
 license = "AGPL-3.0-only"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 authors = [{name = "Pickle-Pixel"}]
 keywords = ["job-search", "automation", "ai", "resume", "apply", "job-application"]
 classifiers = [
@@ -13,7 +13,6 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business",
 ]
 

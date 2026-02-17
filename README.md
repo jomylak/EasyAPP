@@ -77,7 +77,7 @@ Each stage is independent. Run them all or pick what you need.
 
 | Component | Required For | Details |
 |-----------|-------------|---------|
-| Python 3.11+ | Everything | Core runtime |
+| Python 3.11 or 3.12 | Everything | Core runtime (3.12 recommended, 3.13 has numpy compatibility issues) |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |

@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **Config YAML not found after install** - moved `config/` into the package at
   `src/applypilot/config/` so YAML files (employers, sites, searches) ship with `pip install`
+- **Search config format mismatch** - wizard wrote `searches:` key but discovery code
+  expected `queries:` with tier support. Aligned wizard output and example config
+- **Python 3.13 incompatibility** - python-jobspy pins numpy==1.26.3 which has no
+  pre-built wheel for 3.13 on Windows. Restricted to Python 3.11-3.12
+- **JobSpy API restored** - pinned python-jobspy>=1.1.14 to get full API (hours_old,
+  description_format, linkedin_fetch_description)
 
 ### Changed
 - **Blocked sites externalized** - moved from hardcoded sets in launcher.py to
