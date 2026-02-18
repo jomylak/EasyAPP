@@ -87,12 +87,12 @@ def _setup_profile() -> dict:
     # -- Personal --
     console.print("\n[bold cyan]Personal Information[/bold cyan]")
     profile["personal"] = {
-        "name": Prompt.ask("Full name"),
+        "full_name": Prompt.ask("Full name"),
         "email": Prompt.ask("Email address"),
         "phone": Prompt.ask("Phone number", default=""),
         "city": Prompt.ask("City"),
         "country": Prompt.ask("Country"),
-        "linkedin": Prompt.ask("LinkedIn URL", default=""),
+        "linkedin_url": Prompt.ask("LinkedIn URL", default=""),
         "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
 
