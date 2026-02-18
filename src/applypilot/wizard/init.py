@@ -105,16 +105,21 @@ def _setup_profile() -> dict:
 
     # -- Compensation --
     console.print("\n[bold cyan]Compensation[/bold cyan]")
+    salary = Prompt.ask("Expected annual salary (number)", default="")
+    salary_currency = Prompt.ask("Currency", default="USD")
+    salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
+    range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
     profile["compensation"] = {
-        "expected_salary": Prompt.ask("Expected annual salary (number)", default=""),
-        "currency": Prompt.ask("Currency", default="USD"),
-        "range": Prompt.ask("Acceptable range (e.g. 80000-120000)", default=""),
+        "salary_expectation": salary,
+        "salary_currency": salary_currency,
+        "salary_range_min": range_parts[0].strip(),
+        "salary_range_max": range_parts[1].strip() if len(range_parts) > 1 else range_parts[0].strip(),
     }
 
     # -- Experience --
     console.print("\n[bold cyan]Experience[/bold cyan]")
     profile["experience"] = {
-        "years": Prompt.ask("Years of professional experience", default=""),
+        "years_of_experience_total": Prompt.ask("Years of professional experience", default=""),
         "education_level": Prompt.ask("Highest education (e.g. Bachelor's, Master's, PhD, Self-taught)", default=""),
         "current_title": Prompt.ask("Current/most recent job title", default=""),
     }
@@ -154,7 +159,7 @@ def _setup_profile() -> dict:
 
     # -- Availability --
     profile["availability"] = {
-        "start_date": Prompt.ask("Earliest start date", default="Immediately"),
+        "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
     }
 
     # Save
