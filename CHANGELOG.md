@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expected `queries:` with tier support. Aligned wizard output and example config
 - **JobSpy install isolation** - removed python-jobspy from package dependencies due to
   broken numpy==1.26.3 exact pin in jobspy metadata. Installed separately with `--no-deps`
+- **Scoring batch limit** - default limit of 50 silently left jobs unscored across runs.
+  Changed to no limit (scores all pending jobs in one pass)
+- **Missing logging output** - added `logging.basicConfig(INFO)` so per-job progress for
+  scoring, tailoring, and cover letters is visible during pipeline runs
 
 ### Changed
 - **Blocked sites externalized** - moved from hardcoded sets in launcher.py to
