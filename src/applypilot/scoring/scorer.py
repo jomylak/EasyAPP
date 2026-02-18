@@ -101,7 +101,7 @@ def score_job(resume_text: str, job: dict) -> dict:
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
 
 
-def run_scoring(limit: int = 50, rescore: bool = False) -> dict:
+def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
@@ -115,10 +115,10 @@ def run_scoring(limit: int = 50, rescore: bool = False) -> dict:
     conn = get_connection()
 
     if rescore:
-        jobs = conn.execute(
-            "SELECT * FROM jobs WHERE full_description IS NOT NULL LIMIT ?",
-            (limit,),
-        ).fetchall()
+        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
+        if limit > 0:
+            query += f" LIMIT {limit}"
+        jobs = conn.execute(query).fetchall()
     else:
         jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
 

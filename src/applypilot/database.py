@@ -410,12 +410,12 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         where += " AND fit_score >= ?"
         params.append(min_score)
 
-    params.append(limit)
+    query = f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC"
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
 
-    rows = conn.execute(
-        f"SELECT * FROM jobs WHERE {where} ORDER BY fit_score DESC NULLS LAST, discovered_at DESC LIMIT ?",
-        params,
-    ).fetchall()
+    rows = conn.execute(query, params).fetchall()
 
     # Convert sqlite3.Row objects to dicts
     if rows:
