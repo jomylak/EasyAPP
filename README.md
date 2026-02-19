@@ -9,7 +9,11 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/Pickle-Pixel/ApplyPilot?style=social)](https://github.com/Pickle-Pixel/ApplyPilot)
 
-<!-- demo gif here -->
+
+
+
+https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
+
 
 ---
 
@@ -167,26 +171,6 @@ applypilot apply --url URL              # Apply to a specific job
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
-
----
-
-## Roadmap
-
-### Done
-
-- [x] Parallel auto-apply workers (`--workers N` for N Chrome instances, thread-safe job queue)
-- [x] Tiered setup wizard (lock/unlock features by installed dependencies)
-- [x] Streaming pipeline (`--stream` for concurrent stages with DB as conveyor belt)
-- [x] Config parity (search queries, sites, CAPTCHA handling)
-- [x] Full feature parity (apply utility modes, parallel discovery/enrichment, manual ATS detection, config externalization)
-
-### Planned
-
-- [ ] Multi-profile support (different resumes for different role types)
-- [ ] Application tracking dashboard (web UI)
-- [ ] More job boards (Dice, AngelList, Monster)
-- [ ] Scheduled runs (daily automated discovery)
-- [ ] Resume A/B testing (track which tailoring strategies get callbacks)
 
 ---
 
