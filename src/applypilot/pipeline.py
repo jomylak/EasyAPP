@@ -121,22 +121,22 @@ def _run_score() -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7) -> dict:
+def _run_tailor(min_score: int = 7, validation_mode: str = "normal") -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score)
+        run_tailoring(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7) -> dict:
+def _run_cover(min_score: int = 7, validation_mode: str = "normal") -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score)
+        run_cover_letters(min_score=min_score, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
@@ -261,6 +261,7 @@ def _run_stage_streaming(
     stop_event: threading.Event,
     min_score: int = 7,
     workers: int = 1,
+    validation_mode: str = "normal",
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -272,6 +273,7 @@ def _run_stage_streaming(
     kwargs: dict = {}
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
+        kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
 
@@ -321,7 +323,8 @@ def _run_stage_streaming(
 # Pipeline orchestrators
 # ---------------------------------------------------------------------------
 
-def _run_sequential(ordered: list[str], min_score: int, workers: int = 1) -> dict:
+def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
+                    validation_mode: str = "normal") -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
     errors: dict[str, str] = {}
@@ -341,6 +344,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1) -> dic
             kwargs: dict = {}
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
+                kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
             result = runner(**kwargs)
@@ -373,7 +377,8 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1) -> dic
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int, workers: int = 1) -> dict:
+def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
+                   validation_mode: str = "normal") -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -395,7 +400,7 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1) -> dict
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, workers),
+            args=(name, tracker, stop_event, min_score, workers, validation_mode),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -442,6 +447,7 @@ def run_pipeline(
     dry_run: bool = False,
     stream: bool = False,
     workers: int = 1,
+    validation_mode: str = "normal",
 ) -> dict:
     """Run pipeline stages.
 
@@ -472,9 +478,10 @@ def run_pipeline(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
         border_style="blue",
     ))
-    console.print(f"  Min score: {min_score}")
-    console.print(f"  Workers:   {workers}")
-    console.print(f"  Stages:    {' -> '.join(ordered)}")
+    console.print(f"  Min score:  {min_score}")
+    console.print(f"  Workers:    {workers}")
+    console.print(f"  Validation: {validation_mode}")
+    console.print(f"  Stages:     {' -> '.join(ordered)}")
 
     # Pre-run stats
     pre_stats = get_stats()
@@ -490,9 +497,11 @@ def run_pipeline(
 
     # Execute
     if stream:
-        result = _run_streaming(ordered, min_score, workers=workers)
+        result = _run_streaming(ordered, min_score, workers=workers,
+                                validation_mode=validation_mode)
     else:
-        result = _run_sequential(ordered, min_score, workers=workers)
+        result = _run_sequential(ordered, min_score, workers=workers,
+                                 validation_mode=validation_mode)
 
     # Summary table
     console.print(f"\n{'=' * 70}")

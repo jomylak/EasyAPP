@@ -116,21 +116,30 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             """, (target_url, target_url, like, like)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
-            site_filter = " AND ".join(f"site != '{s}'" for s in blocked_sites) if blocked_sites else "1=1"
-            url_filter = " AND ".join(f"url NOT LIKE '{p}'" for p in blocked_patterns) if blocked_patterns else "1=1"
+            # Build parameterized filters to avoid SQL injection
+            params: list = [min_score]
+            site_clause = ""
+            if blocked_sites:
+                placeholders = ",".join("?" * len(blocked_sites))
+                site_clause = f"AND site NOT IN ({placeholders})"
+                params.extend(blocked_sites)
+            url_clauses = ""
+            if blocked_patterns:
+                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
+                  AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
-                  AND {site_filter}
-                  AND {url_filter}
+                  {site_clause}
+                  {url_clauses}
                 ORDER BY fit_score DESC, url
                 LIMIT 1
-            """, (min_score,)).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
         if not row:
             conn.rollback()

@@ -16,6 +16,7 @@ from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
+    LLM_LEAK_PHRASES,
     sanitize_text,
     validate_cover_letter,
 )
@@ -59,6 +60,11 @@ def _build_cover_letter_prompt(profile: dict) -> str:
     if real_metrics:
         metrics_hint = f"\nReal metrics to use: {', '.join(real_metrics)}"
 
+    # Build the full banned list from the validator so the prompt stays in sync
+    # with what will actually be rejected — the validator checks all of these.
+    all_banned = ", ".join(f'"{w}"' for w in BANNED_WORDS)
+    leak_banned = ", ".join(f'"{p}"' for p in LLM_LEAK_PHRASES)
+
     return f"""Write a cover letter for {sign_off_name}. The goal is to get an interview.
 
 STRUCTURE: 3 short paragraphs. Under 250 words. Every sentence must earn its place.
@@ -69,30 +75,20 @@ PARAGRAPH 2 (3-4 sentences): Pick 2 achievements from the resume that are MOST r
 
 PARAGRAPH 3 (1-2 sentences): One specific thing about the company from the job description (a product, a technical challenge, a team structure). Then close. "Happy to walk through any of this in more detail." or "Let's discuss." Nothing else.
 
-BANNED WORDS/PHRASES (using ANY of these = instant rejection):
-"resonated", "aligns with", "passionate", "eager", "eager to", "excited to apply", "I am confident",
-"I believe", "proven track record", "strong track record", "cutting-edge", "innovative", "innovative solutions",
-"leverage", "leveraging", "robust", "driven", "dedicated", "committed to",
-"I look forward to hearing from you", "great fit", "unique opportunity",
-"commitment to excellence", "dynamic team", "fast-paced environment",
-"I am writing to express", "caught my eye", "caught my attention"
+BANNED WORDS AND PHRASES (automated validator rejects ANY of these — do not use even once):
+{all_banned}
 
-BANNED PUNCTUATION: No em dashes. Use commas or periods.
+ALSO BANNED (meta-commentary the validator catches):
+{leak_banned}
+
+BANNED PUNCTUATION: No em dashes (—) or en dashes (–). Use commas or periods.
 
 VOICE:
 - Write like a real engineer emailing someone they respect. Not formal, not casual. Just direct.
 - NEVER narrate or explain what you're doing. BAD: "This demonstrates my commitment to X." GOOD: Just state the fact and move on.
 - NEVER hedge. BAD: "might address some of your challenges." GOOD: "solves the same problem your team is facing."
-- NEVER use "Also," to start a sentence. NEVER use "Furthermore," or "Additionally,".
 - Every sentence should contain either a number, a tool name, or a specific outcome. If it doesn't, cut it.
 - Read it out loud. If it sounds like a robot wrote it, rewrite it.
-
-ADDITIONAL BANNED PHRASES:
-"This demonstrates", "This reflects", "This showcases", "This shows",
-"This experience translates", "which aligns with", "which is relevant to",
-"as demonstrated by", "showing experience with", "reflecting the need for",
-"which directly addresses", "I have experience with",
-"Also,", "Furthermore,", "Additionally,", "Moreover,"
 
 FABRICATION = INSTANT REJECTION:
 The candidate's real tools are ONLY: {skills_str}.
@@ -100,13 +96,30 @@ Do NOT mention ANY tool not in this list. If the job asks for tools not listed, 
 
 Sign off: just "{sign_off_name}"
 
-Output ONLY the letter. Start with "Dear Hiring Manager," end with the name."""
+Output ONLY the letter text. No subject lines. No "Here is the cover letter:" preamble. No notes after the sign-off.
+Start DIRECTLY with "Dear Hiring Manager," and end with the name."""
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+def _strip_preamble(text: str) -> str:
+    """Remove LLM preamble before 'Dear Hiring Manager,' if present.
+
+    Gemini and other models sometimes output "Here is the cover letter:" or
+    similar meta-commentary before the actual letter text. Strip everything
+    before the first occurrence of "Dear" so the validator's start-check passes.
+    """
+    dear_idx = text.lower().find("dear")
+    if dear_idx > 0:
+        return text[dear_idx:]
+    return text
 
 
 # ── Core Generation ──────────────────────────────────────────────────────
 
 def generate_cover_letter(
-    resume_text: str, job: dict, profile: dict, max_retries: int = 3
+    resume_text: str, job: dict, profile: dict,
+    max_retries: int = 3, validation_mode: str = "normal",
 ) -> str:
     """Generate a cover letter with fresh context on each retry + auto-sanitize.
 
@@ -114,10 +127,11 @@ def generate_cover_letter(
     in the prompt, no conversation history stacking.
 
     Args:
-        resume_text: The candidate's resume text (base or tailored).
-        job: Job dict with title, site, location, full_description.
-        profile: User profile dict.
-        max_retries: Maximum retry attempts.
+        resume_text:      The candidate's resume text (base or tailored).
+        job:              Job dict with title, site, location, full_description.
+        profile:          User profile dict.
+        max_retries:      Maximum retry attempts.
+        validation_mode:  "strict", "normal", or "lenient".
 
     Returns:
         The cover letter text (best attempt even if validation failed).
@@ -153,12 +167,14 @@ def generate_cover_letter(
 
         letter = client.chat(messages, max_tokens=1024, temperature=0.7)
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
+        letter = _strip_preamble(letter)  # remove any "Here is the letter:" prefix
 
-        validation = validate_cover_letter(letter)
+        validation = validate_cover_letter(letter, mode=validation_mode)
         if validation["passed"]:
             return letter
 
         avoid_notes.extend(validation["errors"])
+        # Warnings never block — only hard errors trigger a retry
         log.debug(
             "Cover letter attempt %d/%d failed: %s",
             attempt + 1, max_retries + 1, validation["errors"],
@@ -169,12 +185,14 @@ def generate_cover_letter(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
+def run_cover_letters(min_score: int = 7, limit: int = 20,
+                      validation_mode: str = "normal") -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
-        min_score: Minimum fit_score threshold.
-        limit: Maximum jobs to process.
+        min_score:       Minimum fit_score threshold.
+        limit:           Maximum jobs to process.
+        validation_mode: "strict", "normal", or "lenient".
 
     Returns:
         {"generated": int, "errors": int, "elapsed": float}
@@ -216,7 +234,8 @@ def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
     for job in jobs:
         completed += 1
         try:
-            letter = generate_cover_letter(resume_text, job, profile)
+            letter = generate_cover_letter(resume_text, job, profile,
+                                          validation_mode=validation_mode)
 
             # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")

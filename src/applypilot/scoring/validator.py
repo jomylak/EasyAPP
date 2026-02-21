@@ -3,6 +3,12 @@
 All validation is profile-driven -- no hardcoded personal data. The validator receives
 a profile dict (from applypilot.config.load_profile()) and validates against the user's
 actual skills, companies, projects, and school.
+
+Validation modes
+----------------
+strict  -- banned words = hard errors that trigger retries (original behavior)
+normal  -- banned words = warnings only; fabrication/structure = errors (default)
+lenient -- banned words ignored; only fabrication and required structure checked
 """
 
 import re
@@ -90,12 +96,16 @@ def sanitize_text(text: str) -> str:
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict) -> dict:
+def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
-        data: Parsed JSON from the LLM (title, summary, skills, experience, projects, education).
+        data:    Parsed JSON from the LLM (title, summary, skills, experience, projects, education).
         profile: User profile dict from load_profile().
+        mode:    Validation strictness — "strict", "normal", or "lenient".
+                 strict  → banned words are errors (trigger retries)
+                 normal  → banned words are warnings (no retry)
+                 lenient → banned words ignored entirely
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -103,7 +113,7 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys
+    # Required keys — always checked regardless of mode
     for key in ("title", "summary", "skills", "experience", "projects", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
@@ -113,7 +123,7 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
 
-    # Skills: check for fabrication
+    # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
         for fake in FABRICATION_WATCHLIST:
@@ -122,7 +132,7 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
 
-    # Experience: preserved companies must be present
+    # Experience: preserved companies must be present (always enforced)
     resume_facts = profile.get("resume_facts", {})
     preserved_companies = resume_facts.get("preserved_companies", [])
 
@@ -144,23 +154,30 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
-    # Education: preserved school must be present
+    # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
     if preserved_school:
         edu = str(data.get("education", ""))
         if preserved_school.lower() not in edu.lower():
             errors.append(f"Education '{preserved_school}' missing")
 
-    # Bulk checks on all text (word-boundary matching)
+    # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
 
-    found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", all_text)]
-    if found_banned:
-        errors.append(f"Banned words: {', '.join(found_banned[:3])}")
-
+    # LLM self-talk is always an error regardless of mode (indicates broken output)
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
+
+    # Banned filler words — severity depends on mode
+    if mode != "lenient":
+        found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", all_text)]
+        if found_banned:
+            msg = f"Banned words: {', '.join(found_banned[:5])}"
+            if mode == "strict":
+                errors.append(msg)
+            else:  # normal
+                warnings.append(msg)
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}
 
@@ -276,40 +293,53 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
-def validate_cover_letter(text: str) -> dict:
+def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     """Programmatic validation of a cover letter.
 
     Args:
         text: The cover letter text to validate.
+        mode: Validation strictness — "strict", "normal", or "lenient".
+              strict  → banned words are errors (trigger retries); word limit enforced
+              normal  → banned words are warnings; word limit is soft (+25 words)
+              lenient → banned words ignored; word count not checked
 
     Returns:
-        {"passed": bool, "errors": list[str]}
+        {"passed": bool, "errors": list[str], "warnings": list[str]}
     """
     errors: list[str] = []
+    warnings: list[str] = []
     text_lower = text.lower()
 
-    # 1. Em dashes
+    # 1. Em dashes — always an error (sanitize_text should have caught these)
     if "\u2014" in text or "\u2013" in text:
         errors.append("Contains em dash or en dash.")
 
-    # 2. Banned words (word-boundary matching)
-    found = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_lower)]
-    if found:
-        errors.append(f"Banned words: {', '.join(found[:5])}")
+    # 2. Banned words — severity depends on mode
+    if mode != "lenient":
+        found = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_lower)]
+        if found:
+            msg = f"Banned words: {', '.join(found[:5])}"
+            if mode == "strict":
+                errors.append(msg)
+            else:  # normal
+                warnings.append(msg)
 
-    # 3. Too long
+    # 3. Word count
     words = len(text.split())
-    if words > 300:
+    if mode == "strict" and words > 250:
         errors.append(f"Too long ({words} words). Max 250.")
+    elif mode == "normal" and words > 275:
+        warnings.append(f"Long ({words} words). Target 250.")
+    # lenient: no word count check
 
-    # 4. LLM self-talk
+    # 4. LLM self-talk — always an error regardless of mode
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
 
-    # 5. Must start with "Dear"
+    # 5. Must start with "Dear" — always checked (preamble should have been stripped)
     stripped = text.strip()
     if not stripped.lower().startswith("dear"):
         errors.append("Must start with 'Dear Hiring Manager,'")
 
-    return {"passed": len(errors) == 0, "errors": errors}
+    return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

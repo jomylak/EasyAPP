@@ -21,32 +21,34 @@ log = logging.getLogger(__name__)
 # Provider detection
 # ---------------------------------------------------------------------------
 
-_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-_OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
-_LOCAL_URL = os.environ.get("LLM_URL", "")
-
-
 def _detect_provider() -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables."""
+    """Return (base_url, model, api_key) based on environment variables.
+
+    Reads env at call time (not module import time) so that load_env() called
+    in _bootstrap() is always visible here.
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
-    if _GEMINI_KEY and not _LOCAL_URL:
+    if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_override or "gemini-2.0-flash",
-            _GEMINI_KEY,
+            gemini_key,
         )
 
-    if _OPENAI_KEY and not _LOCAL_URL:
+    if openai_key and not local_url:
         return (
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
-            _OPENAI_KEY,
+            openai_key,
         )
 
-    if _LOCAL_URL:
+    if local_url:
         return (
-            _LOCAL_URL.rstrip("/"),
+            local_url.rstrip("/"),
             model_override or "local-model",
             os.environ.get("LLM_API_KEY", ""),
         )
@@ -61,8 +63,12 @@ def _detect_provider() -> tuple[str, str, str]:
 # Client
 # ---------------------------------------------------------------------------
 
-_MAX_RETRIES = 3
+_MAX_RETRIES = 5
 _TIMEOUT = 120  # seconds
+
+# Base wait on first 429/503 (doubles each retry, caps at 60s).
+# Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
+_RATE_LIMIT_BASE_WAIT = 10
 
 
 class LLMClient:
@@ -109,9 +115,23 @@ class LLMClient:
                     headers=headers,
                 )
                 if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    wait = 2 ** attempt
+                    # Respect Retry-After header if provided (Gemini sends this).
+                    retry_after = (
+                        resp.headers.get("Retry-After")
+                        or resp.headers.get("X-RateLimit-Reset-Requests")
+                    )
+                    if retry_after:
+                        try:
+                            wait = float(retry_after)
+                        except (ValueError, TypeError):
+                            wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
+                    else:
+                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+
                     log.warning(
-                        "LLM returned %s, retrying in %ds (attempt %d/%d)",
+                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
+                        "Tip: Gemini free tier = 15 RPM. Consider adding GEMINI_API_KEY "
+                        "from a paid account or switching to a local model.",
                         resp.status_code, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
@@ -121,7 +141,7 @@ class LLMClient:
                 return data["choices"][0]["message"]["content"]
             except httpx.TimeoutException:
                 if attempt < _MAX_RETRIES - 1:
-                    wait = 2 ** attempt
+                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
                     log.warning(
                         "LLM request timed out, retrying in %ds (attempt %d/%d)",
                         wait, attempt + 1, _MAX_RETRIES,

@@ -87,6 +87,16 @@ def run(
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
+    validation: str = typer.Option(
+        "normal",
+        "--validation",
+        help=(
+            "Validation strictness for tailor/cover stages. "
+            "strict: banned words = errors, judge must pass. "
+            "normal: banned words = warnings only (default, recommended for Gemini free tier). "
+            "lenient: banned words ignored, LLM judge skipped (fastest, fewest API calls)."
+        ),
+    ),
 ) -> None:
     """Run pipeline stages: discover, enrich, score, tailor, cover, pdf."""
     _bootstrap()
@@ -110,12 +120,22 @@ def run(
         from applypilot.config import check_tier
         check_tier(2, "AI scoring/tailoring")
 
+    # Validate the --validation flag value
+    valid_modes = ("strict", "normal", "lenient")
+    if validation not in valid_modes:
+        console.print(
+            f"[red]Invalid --validation value:[/red] '{validation}'. "
+            f"Choose from: {', '.join(valid_modes)}"
+        )
+        raise typer.Exit(code=1)
+
     result = run_pipeline(
         stages=stage_list,
         min_score=min_score,
         dry_run=dry_run,
         stream=stream,
         workers=workers,
+        validation_mode=validation,
     )
 
     if result.get("errors"):
@@ -310,6 +330,127 @@ def dashboard() -> None:
     from applypilot.view import open_dashboard
 
     open_dashboard()
+
+
+@app.command()
+def doctor() -> None:
+    """Check your setup and diagnose missing requirements."""
+    import shutil
+    from applypilot.config import (
+        load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
+        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+    )
+
+    load_env()
+
+    ok_mark = "[green]OK[/green]"
+    fail_mark = "[red]MISSING[/red]"
+    warn_mark = "[yellow]WARN[/yellow]"
+
+    results: list[tuple[str, str, str]] = []  # (check, status, note)
+
+    # --- Tier 1 checks ---
+    # Profile
+    if PROFILE_PATH.exists():
+        results.append(("profile.json", ok_mark, str(PROFILE_PATH)))
+    else:
+        results.append(("profile.json", fail_mark, "Run 'applypilot init' to create"))
+
+    # Resume
+    if RESUME_PATH.exists():
+        results.append(("resume.txt", ok_mark, str(RESUME_PATH)))
+    elif RESUME_PDF_PATH.exists():
+        results.append(("resume.txt", warn_mark, "Only PDF found — plain-text needed for AI stages"))
+    else:
+        results.append(("resume.txt", fail_mark, "Run 'applypilot init' to add your resume"))
+
+    # Search config
+    if SEARCH_CONFIG_PATH.exists():
+        results.append(("searches.yaml", ok_mark, str(SEARCH_CONFIG_PATH)))
+    else:
+        results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
+
+    # jobspy (discovery dep installed separately)
+    try:
+        import jobspy  # noqa: F401
+        results.append(("python-jobspy", ok_mark, "Job board scraping available"))
+    except ImportError:
+        results.append(("python-jobspy", warn_mark,
+                        "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
+
+    # --- Tier 2 checks ---
+    import os
+    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
+    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_local = bool(os.environ.get("LLM_URL"))
+    if has_gemini:
+        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
+        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+    elif has_openai:
+        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+    elif has_local:
+        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+    else:
+        results.append(("LLM API key", fail_mark,
+                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+
+    # --- Tier 3 checks ---
+    # Claude Code CLI
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        results.append(("Claude Code CLI", ok_mark, claude_bin))
+    else:
+        results.append(("Claude Code CLI", fail_mark,
+                        "Install from https://claude.ai/code (needed for auto-apply)"))
+
+    # Chrome
+    try:
+        chrome_path = get_chrome_path()
+        results.append(("Chrome/Chromium", ok_mark, chrome_path))
+    except FileNotFoundError:
+        results.append(("Chrome/Chromium", fail_mark,
+                        "Install Chrome or set CHROME_PATH env var (needed for auto-apply)"))
+
+    # Node.js / npx (for Playwright MCP)
+    npx_bin = shutil.which("npx")
+    if npx_bin:
+        results.append(("Node.js (npx)", ok_mark, npx_bin))
+    else:
+        results.append(("Node.js (npx)", fail_mark,
+                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+
+    # CapSolver (optional)
+    capsolver = os.environ.get("CAPSOLVER_API_KEY")
+    if capsolver:
+        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
+    else:
+        results.append(("CapSolver API key", "[dim]optional[/dim]",
+                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+
+    # --- Render results ---
+    console.print()
+    console.print("[bold]ApplyPilot Doctor[/bold]\n")
+
+    col_w = max(len(r[0]) for r in results) + 2
+    for check, status, note in results:
+        pad = " " * (col_w - len(check))
+        console.print(f"  {check}{pad}{status}  [dim]{note}[/dim]")
+
+    console.print()
+
+    # Tier summary
+    from applypilot.config import get_tier, TIER_LABELS
+    tier = get_tier()
+    console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
+
+    if tier == 1:
+        console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+    elif tier == 2:
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+
+    console.print()
 
 
 if __name__ == "__main__":
