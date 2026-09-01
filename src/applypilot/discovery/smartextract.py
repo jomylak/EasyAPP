@@ -27,6 +27,7 @@ import httpx
 import yaml
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
@@ -44,6 +45,17 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         pass
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# Known analytics/telemetry domains -- never job data, not worth an LLM judge
+# call. Filtered out before capture rather than after, to save API quota.
+_TELEMETRY_DOMAINS = (
+    "amplitude.com", "segment.io", "segment.com", "google-analytics.com",
+    "googletagmanager.com", "doubleclick.net", "hotjar.com", "sentry.io",
+    "fullstory.com", "mixpanel.com", "intercom.io", "facebook.com/tr",
+    "clarity.ms", "bugsnag.com", "datadoghq.com", "newrelic.com",
+    "airtable.com/internal", "cloudflareinsights.com", "posthog.com",
+    "heap.io", "logrocket.com", "clickcease.com", "hs-analytics.net",
+)
 
 
 # -- Location filtering -------------------------------------------------------
@@ -85,6 +97,55 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
+def _posted_within_days(posted_date: str | None, days: int = 7) -> bool:
+    """Check if a scraped posting date is within the last N days.
+
+    Best-effort: dates come from LLM-extracted card text in all sorts of
+    formats ("2 days ago", "Aug 28, 2026", "08/28/2026"). If it can't be
+    parsed at all, we keep the job rather than silently dropping it --
+    better to over-include than to zero out results because of a brittle
+    date field on a page we've never scraped before.
+    """
+    if not posted_date or not posted_date.strip():
+        return True
+
+    from dateutil import parser as dateutil_parser
+
+    text = posted_date.strip().lower()
+
+    # Relative formats ("2 days ago", "today", "yesterday") -- common on
+    # job boards and not something dateutil parses on its own.
+    relative_match = re.search(r"(\d+)\s*(hour|day|week)s?\s*ago", text)
+    if relative_match:
+        n, unit = int(relative_match.group(1)), relative_match.group(2)
+        age_days = n / 24 if unit == "hour" else n if unit == "day" else n * 7
+        return age_days <= days
+    if "today" in text or "just posted" in text or "hour" in text:
+        return True
+    if "yesterday" in text:
+        return 1 <= days
+
+    try:
+        parsed = dateutil_parser.parse(posted_date, fuzzy=True)
+    except (ValueError, OverflowError):
+        return True
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    age = datetime.now(timezone.utc) - parsed
+    return age.days <= days
+
+
+def _classify_job_type(site: str) -> str | None:
+    """Derive internship vs new-grad from the source site name (config/sites.yaml)."""
+    site_lower = site.lower()
+    if "intern" in site_lower:
+        return "internship"
+    if "newgrad" in site_lower or "new grad" in site_lower or "new-grad" in site_lower:
+        return "new_grad"
+    return None
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -98,6 +159,8 @@ def _store_jobs_filtered(
     new = 0
     existing = 0
     filtered = 0
+    too_old = 0
+    job_type = _classify_job_type(site)
 
     for job in jobs:
         url = job.get("url")
@@ -106,12 +169,15 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
+        if not _posted_within_days(job.get("posted_date"), days=7):
+            too_old += 1
+            continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, job_type),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -119,6 +185,8 @@ def _store_jobs_filtered(
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
+    if too_old:
+        log.info("Filtered %d jobs (posted more than 7 days ago)", too_old)
     conn.commit()
     return new, existing
 
@@ -145,6 +213,8 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
         rurl = response.url
         if any(ext in rurl for ext in [".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico", ".gif", ".webp"]):
             return
+        if any(domain in rurl for domain in _TELEMETRY_DOMAINS):
+            return
         if "json" in ct or "/api/" in rurl or "algolia" in rurl or "graphql" in rurl:
             try:
                 body = response.text()
@@ -167,7 +237,13 @@ def collect_page_intelligence(url: str, headless: bool = True) -> dict:
         page.on("response", on_response)
 
         page.goto(url, timeout=60000)
-        page.wait_for_load_state("networkidle")
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeoutError:
+            # Some sites (continuous analytics/ad beacons) never go fully
+            # idle. The page is already loaded via goto() above -- proceed
+            # with whatever's rendered rather than failing the whole run.
+            log.info("Page never reached networkidle within 15s, proceeding anyway: %s", url)
 
         intel["page_title"] = page.title()
 
@@ -505,14 +581,15 @@ HOW TO THINK:
 - For api_response: "items_path" must point to the ARRAY of items, not a single item. Use dot notation with [n] ONLY for traversing into a specific index to reach an inner array. Example: if data is {{"results": [{{"hits": [...]}}]}}, items_path is "results[0].hits" to reach the hits array.
 - For api_response: field paths (title, salary, etc.) are RELATIVE TO EACH ITEM in the array. If items are nested objects like {{"_source": {{"Title": "..."}}}}, use "_source.Title" for the title field.
 - For css_selectors: just return {{"strategy":"css_selectors","reasoning":"...","extraction":{{}}}} -- selectors will be generated in a separate focused step.
+- If the data includes a posted/published date (JSON-LD's "datePosted" is standard; API responses often have "created_at", "posted_at", "date", "published"), map it to "posted_date". Use null if there's genuinely no date field -- do not guess.
 
 Return ONLY valid JSON:
 
 For json_ld:
-{{"strategy":"json_ld","reasoning":"...","extraction":{{"title":"title","salary":"baseSalary_path_or_null","description":"description","location":"jobLocation[0].address.addressCountry","url":"url_field"}}}}
+{{"strategy":"json_ld","reasoning":"...","extraction":{{"title":"title","salary":"baseSalary_path_or_null","description":"description","location":"jobLocation[0].address.addressCountry","url":"url_field","posted_date":"datePosted_or_null"}}}}
 
 For api_response:
-{{"strategy":"api_response","reasoning":"...","extraction":{{"url_pattern":"actual.url.substring","items_path":"path.to.the.array","title":"field_in_each_item","salary":"salary_field_or_null","description":"description_field_or_null","location":"location_path","url":"url_field"}}}}
+{{"strategy":"api_response","reasoning":"...","extraction":{{"url_pattern":"actual.url.substring","items_path":"path.to.the.array","title":"field_in_each_item","salary":"salary_field_or_null","description":"description_field_or_null","location":"location_path","url":"url_field","posted_date":"date_field_or_null"}}}}
 
 For css_selectors:
 {{"strategy":"css_selectors","reasoning":"...","extraction":{{}}}}
@@ -619,6 +696,7 @@ Return a JSON object:
 - "description": selector relative to card for description snippet, or null
 - "location": selector relative to card for location, or null
 - "url": selector relative to card for the link (<a> tag) to the job detail page
+- "posted_date": selector relative to card for a posted/updated date or "X days ago" text, or null if the card doesn't show one
 
 Selector rules:
 - SIMPLEST wins. A single attribute selector like [data-testid="job-card"] is better than a multi-level path like li > div > [data-testid="job-card"]. Do NOT add parent/ancestor selectors unless the target is ambiguous without them.
@@ -734,7 +812,7 @@ def execute_json_ld(intel: dict, plan: dict) -> list[dict]:
         if not isinstance(entry, dict) or entry.get("@type") != "JobPosting":
             continue
         job: dict = {}
-        for field in ["title", "salary", "description", "location", "url"]:
+        for field in ["title", "salary", "description", "location", "url", "posted_date"]:
             path = ext.get(field)
             if not path or path == "null":
                 job[field] = None
@@ -770,7 +848,7 @@ def execute_api_response(intel: dict, plan: dict) -> list[dict]:
         if not isinstance(item, dict):
             continue
         job: dict = {}
-        for field in ["title", "salary", "description", "location", "url"]:
+        for field in ["title", "salary", "description", "location", "url", "posted_date"]:
             path = ext.get(field)
             if not path or path == "null":
                 job[field] = None
@@ -827,7 +905,7 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     jobs: list[dict] = []
     for card in cards:
         job: dict = {}
-        for field in ["title", "salary", "description", "location", "url"]:
+        for field in ["title", "salary", "description", "location", "url", "posted_date"]:
             sel = selectors.get(field)
             if not sel or sel == "null":
                 job[field] = None

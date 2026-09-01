@@ -16,7 +16,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import (
+    RESUME_PATH, TAILORED_DIR, load_profile, load_settings, get_resume_variant_paths,
+)
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -453,6 +455,102 @@ def tailor_resume(
     return tailored, report
 
 
+# ── Passthrough mode (tailoring disabled) ─────────────────────────────────
+
+def _pick_resume_variant(job: dict, settings: dict) -> str:
+    """Pick which base resume variant to use for a job, no LLM involved.
+
+    Jobs the scorer flagged as requiring a returning student get the
+    'returning_2028' variant; everything else gets the configured default.
+    """
+    if job.get("requires_returning_student") == "yes":
+        return "returning_2028"
+    return settings.get("default_resume_variant", "default")
+
+
+def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
+    """Skip LLM tailoring entirely -- attach the base resume as-is per job.
+
+    Used while `tailoring_enabled` is False in settings.json (e.g. while the
+    LaTeX-based tailoring path is still being built). Still picks between
+    resume variants (default vs returning-student) based on what the scorer
+    detected from the job description -- that part doesn't need an LLM call
+    since scoring already reads the full description.
+
+    Returns:
+        {"approved": int, "failed": int, "errors": int, "elapsed": float}
+    """
+    settings = load_settings()
+    conn = get_connection()
+    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+
+    if not jobs:
+        log.info("No untailored jobs with score >= %d.", min_score)
+        return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
+
+    TAILORED_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Tailoring DISABLED -- attaching base resume for %d jobs (score >= %d)...",
+              len(jobs), min_score)
+
+    t0 = time.time()
+    now = datetime.now(timezone.utc).isoformat()
+    approved = 0
+    needs_review = 0
+
+    for job in jobs:
+        variant = _pick_resume_variant(job, settings)
+        txt_path, pdf_path, grad_date = get_resume_variant_paths(variant)
+
+        safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+        prefix = f"{safe_site}_{safe_title}"
+
+        if not txt_path.exists() or not pdf_path.exists():
+            log.warning(
+                "Resume variant '%s' not found (%s / %s) -- flagging for review: %s",
+                variant, txt_path, pdf_path, job["title"][:50],
+            )
+            conn.execute(
+                "UPDATE jobs SET review_status = 'needs_review', "
+                "tailor_attempts = COALESCE(tailor_attempts, 0) + 1 WHERE url = ?",
+                (job["url"],),
+            )
+            needs_review += 1
+            continue
+
+        dest_txt = TAILORED_DIR / f"{prefix}.txt"
+        dest_pdf = TAILORED_DIR / f"{prefix}.pdf"
+        dest_txt.write_bytes(txt_path.read_bytes())
+        dest_pdf.write_bytes(pdf_path.read_bytes())
+
+        job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+        job_path.write_text(
+            f"Title: {job['title']}\nCompany: {job['site']}\n"
+            f"Location: {job.get('location', 'N/A')}\nScore: {job.get('fit_score', 'N/A')}\n"
+            f"URL: {job['url']}\n\n{job.get('full_description', '')}",
+            encoding="utf-8",
+        )
+        report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+        report_path.write_text(json.dumps({
+            "status": "passthrough", "resume_variant": variant, "grad_date": grad_date,
+        }, indent=2), encoding="utf-8")
+
+        conn.execute(
+            "UPDATE jobs SET tailored_resume_path = ?, tailored_at = ?, "
+            "tailor_attempts = COALESCE(tailor_attempts, 0) + 1, resume_variant = ? "
+            "WHERE url = ?",
+            (str(dest_txt), now, variant, job["url"]),
+        )
+        approved += 1
+        log.info("[PASSTHROUGH] variant=%s -- %s", variant, job["title"][:50])
+
+    conn.commit()
+    elapsed = time.time() - t0
+    log.info("Passthrough tailoring done in %.1fs: %d attached, %d needs_review",
+              elapsed, approved, needs_review)
+    return {"approved": approved, "failed": needs_review, "errors": 0, "elapsed": elapsed}
+
+
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
@@ -467,6 +565,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
+    if not load_settings().get("tailoring_enabled", True):
+        return run_tailoring_passthrough(min_score=min_score, limit=limit)
+
     profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()

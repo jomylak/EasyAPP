@@ -35,10 +35,22 @@ IMPORTANT FACTORS:
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
 
+RETURNING STUDENT CHECK:
+Some internships require the candidate to be enrolled in school and returning for at least one more semester/term AFTER the internship ends (e.g. "must be currently enrolled and returning to school following the internship", "not graduating before [date]", "rising senior" for a non-final-semester role). Only answer yes if the posting explicitly requires continued enrollment after the internship -- do not infer it from a generic "student" or "currently pursuing degree" requirement that a graduating senior would also satisfy.
+
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
+REQUIRES_RETURNING_STUDENT: [yes or no]
 REASONING: [2-3 sentences explaining the score]"""
+
+# Soft location tiebreaker — never a hard filter. Location-based rejection is
+# handled separately (search config accept/reject lists); this only nudges
+# ties among otherwise-comparable skill matches. Edit this list to change
+# which metros get the nudge.
+PREFERRED_METROS = [
+    "New York City", "San Francisco Bay Area", "Seattle", "Austin", "Boston",
+]
 
 
 def _parse_score_response(response: str) -> dict:
@@ -53,6 +65,7 @@ def _parse_score_response(response: str) -> dict:
     score = 0
     keywords = ""
     reasoning = response
+    requires_returning_student = "no"
 
     for line in response.split("\n"):
         line = line.strip()
@@ -64,10 +77,16 @@ def _parse_score_response(response: str) -> dict:
                 score = 0
         elif line.startswith("KEYWORDS:"):
             keywords = line.replace("KEYWORDS:", "").strip()
+        elif line.startswith("REQUIRES_RETURNING_STUDENT:"):
+            val = line.replace("REQUIRES_RETURNING_STUDENT:", "").strip().lower()
+            requires_returning_student = "yes" if val.startswith("yes") else "no"
         elif line.startswith("REASONING:"):
             reasoning = line.replace("REASONING:", "").strip()
 
-    return {"score": score, "keywords": keywords, "reasoning": reasoning}
+    return {
+        "score": score, "keywords": keywords, "reasoning": reasoning,
+        "requires_returning_student": requires_returning_student,
+    }
 
 
 def score_job(resume_text: str, job: dict) -> dict:
@@ -87,8 +106,18 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
 
+    metros = ", ".join(PREFERRED_METROS)
+    location_note = (
+        f"\n\nCANDIDATE LOCATION NOTE (soft tiebreaker ONLY — never reduce the "
+        f"score for this): the candidate has a mild preference for roles in "
+        f"{metros}, or fully remote. If the job is based there, and the skills "
+        f"match is otherwise close, you may nudge the score up by at most 1 "
+        f"point. Do NOT penalize jobs anywhere else in the US for location — "
+        f"score those purely on skills/experience fit."
+    )
+
     messages = [
-        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "system", "content": SCORE_PROMPT + location_note},
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
@@ -98,7 +127,8 @@ def score_job(resume_text: str, job: dict) -> dict:
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}",
+                "requires_returning_student": "no"}
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -156,8 +186,10 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
         conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
+            "requires_returning_student = ? WHERE url = ?",
+            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now,
+             r.get("requires_returning_student", "no"), r["url"]),
         )
     conn.commit()
 

@@ -2,7 +2,7 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
+  GEMINI_API_KEY  -> Google Gemini (default: gemini-3.1-flash-lite)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
@@ -11,6 +11,7 @@ LLM_MODEL env var overrides the model name for any provider.
 
 import logging
 import os
+import threading
 import time
 
 import httpx
@@ -35,7 +36,7 @@ def _detect_provider() -> tuple[str, str, str]:
     if gemini_key and not local_url:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            model_override or "gemini-2.0-flash",
+            model_override or "gemini-3.1-flash-lite",
             gemini_key,
         )
 
@@ -70,6 +71,10 @@ _TIMEOUT = 120  # seconds
 # Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
 _RATE_LIMIT_BASE_WAIT = 10
 
+# Proactive pacing floor between consecutive Gemini calls (see LLMClient._pace).
+# 15 RPM = 4.0s minimum; a little headroom for clock/network jitter.
+_GEMINI_MIN_CALL_INTERVAL = 4.3
+
 
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -92,6 +97,11 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        # Proactive pacing (Gemini free tier = 15 RPM = one call per 4s).
+        # Shared across threads since discovery/apply can run with --workers > 1
+        # and all of them share this one client instance.
+        self._pace_lock = threading.Lock()
+        self._last_call_at: float = 0.0
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -164,6 +174,14 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
+        # Gemini 3.x models think by default, which can silently eat the
+        # entire max_tokens budget on invisible reasoning and leave no room
+        # for the actual answer (empty/missing `content`). "minimal" keeps
+        # responses fast and non-empty for the short, structured outputs
+        # this codebase asks for (JSON, SCORE:/KEYWORDS: lines, etc).
+        if self._is_gemini:
+            payload["reasoning_effort"] = "minimal"
+
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
             json=payload,
@@ -181,9 +199,34 @@ class LLMClient:
     def _handle_compat_response(resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"].get("content")
+        if not content:
+            finish_reason = data["choices"][0].get("finish_reason", "?")
+            raise RuntimeError(
+                f"LLM returned no content (finish_reason={finish_reason}). "
+                f"This usually means max_tokens was too low for the model's reasoning "
+                f"overhead -- raise it or check the reasoning_effort setting."
+            )
+        return content
 
     # -- public API ---------------------------------------------------------
+
+    def _pace(self) -> None:
+        """Proactively space out calls to stay under Gemini's free-tier 15 RPM.
+
+        Reactive backoff-after-429 (below) still exists as a safety net, but
+        pacing up front avoids the wasted 10s/20s/40s/60s retry storms that
+        happen when several calls fire back-to-back (e.g. judging a dozen
+        intercepted API responses one after another).
+        """
+        if not self._is_gemini:
+            return
+        with self._pace_lock:
+            elapsed = time.monotonic() - self._last_call_at
+            wait = _GEMINI_MIN_CALL_INTERVAL - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call_at = time.monotonic()
 
     def chat(
         self,
@@ -198,6 +241,8 @@ class LLMClient:
             first = messages[0]
             if first.get("role") == "user" and not first["content"].startswith("/no_think"):
                 messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
+
+        self._pace()
 
         for attempt in range(_MAX_RETRIES):
             try:
