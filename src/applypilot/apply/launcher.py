@@ -398,6 +398,20 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
+            elif dry_run:
+                # A dry run must not change the job's state. The agent is told
+                # to report RESULT:APPLIED with a dry-run note, so without this
+                # the job would be recorded as submitted and never picked up
+                # again -- an application silently lost.
+                release_lock(job["url"])
+                outcome = result.split(":", 1)[0]
+                add_event(f"[W{worker_id}] DRY RUN ({outcome}), not recorded: {job['title'][:28]}")
+                update_state(worker_id, status="done",
+                             last_action=f"dry run: {outcome} (not saved)")
+                jobs_done += 1
+                if target_url:
+                    break
+                continue
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms,
                             backend=backend, llm_requests=llm_requests)
