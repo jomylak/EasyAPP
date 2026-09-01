@@ -28,7 +28,6 @@ def _build_profile_summary(profile: dict) -> str:
     comp = p["compensation"]
     exp = p.get("experience", {})
     avail = p.get("availability", {})
-    eeo = p.get("eeo_voluntary", {})
 
     lines = [
         f"Name: {personal['full_name']}",
@@ -83,11 +82,10 @@ def _build_profile_summary(profile: dict) -> str:
         "How Heard: Online Job Board",
     ])
 
-    # EEO
-    lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
-    lines.append(f"Race: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
-    lines.append(f"Veteran: {eeo.get('veteran_status', 'I am not a protected veteran')}")
-    lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
+    # EEO/demographics are deliberately NOT included. The screening section
+    # instructs the agent to decline to self-identify on every one of them, so
+    # sending the real values would transmit the most sensitive category of
+    # personal data to the model on every request without ever using it.
 
     return "\n".join(lines)
 
@@ -162,7 +160,7 @@ Decision tree:
 6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
 
 
-def _build_screening_section(profile: dict) -> str:
+def _build_screening_section(profile: dict, grad_date: str = "") -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
@@ -171,11 +169,19 @@ def _build_screening_section(profile: dict) -> str:
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
 
+    grad_line = ""
+    if grad_date:
+        grad_line = (
+            f"  - Expected graduation date / class standing: {grad_date}. This MUST match the "
+            f"resume attached to this application -- do not give a different date than what's "
+            f"printed on the resume, even if your training data suggests otherwise.\n"
+        )
+
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
   - Location/relocation: lives in {city}, cannot relocate
   - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
-  - Citizenship, clearance, licenses, certifications: answer from profile only
+{grad_line}  - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
 Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
@@ -417,23 +423,25 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
-def build_prompt(job: dict, tailored_resume: str,
-                 cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
-    """Build the full instruction prompt for the apply agent.
+def _prepare_context(job: dict, cover_letter: str | None = None,
+                     worker_id: int | None = None) -> dict:
+    """Resolve documents and build every reusable prompt section for a job.
 
-    Loads the user profile and search config internally. All personal data
-    comes from the profile -- nothing is hardcoded.
+    Shared by both prompt assemblers so the Claude Code and Skyvern paths
+    describe the same candidate, the same eligibility rules and the same
+    salary/screening strategy -- only the surrounding tool instructions differ.
 
     Args:
-        job: Job dict from the database (must have url, title, site,
-             application_url, fit_score, tailored_resume_path).
-        tailored_resume: Plain-text content of the tailored resume.
-        cover_letter: Optional plain-text cover letter content.
-        dry_run: If True, tell the agent not to click Submit.
+        job: Job dict from the database.
+        cover_letter: Optional plain-text cover letter override.
+        worker_id: When given, documents are copied into a per-worker
+            directory instead of the shared ``current`` one. The Skyvern
+            backend needs this because it serves that directory over HTTP,
+            and because parallel workers would otherwise overwrite each
+            other's uploads.
 
     Returns:
-        Complete prompt string for the AI agent.
+        Dict of resolved paths, text and rendered prompt sections.
     """
     profile = config.load_profile()
     search_config = config.load_search_config()
@@ -451,7 +459,8 @@ def build_prompt(job: dict, tailored_resume: str,
     # Copy to a clean filename for upload (recruiters see the filename)
     full_name = personal["full_name"]
     name_slug = full_name.replace(" ", "_")
-    dest_dir = config.APPLY_WORKER_DIR / "current"
+    dest_dir = (config.APPLY_WORKER_DIR / f"worker-{worker_id}" / "documents"
+                if worker_id is not None else config.APPLY_WORKER_DIR / "current")
     dest_dir.mkdir(parents=True, exist_ok=True)
     upload_pdf = dest_dir / f"{name_slug}_Resume.pdf"
     shutil.copy(str(src_pdf), str(upload_pdf))
@@ -476,11 +485,15 @@ def build_prompt(job: dict, tailored_resume: str,
             shutil.copy(str(cl_pdf_src), str(cl_upload))
             cl_upload_path = str(cl_upload)
 
+    # --- Resume variant -> graduation date (must match what's on the resume) ---
+    resume_variant = job.get("resume_variant") or "default"
+    _, _, grad_date = config.get_resume_variant_paths(resume_variant)
+
     # --- Build all prompt sections ---
     profile_summary = _build_profile_summary(profile)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
-    screening_section = _build_screening_section(profile)
+    screening_section = _build_screening_section(profile, grad_date=grad_date)
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
 
@@ -506,6 +519,64 @@ def build_prompt(job: dict, tailored_resume: str,
     preferred_name = personal.get("preferred_name", full_name.split()[0])
     last_name = full_name.split()[-1] if " " in full_name else ""
     display_name = f"{preferred_name} {last_name}".strip()
+
+    return {
+        "profile": profile,
+        "search_config": search_config,
+        "personal": personal,
+        "full_name": full_name,
+        "pdf_path": pdf_path,
+        "upload_pdf": upload_pdf,
+        "dest_dir": dest_dir,
+        "cover_letter_text": cover_letter_text,
+        "cl_upload_path": cl_upload_path,
+        "cl_display": cl_display,
+        "grad_date": grad_date,
+        "profile_summary": profile_summary,
+        "location_check": location_check,
+        "salary_section": salary_section,
+        "screening_section": screening_section,
+        "hard_rules": hard_rules,
+        "phone_digits": phone_digits,
+        "blocked_sso": blocked_sso,
+        "display_name": display_name,
+    }
+
+
+def build_prompt(job: dict, tailored_resume: str,
+                 cover_letter: str | None = None,
+                 dry_run: bool = False) -> str:
+    """Build the full instruction prompt for the apply agent.
+
+    Loads the user profile and search config internally. All personal data
+    comes from the profile -- nothing is hardcoded.
+
+    Args:
+        job: Job dict from the database (must have url, title, site,
+             application_url, fit_score, tailored_resume_path).
+        tailored_resume: Plain-text content of the tailored resume.
+        cover_letter: Optional plain-text cover letter content.
+        dry_run: If True, tell the agent not to click Submit.
+
+    Returns:
+        Complete prompt string for the AI agent.
+    """
+    ctx = _prepare_context(job, cover_letter=cover_letter)
+    profile = ctx["profile"]
+    personal = ctx["personal"]
+    full_name = ctx["full_name"]
+    pdf_path = ctx["pdf_path"]
+    cl_upload_path = ctx["cl_upload_path"]
+    cl_display = ctx["cl_display"]
+    profile_summary = ctx["profile_summary"]
+    location_check = ctx["location_check"]
+    salary_section = ctx["salary_section"]
+    screening_section = ctx["screening_section"]
+    hard_rules = ctx["hard_rules"]
+    phone_digits = ctx["phone_digits"]
+    blocked_sso = ctx["blocked_sso"]
+    display_name = ctx["display_name"]
+    captcha_section = _build_captcha_section()
 
     # Dry-run: override submit instruction
     if dry_run:
@@ -571,7 +642,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
    5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code.
+   5f. Need email verification? Use search_emails + read_email to get the code. If a normal inbox search finds nothing after ~15s, ALSO search with "in:spam" -- verification emails from employer ATS systems often get flagged as spam (this is expected, not a bug: forwarded mail commonly fails sender authentication checks at the destination). Codes typically expire in ~10 minutes, so don't waste time -- check spam promptly rather than retrying the inbox search repeatedly.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
@@ -622,3 +693,146 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 Stop immediately. Output your RESULT code. Do not loop."""
 
     return prompt
+
+
+def build_skyvern_goal(job: dict, tailored_resume: str,
+                       resume_url: str,
+                       cover_letter_url: str = "",
+                       cover_letter_text: str = "",
+                       profile_summary: str = "",
+                       location_check: str = "",
+                       salary_section: str = "",
+                       screening_section: str = "",
+                       hard_rules: str = "",
+                       display_name: str = "",
+                       phone_digits: str = "",
+                       personal: dict | None = None,
+                       dry_run: bool = False) -> str:
+    """Build the navigation goal for the Skyvern backend.
+
+    Deliberately different from ``build_prompt``, not just a trimmed copy:
+
+    - No Playwright MCP tool names. ``browser_snapshot``/``browser_click``/
+      ``browser_fill_form`` are Claude Code's tools; naming them here would
+      describe an API Skyvern does not have and actively mislead the model.
+    - No CAPTCHA section. That flow drives the CapSolver REST API by hand and
+      has no Skyvern equivalent.
+    - No ``RESULT:`` codes. Skyvern reports the outcome through the run's
+      ``data_extraction_schema`` instead of by printing a line we regex out.
+    - No step-by-step browser mechanics or "when to give up" rules. Skyvern
+      has its own action layer and a ``max_steps`` budget.
+
+    What it keeps is everything about *the candidate and the decision rules* --
+    profile, eligibility, salary strategy, screening guidance, hard rules --
+    so both backends apply as the same person under the same constraints.
+
+    Args:
+        resume_url: Loopback URL the tailored resume is served at. Skyvern
+            uploads files by downloading them first, so this must be a URL,
+            not a path. See ``apply.fileserver``.
+        cover_letter_url: Same, for the cover letter PDF (may be empty).
+
+    Returns:
+        The navigation goal string.
+    """
+    personal = personal or {}
+
+    if dry_run:
+        submit_instruction = (
+            "DRY RUN: fill in every field completely, but do NOT click the final "
+            "Submit/Apply button. Once the form is filled and reviewed, stop and "
+            "report the result as applied, noting that this was a dry run."
+        )
+    else:
+        submit_instruction = (
+            "Before submitting, re-read every field on the page and confirm it matches "
+            "the applicant profile and resume -- name, email, phone, location, work "
+            "authorization, resume uploaded, cover letter if applicable. Fix anything "
+            "wrong or missing first. Then submit, and confirm the submission landed "
+            "(a confirmation page, 'thank you', or 'application received')."
+        )
+
+    cl_block = cover_letter_text or (
+        "None available. Skip if optional. If required, write two factual sentences "
+        "drawn from the resume."
+    )
+    cl_file_line = (
+        f"Cover letter PDF (download and upload if a file field asks for one): {cover_letter_url}"
+        if cover_letter_url else "Cover letter PDF: none"
+    )
+
+    return f"""Apply to this job on behalf of the candidate described below, and submit the application.
+
+== JOB ==
+Title: {job['title']}
+Company: {job.get('site', 'Unknown')}
+
+== FILES ==
+Resume PDF (upload this to any resume/CV file field): {resume_url}
+{cl_file_line}
+
+The resume is served over HTTP. When a file upload field asks for a resume or CV,
+use that URL. Always upload this resume even if the form already has one attached --
+it is tailored to this specific job. This is required; an application submitted
+without it does not count as complete.
+
+== APPLICANT PROFILE ==
+{profile_summary}
+
+== RESUME TEXT (source of truth for any text field) ==
+{tailored_resume}
+
+== COVER LETTER TEXT (paste if a text field asks for one) ==
+{cl_block}
+
+{hard_rules}
+
+== NEVER DO THESE (stop and report failure instead) ==
+- Never grant camera, microphone, screen sharing, or location permissions -> unsafe_permissions
+- Never do video/audio verification, selfie capture, ID photo upload, or biometrics -> unsafe_verification
+- Never create a freelancing or contractor marketplace profile (Mercor, Toptal, Upwork,
+  Fiverr, Turing). Those are not job applications -> not_a_job_application
+- Never agree to hourly/contract rates, availability calendars, or "set your rate" flows.
+  This candidate is applying for full-time salaried roles only.
+- Never install browser extensions, download executables, or run assessment software.
+- Never enter payment details, bank details, or a national ID / SSN / SIN.
+- Never sign in through Google, Microsoft, or any other SSO/OAuth provider -> sso_required
+- If the page is not actually a job application (profile builder, talent network signup,
+  skills marketplace, coding assessment platform) -> not_a_job_application
+
+{location_check}
+
+{salary_section}
+
+{screening_section}
+
+== ACCOUNTS AND LOGINS ==
+If the site requires an account on the employer's own system, sign in with
+{personal.get('email', 'the profile email')} and the profile password, or register a new
+account with the same email. If sign-in and registration both fail, or the site demands
+SSO, stop and report login_issue rather than retrying indefinitely.
+
+If a step asks for an emailed verification code, request the code and enter it -- it is
+fetched from the inbox automatically, including from the spam folder, so wait for it
+rather than giving up. Codes usually expire in about 10 minutes, so ask for a fresh one
+if the first has gone stale. If instead the email contains a "verify"/"confirm" LINK
+rather than a code, it is opened for you in the background: wait a few seconds, reload
+the page, and continue -- you do not need to find or click the link yourself.
+
+== FILLING THE FORM ==
+Applications are often multi-page: an upload/parse step, then the real form, then review.
+Work through every page until the application is actually submitted. ATS systems pre-fill
+fields by parsing the resume and frequently get them wrong -- check every pre-filled value
+against the applicant profile above and correct it. Answer all required questions.
+Skip honeypot fields that are hidden or say to leave them blank.
+For phone fields that already show a country prefix, enter only the digits {phone_digits}.
+Match any format hint shown in a field's placeholder text.
+
+{submit_instruction}
+
+== REPORTING THE OUTCOME ==
+When you are done -- successfully or not -- report the result using the required schema.
+Use `applied` only if the application was genuinely submitted and confirmed.
+If the posting is closed or no longer accepting applications, use `expired`.
+If an unsolvable CAPTCHA blocks you, use `captcha`.
+Otherwise use `failed` with the most specific reason code that fits."""

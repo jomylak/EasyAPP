@@ -148,6 +148,19 @@ Claude Code launches a Chrome instance, navigates to each application page, dete
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
+**Choosing a backend.** `--backend claude` (the default) drives the browser with the
+Claude Code CLI and spends Claude subscription quota. `--backend skyvern` hands the
+same job to a local [Skyvern](https://github.com/Skyvern-AI/skyvern) server attached to
+the same Chrome, running on whatever model Skyvern is configured with — typically a
+cheap or free OpenRouter one — so applications don't consume your Claude usage window.
+Both apply as the same candidate and record the same outcome codes, so you can compare
+their completion rates directly. See [docs/skyvern-backend.md](docs/skyvern-backend.md)
+for setup.
+
+```bash
+applypilot apply --backend skyvern --url URL --dry-run
+```
+
 ```bash
 # Utility modes (no Chrome/Claude needed)
 applypilot apply --mark-applied URL    # manually mark a job as applied
@@ -176,6 +189,7 @@ applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot apply --backend skyvern      # Drive via local Skyvern (off Claude quota)
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```

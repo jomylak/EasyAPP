@@ -15,6 +15,7 @@ RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
+SETTINGS_PATH = APP_DIR / "settings.json"
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
@@ -168,7 +169,90 @@ DEFAULTS = {
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
+    # --- Skyvern backend ---
+    # Skyvern's own MAX_STEPS_PER_RUN defaults to 10, which terminates a
+    # multi-page ATS form partway through; we pass this per task instead.
+    "skyvern_max_steps": 50,
+    "skyvern_timeout": 900,
+    "skyvern_base_url": "http://localhost:8000",
+    # Loopback port serving the tailored resume to Skyvern (+ worker_id).
+    "skyvern_file_port_base": 8100,
+    # Loopback port hosting the email-verification (totp_url) endpoint.
+    "skyvern_totp_port_base": 8200,
+    # How long the totp endpoint waits for a verification email to arrive.
+    "verification_wait_seconds": 45,
+    # How often the background watcher looks for one-time login links.
+    "verification_link_poll_seconds": 10,
 }
+
+
+DEFAULT_SETTINGS: dict = {
+    # Which engine drives the browser during apply: "claude" (Claude Code CLI,
+    # costs subscription quota) or "skyvern" (local Skyvern server on a cheap
+    # model). Override per run with `applypilot apply --backend`.
+    "apply_backend": "claude",
+    # When False, the tailor stage skips the LLM entirely and just uses the
+    # base resume for every application (see scoring/tailor.py). Flip this
+    # back to True once LaTeX tailoring is wired up.
+    "tailoring_enabled": False,
+    "cover_letters_enabled": False,
+    "default_resume_variant": "default",
+    "resume_variants": {
+        "default": {
+            "pdf": "resume.pdf",
+            "txt": "resume.txt",
+            "grad_date": "May 2027",
+        },
+        "returning_2028": {
+            "pdf": "resume_2028.pdf",
+            "txt": "resume_2028.txt",
+            "grad_date": "May 2028",
+        },
+    },
+}
+
+
+def load_settings() -> dict:
+    """Load ~/.applypilot/settings.json, falling back to defaults for missing keys.
+
+    Unlike searches.yaml, this file has no package-shipped example -- it's
+    created with sane defaults on first read if it doesn't exist yet.
+    """
+    import json
+
+    if not SETTINGS_PATH.exists():
+        return json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
+
+    try:
+        user_settings = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return json.loads(json.dumps(DEFAULT_SETTINGS))
+
+    merged = json.loads(json.dumps(DEFAULT_SETTINGS))
+    merged.update({k: v for k, v in user_settings.items() if k != "resume_variants"})
+    if "resume_variants" in user_settings:
+        merged["resume_variants"].update(user_settings["resume_variants"])
+    return merged
+
+
+def save_settings(settings: dict) -> None:
+    """Write settings back to ~/.applypilot/settings.json."""
+    import json
+    ensure_dirs()
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def get_resume_variant_paths(variant: str) -> tuple[Path, Path, str]:
+    """Resolve (txt_path, pdf_path, grad_date) for a resume variant name.
+
+    Falls back to the default variant if the requested one isn't configured.
+    """
+    settings = load_settings()
+    variants = settings.get("resume_variants", {})
+    cfg = variants.get(variant) or variants.get(settings.get("default_resume_variant", "default"))
+    txt_path = APP_DIR / cfg["txt"]
+    pdf_path = APP_DIR / cfg["pdf"]
+    return txt_path, pdf_path, cfg.get("grad_date", "")
 
 
 def load_env():

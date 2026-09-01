@@ -98,6 +98,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
+            job_type              TEXT,
 
             -- Enrichment stage (detail_scraper)
             full_description      TEXT,
@@ -109,11 +110,13 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             fit_score             INTEGER,
             score_reasoning       TEXT,
             scored_at             TEXT,
+            requires_returning_student TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
             tailor_attempts       INTEGER DEFAULT 0,
+            resume_variant        TEXT,
 
             -- Cover letter stage
             cover_letter_path     TEXT,
@@ -129,7 +132,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            review_status         TEXT
         )
     """)
     conn.commit()
@@ -153,6 +157,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
+    "job_type": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -162,10 +167,12 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    "requires_returning_student": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
     "tailor_attempts": "INTEGER DEFAULT 0",
+    "resume_variant": "TEXT",
     # Cover letter
     "cover_letter_path": "TEXT",
     "cover_letter_at": "TEXT",
@@ -180,6 +187,12 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    "review_status": "TEXT",
+    # Which backend drove this application, and how many LLM requests it took.
+    # Together with apply_duration_ms these make backend/model comparison
+    # measurable instead of anecdotal.
+    "apply_backend": "TEXT",
+    "apply_llm_requests": "INTEGER",
 }
 
 
