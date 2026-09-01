@@ -151,6 +151,12 @@ def apply(
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
+    backend: Optional[str] = typer.Option(
+        None, "--backend", "-b",
+        help="Engine that drives the browser: 'claude' (Claude Code CLI) or "
+             "'skyvern' (local Skyvern server, cheaper model). "
+             "Defaults to apply_backend in settings.json.",
+    ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
@@ -234,10 +240,23 @@ def apply(
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
+    from applypilot.config import load_settings
+    from applypilot.apply.backends import BACKEND_NAMES
+
+    effective_backend = (backend or load_settings().get("apply_backend", "claude")).lower()
+    if effective_backend not in BACKEND_NAMES:
+        console.print(
+            f"[red]Unknown backend {effective_backend!r}.[/red] "
+            f"Expected one of: {', '.join(BACKEND_NAMES)}"
+        )
+        raise typer.Exit(code=1)
+
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Backend:  {effective_backend}")
+    console.print(f"  Model:    {model}" + ("  [dim](Skyvern configures its own model)[/dim]"
+                                            if effective_backend == "skyvern" else ""))
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -253,6 +272,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        backend=effective_backend,
     )
 
 
@@ -384,7 +404,7 @@ def doctor() -> None:
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
     if has_gemini:
-        model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
+        model = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")

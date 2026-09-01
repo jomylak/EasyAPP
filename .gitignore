@@ -2,6 +2,12 @@
 profile.json
 resume.txt
 resume.pdf
+# Any resume/CV variant, wherever it lands. The bare resume.pdf rule above
+# missed real files like JakubOmylak_2026_Resume.pdf sitting in the repo root.
+*[Rr]esume*.pdf
+*[Rr]esume*.docx
+*[Cc]over[_ ][Ll]etter*.pdf
+*.cv.pdf
 *.env
 .env.*
 !.env.example
