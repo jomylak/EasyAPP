@@ -173,7 +173,9 @@ DEFAULTS = {
     # Skyvern's own MAX_STEPS_PER_RUN defaults to 10, which terminates a
     # multi-page ATS form partway through; we pass this per task instead.
     "skyvern_max_steps": 50,
-    "skyvern_timeout": 900,
+    # Measured: ~20s per action on a free OpenRouter model, and a multi-page
+    # ATS form runs to 45+ actions. 900s cut a healthy run off mid-form.
+    "skyvern_timeout": 2400,
     "skyvern_base_url": "http://localhost:8000",
     # Loopback port serving the tailored resume to Skyvern (+ worker_id).
     "skyvern_file_port_base": 8100,
