@@ -84,7 +84,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path,
+                       apply_status AS prior_status, applied_at AS prior_applied_at
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
@@ -111,7 +112,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path,
+                       apply_status AS prior_status, applied_at AS prior_applied_at
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
@@ -205,6 +207,22 @@ def mark_result(url: str, status: str, error: str | None = None,
               backend, llm_requests, stats.get("input_tokens"),
               stats.get("output_tokens"), stats.get("cache_read_tokens"),
               stats.get("cost_usd"), url))
+    conn.commit()
+
+
+def _restore_status(job: dict) -> None:
+    """Put a job back exactly as it was before acquire_job locked it.
+
+    acquire_job overwrites apply_status with 'in_progress', so simply releasing
+    the lock to NULL discards whatever the job's real outcome was. That matters
+    for dry runs, which must leave no trace.
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE jobs SET apply_status = ?, applied_at = ?, agent_id = NULL "
+        "WHERE url = ? AND apply_status = 'in_progress'",
+        (job.get("prior_status"), job.get("prior_applied_at"), job["url"]),
+    )
     conn.commit()
 
 
@@ -435,7 +453,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 # to report RESULT:APPLIED with a dry-run note, so without this
                 # the job would be recorded as submitted and never picked up
                 # again -- an application silently lost.
-                release_lock(job["url"])
+                # Restore the status the job had before we locked it. Releasing
+                # to NULL would erase a real prior outcome -- dry-running a job
+                # already marked 'applied' would delete the record of having
+                # applied to it.
+                _restore_status(job)
                 outcome = result.split(":", 1)[0]
                 add_event(f"[W{worker_id}] DRY RUN ({outcome}), not recorded: {job['title'][:28]}")
                 update_state(worker_id, status="done",
