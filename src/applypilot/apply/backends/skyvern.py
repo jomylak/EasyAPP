@@ -193,13 +193,28 @@ class SkyvernBackend:
         has been locked as in_progress.
         """
         base_url, api_key = self._config()
+        # Probe an authenticated endpoint on the SAME prefix the real calls use.
+        # The server mounts its documented API under /v1 and a separate health
+        # route under /api/v1, so checking heartbeat would validate neither the
+        # prefix we POST to nor the API key.
         try:
-            resp = httpx.get(f"{base_url}/api/v1/heartbeat", timeout=10,
+            resp = httpx.get(f"{base_url}/v1/runs", timeout=10,
                              headers={"x-api-key": api_key})
         except httpx.HTTPError as exc:
             raise RuntimeError(
                 f"No Skyvern server reachable at {base_url} ({exc}).\n{SERVER_HINT}"
             ) from exc
+
+        if resp.status_code in (401, 403):
+            raise RuntimeError(
+                f"Skyvern rejected the API key (HTTP {resp.status_code}). Copy "
+                f"SKYVERN_API_KEY from your Skyvern .env into {config.ENV_PATH}."
+            )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Skyvern at {base_url} has no /v1 API (HTTP 404). The server may "
+                "be a different version than this backend expects."
+            )
         if resp.status_code >= 500:
             raise RuntimeError(
                 f"Skyvern server at {base_url} returned HTTP {resp.status_code}.\n"
@@ -212,7 +227,7 @@ class SkyvernBackend:
         """Start a task run. Returns the initial run object."""
         base_url, api_key = self._config()
         resp = httpx.post(
-            f"{base_url}/api/v1/run/tasks",
+            f"{base_url}/v1/run/tasks",
             json=payload,
             headers={"x-api-key": api_key},
             timeout=60,
@@ -232,7 +247,7 @@ class SkyvernBackend:
         run: dict = {}
         while time.time() < deadline:
             try:
-                resp = httpx.get(f"{base_url}/api/v1/runs/{run_id}", timeout=30,
+                resp = httpx.get(f"{base_url}/v1/runs/{run_id}", timeout=30,
                                  headers={"x-api-key": api_key})
                 resp.raise_for_status()
                 run = resp.json()
