@@ -162,7 +162,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None, backend: str | None = None,
-                llm_requests: int | None = None) -> None:
+                llm_requests: int | None = None, stats: dict | None = None) -> None:
     """Update a job's apply status in the database.
 
     Args:
@@ -170,7 +170,10 @@ def mark_result(url: str, status: str, error: str | None = None,
             completion rates can be compared between backends and models.
         llm_requests: How many LLM steps the run took, where the backend
             reports it (Skyvern does; the Claude CLI does not).
+        stats: Optional token accounting -- input_tokens, output_tokens,
+            cache_read_tokens, cost_usd.
     """
+    stats = stats or {}
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
@@ -179,9 +182,13 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_error = NULL, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = NULL, apply_backend = ?,
-                           apply_llm_requests = ?
+                           apply_llm_requests = ?, apply_input_tokens = ?,
+                           apply_output_tokens = ?, apply_cache_read_tokens = ?,
+                           apply_cost_usd = ?
             WHERE url = ?
-        """, (now, duration_ms, task_id, backend, llm_requests, url))
+        """, (now, duration_ms, task_id, backend, llm_requests,
+              stats.get("input_tokens"), stats.get("output_tokens"),
+              stats.get("cache_read_tokens"), stats.get("cost_usd"), url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         review_status = _classify_review_status(error or "")
@@ -190,10 +197,14 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = ?, apply_backend = ?,
-                           apply_llm_requests = ?
+                           apply_llm_requests = ?, apply_input_tokens = ?,
+                           apply_output_tokens = ?, apply_cache_read_tokens = ?,
+                           apply_cost_usd = ?
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, review_status,
-              backend, llm_requests, url))
+              backend, llm_requests, stats.get("input_tokens"),
+              stats.get("output_tokens"), stats.get("cache_read_tokens"),
+              stats.get("cost_usd"), url))
     conn.commit()
 
 
@@ -435,7 +446,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 continue
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms,
-                            backend=backend, llm_requests=llm_requests)
+                            backend=backend, llm_requests=llm_requests,
+                            stats=run_stats)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
@@ -444,7 +456,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms, backend=backend,
-                            llm_requests=llm_requests)
+                            llm_requests=llm_requests, stats=run_stats)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
