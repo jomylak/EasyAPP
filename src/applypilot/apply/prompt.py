@@ -107,12 +107,35 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     else:
         city_list = primary_city
 
+    # When the accepted area is a blanket phrase ("any city in the United
+    # States") rather than a list of cities, the old wording contradicted
+    # itself: it accepted "onsite in any US city" and then rejected "onsite in
+    # any city outside the list above". Haiku read a Texas role as outside the
+    # list and rejected an eligible job. Nationwide gets its own unambiguous
+    # wording with no "outside the list" clause to misread.
+    blanket = any(
+        kw in city_list.lower()
+        for kw in ("any city", "anywhere", "united states", "nationwide", "all us", "any us")
+    )
+
+    if blanket:
+        return f"""== LOCATION CHECK (do this FIRST before any form) ==
+Read the job page. Determine the work arrangement. Then decide:
+- Remote, hybrid, or onsite ANYWHERE IN THE UNITED STATES -> ELIGIBLE. Apply.
+  This includes cities far from where the candidate currently lives. Distance,
+  relocation, and commute are NOT reasons to reject a US-based role.
+- Outside the United States (India, Philippines, Europe, etc.) with no remote
+  option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
+- Cannot determine location -> Continue applying.
+There is no US city that fails this check. Only reject on location for roles
+based outside the United States."""
+
     return f"""== LOCATION CHECK (do this FIRST before any form) ==
 Read the job page. Determine the work arrangement. Then decide:
 - "Remote" or "work from anywhere" -> ELIGIBLE. Apply.
 - "Hybrid" or "onsite" in {city_list} -> ELIGIBLE. Apply.
-- "Hybrid" or "onsite" in another city BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
-- "Onsite only" or "hybrid only" in any city outside the list above with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
+- "Hybrid" or "onsite" elsewhere BUT the posting also says "remote OK" or "remote option available" -> ELIGIBLE. Apply.
+- "Onsite only" or "hybrid only" in a city NOT among ({city_list}) with NO remote option -> NOT ELIGIBLE. Stop immediately. Output RESULT:FAILED:not_eligible_location
 - City is overseas (India, Philippines, Europe, etc.) with no remote option -> NOT ELIGIBLE. Output RESULT:FAILED:not_eligible_location
 - Cannot determine location -> Continue applying. If a screening question reveals it's non-local onsite, answer honestly and let the system reject if needed.
 Do NOT fill out forms for jobs that are clearly onsite in a non-acceptable location. Check EARLY, save time."""
