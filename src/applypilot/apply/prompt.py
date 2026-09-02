@@ -261,6 +261,20 @@ def _build_captcha_section() -> str:
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
 
+    if not capsolver_key:
+        # Without a key the 8.3k-char CapSolver section is dead weight -- 29% of
+        # the prompt, resent on every turn of a ~50-turn agentic loop, purely to
+        # say the API is unavailable. Emit the manual fallback only.
+        return """== CAPTCHA ==
+No CAPTCHA solving service is configured, so you cannot solve image or token
+CAPTCHAs programmatically. If one appears:
+1. Audio challenge: look for an "audio" or "accessibility" button -- often easier.
+2. Text or logic puzzles ("What is 3+7?", "type the word"): solve them yourself.
+3. Anything else -> RESULT:CAPTCHA. Do not loop.
+Note that invisible CAPTCHAs (reCAPTCHA v3, Turnstile) show no widget but can
+silently block a submit. If a form submits with no error and no confirmation,
+suspect one and report RESULT:CAPTCHA rather than retrying indefinitely."""
+
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
 API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
