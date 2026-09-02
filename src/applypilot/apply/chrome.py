@@ -186,6 +186,39 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
+def _wait_for_cdp(port: int, worker_id: int, proc: subprocess.Popen,
+                  timeout: float = 20.0) -> bool:
+    """Block until Chrome's DevTools endpoint actually accepts connections.
+
+    This previously slept a flat 3 seconds, but Chrome typically does not open
+    the port until ~4s, so whatever connected next could race it. The Claude
+    path masked this because Playwright MCP takes a while to boot; Skyvern
+    connects over CDP immediately and lost the race with
+    "connect ECONNREFUSED 127.0.0.1:<port>".
+
+    Returns:
+        True if the endpoint answered, False if it never came up in time.
+    """
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            logger.error("[worker-%d] Chrome exited during startup (rc=%s)",
+                         worker_id, proc.returncode)
+            return False
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1)
+            return True
+        except Exception:
+            time.sleep(0.25)
+
+    logger.warning("[worker-%d] Chrome DevTools port %d did not open within %.0fs",
+                   worker_id, port, timeout)
+    return False
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
                   headless: bool = False) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
@@ -245,8 +278,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
-    # Give Chrome time to start and open the debug port
-    time.sleep(3)
+    _wait_for_cdp(port, worker_id, proc)
     logger.info("[worker-%d] Chrome started on port %d (pid %d)",
                 worker_id, port, proc.pid)
     return proc
