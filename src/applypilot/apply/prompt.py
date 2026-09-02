@@ -706,7 +706,9 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
-- Fill ALL fields in ONE browser_fill_form call. Not one at a time.
+- Fill ALL plain text fields in ONE browser_fill_form call. Not one at a time.
+  Custom comboboxes are the exception -- see TOOL DISCIPLINE below; batching them
+  into fill_form leaves them unset and poisons the field for the retry.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 
@@ -725,8 +727,13 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - A FIELD THAT RESISTS: do NOT retry the same action. Retrying is what burns runs.
   Snapshot the element and look at what it actually is, then match the pattern:
   * role="combobox" on an <input> (not a <select>) -> it is a FILTERABLE combobox.
-    browser_type the value into the input to filter the list, THEN click the
-    matching option. Do not scroll the unfiltered list hunting for it.
+    browser_fill_form and fill() DO NOT WORK on these: they set the value without
+    producing keystrokes, so the live-search filter never runs and the list never
+    narrows. Worse, the value they leave behind concatenates with what you type
+    next ("United StatesUnited States"). So: CLEAR the field first, then
+    browser_type the value with slow/character-by-character typing so real key
+    events fire, THEN click the matching option from a fresh snapshot. Do not
+    scroll the unfiltered list hunting for it.
   * A long option list (countries, states, universities) is usually paginated or
     virtualised: the option you want is not in the DOM until you type to filter.
     Clicking blind lands on whatever row happens to be rendered -- this is how a
