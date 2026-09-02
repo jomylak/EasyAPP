@@ -220,7 +220,10 @@ Skills and tools -> be confident. This candidate is a {target_role} with {years}
 
 Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
 
-EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
+EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything.
+Gender, Race/Ethnicity, Veteran status and Disability status always get this same
+answer -- there is nothing to decide. Set them as one consecutive batch and verify
+them together with a single browser_find, rather than open/click/verify four times."""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -717,8 +720,19 @@ RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:reason -- any other failure (brief reason)
 
 == BROWSER EFFICIENCY ==
-- browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
-- Only snapshot again when you need element refs to click/fill.
+- CONTEXT IS THE COST. Every snapshot you take is re-sent to you on every later
+  turn for the rest of the run, so one needless full snapshot is paid for dozens
+  of times. A measured run spent ~93,000 tokens per turn re-reading context and
+  only ~200 on new input. Keep what enters context small:
+  * browser_snapshot ONCE when you arrive on a genuinely new page or step.
+  * To CHECK a value you just set, use browser_find with that field's label
+    (e.g. text: "Country"). It returns only the matching nodes instead of the
+    whole page -- the single most effective thing you can do to keep the run
+    cheap, and just as reliable for confirming one field.
+  * Do NOT re-snapshot the whole form after each field, and do NOT snapshot
+    after a navigation unless you actually need new element refs.
+  * For an overview of a large form, browser_snapshot accepts a `depth` limit --
+    prefer a shallow snapshot over a full one.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
 - Fill ALL plain text fields in ONE browser_fill_form call. Not one at a time.
   Custom comboboxes are the exception -- see TOOL DISCIPLINE below; batching them
@@ -756,9 +770,13 @@ RESULT:FAILED:reason -- any other failure (brief reason)
     option. Value assignment and fill do nothing on these.
   * SAP SuccessFactors (class names starting rcm*, fd-input, or juic handlers),
     Oracle HCM (oj-*), and Workday all use custom widgets of this kind.
-- VERIFY every dropdown after setting it. Snapshot and read the value back. An
-  action that "succeeded" often left the field unchanged or set it to the wrong
-  option, and a form submitted with the wrong country is worse than a failure.
+- VERIFY every dropdown after setting it -- with browser_find on that field's
+  label, not a full snapshot. An action that "succeeded" often left the field
+  unchanged or set it to the wrong option, and a form submitted with the wrong
+  country is worse than a failure. Cheap verification is also what stops you
+  re-clicking blindly: check once and you know immediately instead of guessing.
+  Keep working the field until it holds the right value -- do not give up on it
+  and do not move on while it is wrong.
 - A required field can appear only AFTER you answer another one (choosing "Other"
   for "how did you hear about this position" reveals a required "Details" box).
   Re-check the form for newly required fields before submitting.
@@ -952,7 +970,10 @@ value to filter the list, then click the matching option. Long option lists
 (countries, states) are paginated, so the option you want is not present until you
 filter -- clicking blind is how a Country field ends up set to "Sierra Leone".
 Always read the value back after setting it; an action that reports success has
-often left the field wrong. Answering one question can also reveal a new required
+often left the field wrong. Read back just that field rather than re-reading the
+whole page -- everything you read stays in context and is re-processed on every
+later step, so re-reading a large form after each field is the main thing that
+makes a run expensive. Keep working a field until it holds the right value. Answering one question can also reveal a new required
 field, so re-check the form before submitting.
 
 Applications are often multi-page: an upload/parse step, then the real form, then review.
