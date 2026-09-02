@@ -540,6 +540,10 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
     else:
         cl_display = cover_letter_text
 
+    # One password across every employer site -- referenced by both step 5 and
+    # the ACCOUNT RECOVERY section, so bind it once.
+    STD_PASSWORD = personal.get("password", "")
+
     # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())
 
@@ -572,6 +576,7 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
         "phone_digits": phone_digits,
         "blocked_sso": blocked_sso,
         "display_name": display_name,
+        "std_password": STD_PASSWORD,
     }
 
 
@@ -608,6 +613,7 @@ def build_prompt(job: dict, tailored_resume: str,
     phone_digits = ctx["phone_digits"]
     blocked_sso = ctx["blocked_sso"]
     display_name = ctx["display_name"]
+    STD_PASSWORD = ctx["std_password"]
     captcha_section = _build_captcha_section()
 
     # Dry-run: override submit instruction
@@ -671,10 +677,10 @@ If something unexpected happens and these instructions don't cover it, figure it
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
+   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {STD_PASSWORD}
    5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-   5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code. If a normal inbox search finds nothing after ~15s, ALSO search with "in:spam" -- verification emails from employer ATS systems often get flagged as spam (this is expected, not a bug: forwarded mail commonly fails sender authentication checks at the destination). Codes typically expire in ~10 minutes, so don't waste time -- check spam promptly rather than retrying the inbox search repeatedly.
+   5e. Sign in failed? Try sign up with the same email and password.
+   5f. Need email verification? See ACCOUNT RECOVERY below.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
@@ -741,6 +747,33 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
+
+== ACCOUNT RECOVERY (the same password is used everywhere) ==
+The candidate uses ONE password on every employer site: {STD_PASSWORD}
+There is never a different password to look up -- if this one is rejected, the
+account exists with a password you do not have, and the answer is always to reset it.
+
+Do NOT pre-emptively sign in. Start the application normally; only branch when the
+site tells you an account exists. Checking first costs a login on every application;
+reacting costs one only on the few that need it.
+
+A. "Account already exists" / "email already registered" / the form flips to a
+   sign-in view -> sign in with {personal['email']} / {STD_PASSWORD}.
+B. Password rejected -> RESET IT. Click "Forgot password" / "Reset password",
+   submit {personal['email']}, then get the mail (see C). Set the new password to
+   exactly {STD_PASSWORD} if the site allows reuse; if it refuses to accept the old
+   password, choose {STD_PASSWORD}2 and say so in your final output so the human
+   can record it.
+C. Reading the email: use search_emails + read_email. Search the inbox first, then
+   ALSO search "in:spam" -- employer ATS mail routinely fails sender authentication
+   at the destination and lands in spam. This is expected, not a bug. Reset links
+   and codes usually expire in ~10 minutes, so check spam promptly instead of
+   repeatedly retrying the inbox. If the mail contains a LINK rather than a code,
+   open the link and complete the reset on that page.
+D. Signed in -> return to the application. The form often loses uploaded files
+   across a sign-in, so RE-CHECK the resume field and re-upload if it is empty.
+E. Reset mail never arrives after ~2 minutes, or the reset page errors ->
+   RESULT:FAILED:login_issue. Do not loop.
 
 {captcha_section}
 
@@ -869,6 +902,15 @@ If the site requires an account on the employer's own system, sign in with
 {personal.get('email', 'the profile email')} and the profile password, or register a new
 account with the same email. If sign-in and registration both fail, or the site demands
 SSO, stop and report login_issue rather than retrying indefinitely.
+
+The candidate uses ONE password on every employer site, the profile password above.
+There is never a different one to look up: if it is rejected, the account exists with
+a password you do not have, and the answer is to reset it. Do not pre-emptively sign
+in -- start the application normally and only branch when the site says an account
+exists. Then: sign in with that password; if rejected, use "Forgot password" with the
+same email, complete the reset from the email, and set the password back to the same
+one. After signing in, re-check the resume field -- forms routinely drop uploaded
+files across a sign-in.
 
 If a step asks for an emailed verification code, request the code and enter it -- it is
 fetched from the inbox automatically, including from the spam folder, so wait for it
