@@ -266,11 +266,23 @@ class SkyvernBackend:
                 return run
             time.sleep(poll_every)
 
-        # Timed out on our side; report what the run last looked like.
-        run["status"] = run.get("status") or "timed_out"
-        if run["status"] not in TERMINAL_STATUSES:
-            run["status"] = "timed_out"
+        # Timed out on our side. Cancel the run before returning: the worker
+        # loop tears Chrome down immediately after, and a run left alive would
+        # keep operating against a dead browser and report a misleading
+        # "browser crashed" failure instead of the timeout that really happened.
+        self._cancel_run(run_id)
+        run["status"] = "timed_out"
         return run
+
+    def _cancel_run(self, run_id: str) -> None:
+        """Best-effort cancel so an abandoned run doesn't outlive its browser."""
+        try:
+            base_url, api_key = self._config()
+            httpx.post(f"{base_url}/v1/runs/{run_id}/cancel",
+                       headers={"x-api-key": api_key}, timeout=15)
+            logger.info("Cancelled Skyvern run %s after timeout", run_id)
+        except Exception:
+            logger.debug("Could not cancel run %s", run_id, exc_info=True)
 
     # -- execution --------------------------------------------------------
 
