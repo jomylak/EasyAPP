@@ -708,6 +708,14 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
+- TOOL DISCIPLINE (this is the difference between a 4-minute run and a 20-minute one):
+  Set values with browser_type, browser_click, browser_fill_form and
+  browser_file_upload. Use browser_evaluate ONLY to READ state you cannot see in
+  a snapshot -- never to set a value. Assigning `el.value` and firing a synthetic
+  `new Event('input')` does NOT work on custom widgets: SAP SuccessFactors, Oracle
+  HCM and Workday commit values through their own event bus, so the field silently
+  keeps its old value and you will loop writing JS that never takes effect. Real
+  keyboard and mouse events from browser_type/browser_click do commit.
 - A FIELD THAT RESISTS: do NOT retry the same action. Retrying is what burns runs.
   Snapshot the element and look at what it actually is, then match the pattern:
   * role="combobox" on an <input> (not a <select>) -> it is a FILTERABLE combobox.
@@ -870,6 +878,11 @@ rather than a code, it is opened for you in the background: wait a few seconds, 
 the page, and continue -- you do not need to find or click the link yourself.
 
 == FILLING THE FORM ==
+Set values by typing and clicking as a person would. Do not set fields by running
+JavaScript: assigning a value and firing a synthetic input event does not commit on
+SAP SuccessFactors, Oracle HCM or Workday widgets, which listen to their own event
+bus -- the field silently keeps its old value.
+
 If a field will not take a value, do not repeat the same action -- inspect the
 element first. An <input> with role="combobox" is a filterable combobox: type the
 value to filter the list, then click the matching option. Long option lists

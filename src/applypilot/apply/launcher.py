@@ -212,7 +212,8 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
+               model: str = "sonnet", worker_id: int = 0,
+               dry_run: bool = True) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
     Returns:
@@ -229,7 +230,11 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    # Defaults to a dry-run prompt: --gen exists for manual debugging, and a
+    # generated prompt gets piped into whatever harness is being tried, so it
+    # must not tell that harness to submit a real application by default.
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text,
+                                     dry_run=dry_run)
 
     # Release the lock so the job stays available
     release_lock(job["url"])
