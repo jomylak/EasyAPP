@@ -708,7 +708,25 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
-- Dropdown won't fill? browser_click to open it, then browser_click the option.
+- A FIELD THAT RESISTS: do NOT retry the same action. Retrying is what burns runs.
+  Snapshot the element and look at what it actually is, then match the pattern:
+  * role="combobox" on an <input> (not a <select>) -> it is a FILTERABLE combobox.
+    browser_type the value into the input to filter the list, THEN click the
+    matching option. Do not scroll the unfiltered list hunting for it.
+  * A long option list (countries, states, universities) is usually paginated or
+    virtualised: the option you want is not in the DOM until you type to filter.
+    Clicking blind lands on whatever row happens to be rendered -- this is how a
+    Country field ends up set to "Sierra Leone".
+  * Any custom widget that is not a native <select>: click to open, click the
+    option. Value assignment and fill do nothing on these.
+  * SAP SuccessFactors (class names starting rcm*, fd-input, or juic handlers),
+    Oracle HCM (oj-*), and Workday all use custom widgets of this kind.
+- VERIFY every dropdown after setting it. Snapshot and read the value back. An
+  action that "succeeded" often left the field unchanged or set it to the wrong
+  option, and a form submitted with the wrong country is worse than a failure.
+- A required field can appear only AFTER you answer another one (choosing "Other"
+  for "how did you hear about this position" reveals a required "Details" box).
+  Re-check the form for newly required fields before submitting.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
 - Date fields: {datetime.now().strftime('%m/%d/%Y')}
@@ -852,6 +870,15 @@ rather than a code, it is opened for you in the background: wait a few seconds, 
 the page, and continue -- you do not need to find or click the link yourself.
 
 == FILLING THE FORM ==
+If a field will not take a value, do not repeat the same action -- inspect the
+element first. An <input> with role="combobox" is a filterable combobox: type the
+value to filter the list, then click the matching option. Long option lists
+(countries, states) are paginated, so the option you want is not present until you
+filter -- clicking blind is how a Country field ends up set to "Sierra Leone".
+Always read the value back after setting it; an action that reports success has
+often left the field wrong. Answering one question can also reveal a new required
+field, so re-check the form before submitting.
+
 Applications are often multi-page: an upload/parse step, then the real form, then review.
 Work through every page until the application is actually submitted. ATS systems pre-fill
 fields by parsing the resume and frequently get them wrong -- check every pre-filled value
