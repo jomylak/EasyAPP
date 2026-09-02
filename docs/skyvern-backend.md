@@ -20,13 +20,45 @@ its own browser.
 
 ## Setup
 
-### 1. Install
+### 1. Install Skyvern in its own venv
+
+ApplyPilot talks to Skyvern over its REST API with `httpx`, so **Skyvern is not
+an ApplyPilot dependency** — it lives in a separate environment entirely. That
+avoids a real conflict: Skyvern pins playwright 1.46, pandas 3.x, litellm and a
+FastAPI stack, which would fight ApplyPilot's own pins.
 
 ```bash
-pip install "applypilot[skyvern]"     # or: pip install skyvern
+python3 -m venv ~/.venvs/skyvern
+source ~/.venvs/skyvern/bin/activate
+pip install skyvern
 ```
 
 Requires Python 3.11–3.13 (Skyvern does not yet support 3.14).
+
+### 1b. Postgres (required)
+
+Skyvern's config defaults to SQLite and its docstring claims that works out of
+the box. **It does not** in 1.0.48 — two migrations use `::jsonb`, `USING gin`
+and `CREATE EXTENSION`, which SQLite cannot execute, so `skyvern init
+--no-postgres` fails partway through migration. You need Postgres, but not
+Docker: `setup_postgresql` checks for a local instance *before* it considers a
+container.
+
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+# postgresql@16 is keg-only; psql must be on PATH or init won't detect it
+echo 'export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"' >> ~/.zshrc
+export PATH="/opt/homebrew/opt/postgresql@16/bin:$PATH"
+pg_isready   # must print "accepting connections"
+```
+
+Then run `skyvern init` (without `--no-postgres`) from `~/skyvern`. Decline every
+LLM provider — OpenRouter is not in the wizard's menu and is configured by hand
+in the next step. Answer **2 (New browser, headful)** for the browser type: every
+path in `browser_factory.py` short-circuits to CDP when `browser_address` is
+passed, which ApplyPilot always does, so this is only a fallback — but option 1
+would point Skyvern at your personal Chrome.
 
 ### 2. Configure Skyvern's own `.env`
 
@@ -153,6 +185,9 @@ from an earlier application is never replayed.
 Requires `ALLOWED_HOSTS=["127.0.0.1"]` in Skyvern's `.env` — the same setting the
 resume upload needs, since Skyvern's SSRF guard also covers its outbound call to
 `totp_url`.
+
+`ALLOWED_HOSTS` must be the JSON-array form (`'["127.0.0.1"]'`); a bare
+`127.0.0.1` won't deserialize into the setting's list type.
 
 If Gmail is not authorised, verification degrades quietly: the endpoint returns
 404, and a login needing a code ends as `login_issue`. To (re)authorise:

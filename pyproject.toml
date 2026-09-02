@@ -30,10 +30,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]
-# Optional apply backend. Not a core dependency: the Skyvern backend imports
-# lazily and degrades with an install hint if this isn't present, so the
-# default Claude Code path never pulls it in.
-skyvern = ["skyvern>=1.0"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
