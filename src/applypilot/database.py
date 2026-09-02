@@ -191,6 +191,11 @@ _ALL_COLUMNS: dict[str, str] = {
     # Which backend drove this application, and how many LLM requests it took.
     # Together with apply_duration_ms these make backend/model comparison
     # measurable instead of anecdotal.
+    # Pay as stated in the posting, and whether it falls under the candidate's
+    # floor. Judged at scoring time (free) so below-floor jobs never reach the
+    # apply stage; 'unknown' when the posting states no pay, which is common.
+    "pay_text": "TEXT",
+    "pay_below_floor": "TEXT",
     "apply_backend": "TEXT",
     "apply_llm_requests": "INTEGER",
 }

@@ -35,6 +35,13 @@ IMPORTANT FACTORS:
 - Factor in the candidate's project experience
 - Be realistic about experience level vs. job requirements (years of experience, seniority)
 
+COMPENSATION CHECK:
+Report the pay if the posting states one. Many postings don't -- that is normal and
+must not be penalised. Judge it against the floors given below, applying the hourly
+floor to internships/co-ops and the annual floor to full-time roles. Convert between
+the two at 2080 hours/year when only one is stated. Never lower the fit SCORE because
+of pay -- report it separately so the pipeline can decide.
+
 RETURNING STUDENT CHECK:
 Some internships require the candidate to be enrolled in school and returning for at least one more semester/term AFTER the internship ends (e.g. "must be currently enrolled and returning to school following the internship", "not graduating before [date]", "rising senior" for a non-final-semester role). Only answer yes if the posting explicitly requires continued enrollment after the internship -- do not infer it from a generic "student" or "currently pursuing degree" requirement that a graduating senior would also satisfy.
 
@@ -42,6 +49,8 @@ RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
 REQUIRES_RETURNING_STUDENT: [yes or no]
+PAY: [the stated pay exactly as written, or "not stated"]
+BELOW_FLOOR: [yes, no, or unknown -- "unknown" whenever no pay is stated]
 REASONING: [2-3 sentences explaining the score]"""
 
 # Soft location tiebreaker — never a hard filter. Location-based rejection is
@@ -66,6 +75,8 @@ def _parse_score_response(response: str) -> dict:
     keywords = ""
     reasoning = response
     requires_returning_student = "no"
+    pay_text = ""
+    below_floor = "unknown"
 
     for line in response.split("\n"):
         line = line.strip()
@@ -80,12 +91,18 @@ def _parse_score_response(response: str) -> dict:
         elif line.startswith("REQUIRES_RETURNING_STUDENT:"):
             val = line.replace("REQUIRES_RETURNING_STUDENT:", "").strip().lower()
             requires_returning_student = "yes" if val.startswith("yes") else "no"
+        elif line.startswith("PAY:"):
+            pay_text = line.replace("PAY:", "").strip()
+        elif line.startswith("BELOW_FLOOR:"):
+            val = line.replace("BELOW_FLOOR:", "").strip().lower()
+            below_floor = val if val in ("yes", "no") else "unknown"
         elif line.startswith("REASONING:"):
             reasoning = line.replace("REASONING:", "").strip()
 
     return {
         "score": score, "keywords": keywords, "reasoning": reasoning,
         "requires_returning_student": requires_returning_student,
+        "pay_text": pay_text, "pay_below_floor": below_floor,
     }
 
 
@@ -106,6 +123,21 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
 
+    # The floors come from the profile so the scorer judges pay against the
+    # same numbers the apply stage uses. Internships and full-time roles get
+    # different floors -- an intern rate that looks low annualised is normal.
+    from applypilot import config as _config
+    comp = _config.load_profile().get("compensation", {})
+    annual_floor = comp.get("salary_expectation", "")
+    hourly_floor = comp.get("internship_hourly_floor", "")
+    currency = comp.get("salary_currency", "USD")
+    pay_note = (
+        f"\n\nCOMPENSATION FLOORS ({currency}): internships/co-ops "
+        f"${hourly_floor}/hour; full-time roles ${annual_floor}/year. "
+        f"Use the hourly floor for any internship, even when the posting "
+        f"quotes an annual figure."
+    ) if (annual_floor or hourly_floor) else ""
+
     metros = ", ".join(PREFERRED_METROS)
     location_note = (
         f"\n\nCANDIDATE LOCATION NOTE (soft tiebreaker ONLY — never reduce the "
@@ -117,7 +149,7 @@ def score_job(resume_text: str, job: dict) -> dict:
     )
 
     messages = [
-        {"role": "system", "content": SCORE_PROMPT + location_note},
+        {"role": "system", "content": SCORE_PROMPT + pay_note + location_note},
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
@@ -128,7 +160,8 @@ def score_job(resume_text: str, job: dict) -> dict:
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}",
-                "requires_returning_student": "no"}
+                "requires_returning_student": "no",
+                "pay_text": "", "pay_below_floor": "unknown"}
 
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
@@ -187,9 +220,12 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     for r in results:
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
-            "requires_returning_student = ? WHERE url = ?",
+            "requires_returning_student = ?, pay_text = ?, pay_below_floor = ? "
+            "WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now,
-             r.get("requires_returning_student", "no"), r["url"]),
+             r.get("requires_returning_student", "no"),
+             r.get("pay_text", ""), r.get("pay_below_floor", "unknown"),
+             r["url"]),
         )
     conn.commit()
 
