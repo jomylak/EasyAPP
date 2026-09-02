@@ -106,6 +106,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
+                  -- Pay below the candidate's floor is decided at scoring time
+                  -- (free) rather than burning an apply run to discover it.
+                  -- NULL/'unknown' still applies: most postings state no pay.
+                  AND (pay_below_floor IS NULL OR pay_below_floor != 'yes')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   {site_clause}

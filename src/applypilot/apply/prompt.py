@@ -126,6 +126,7 @@ def _build_salary_section(profile: dict) -> str:
     comp = profile["compensation"]
     currency = comp.get("salary_currency", "USD")
     floor = comp["salary_expectation"]
+    hourly_floor = comp.get("internship_hourly_floor", "")
     range_min = comp.get("salary_range_min", floor)
     range_max = comp.get("salary_range_max", str(int(floor) + 20000) if floor.isdigit() else floor)
     conversion_note = comp.get("currency_conversion_note", "")
@@ -148,8 +149,16 @@ def _build_salary_section(profile: dict) -> str:
     else:
         convert_line = "Posting is in a different currency? -> Target midpoint of their range. Convert if needed."
 
+    intern_rule = (
+        f"INTERNSHIPS AND CO-OPS: the ${floor} annual figure below does NOT apply. "
+        f"Intern roles are paid hourly and a normal rate annualises well below "
+        f"any full-time floor -- do not reject one on that basis. The floor for "
+        f"an internship is ${hourly_floor}/hour. Only stop if the posting states "
+        f"a rate clearly below that.\n\n"
+    ) if hourly_floor else ""
+
     return f"""== SALARY (think, don't just copy) ==
-${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
+{intern_rule}FULL-TIME ROLES: ${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
 
 Decision tree:
 1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
