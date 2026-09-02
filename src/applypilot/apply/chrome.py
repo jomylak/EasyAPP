@@ -259,6 +259,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--password-store=basic",
         "--disable-save-password-bubble",
         "--disable-popup-blocking",
+        # The worker profile is cloned from the user's real Chrome, so it
+        # inherits their extensions. That is actively harmful here: a rival
+        # autofill extension (Jobright) injects its own "Upload Resume" and
+        # "Autofill" controls into the very page we are filling, which both
+        # confuses a vision-driven agent and eats ~40% of the viewport.
+        # Cookies and sessions live in the profile, not the extensions, so
+        # logged-in ATS state is unaffected.
+        "--disable-extensions",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
