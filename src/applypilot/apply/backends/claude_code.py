@@ -145,6 +145,40 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         with _claude_lock:
             _claude_procs[worker_id] = proc
 
+        # Watchdog: if Chrome's DevTools port dies, the agent has no browser and
+        # cannot recover -- but it does not know that, so it sits in
+        # browser_wait_for until the whole run times out. A real run lost ~10
+        # minutes that way. Kill the session promptly instead.
+        cdp_dead = threading.Event()
+
+        def _watch_cdp() -> None:
+            import socket
+            misses = 0
+            while not cdp_dead.wait(10):
+                if proc.poll() is not None:
+                    return
+                sock = socket.socket()
+                try:
+                    sock.settimeout(2)
+                    sock.connect(("127.0.0.1", port))
+                    misses = 0
+                except OSError:
+                    misses += 1
+                    # Two consecutive misses -- one can be a transient stall
+                    # while Chrome is busy, two means it is gone.
+                    if misses >= 2:
+                        logger.error("[worker-%d] Chrome DevTools port %d died; "
+                                     "ending the session", worker_id, port)
+                        cdp_dead.set()
+                        _kill_process_tree(proc.pid)
+                        return
+                finally:
+                    sock.close()
+
+        watchdog = threading.Thread(target=_watch_cdp,
+                                    name=f"cdp-watch-{worker_id}", daemon=True)
+        watchdog.start()
+
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
 
@@ -255,6 +289,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     return f"failed:{reason}", duration_ms
             return "failed:unknown", duration_ms
 
+        if cdp_dead.is_set():
+            add_event(f"[W{worker_id}] BROWSER DIED ({elapsed}s)")
+            update_state(worker_id, status="failed",
+                         last_action=f"browser died ({elapsed}s)")
+            return "failed:page_error", duration_ms
+
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
         return "failed:no_result_line", duration_ms
@@ -271,6 +311,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
+        try:
+            cdp_dead.set()
+        except NameError:
+            pass  # failed before the watchdog started
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:

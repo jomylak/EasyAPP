@@ -61,6 +61,30 @@ def _kill_process_tree(pid: int) -> None:
         logger.debug("Failed to kill process tree for PID %d", pid, exc_info=True)
 
 
+def _wait_for_port_free(port: int, timeout: float = 10.0) -> bool:
+    """Block until nothing is listening on a port.
+
+    Killing a process is not the same as it having exited: Chrome takes a moment
+    to release the port and its profile lock. Relaunching into that window
+    produces an instance whose DevTools endpoint dies partway through a run,
+    which is indistinguishable from a crash from the agent's point of view.
+    """
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sock = socket.socket()
+        try:
+            sock.settimeout(0.5)
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return True  # refused == nothing listening
+        finally:
+            sock.close()
+        time.sleep(0.25)
+    logger.warning("Port %d still in use after %.0fs", port, timeout)
+    return False
+
+
 def _kill_on_port(port: int) -> None:
     """Kill any process listening on a specific port (zombie cleanup).
 
@@ -236,8 +260,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     profile_dir = setup_worker_profile(worker_id)
 
-    # Kill any zombie Chrome from a previous run on this port
+    # Kill any zombie Chrome from a previous run on this port, and wait for it
+    # to actually release the port before launching into the same one.
     _kill_on_port(port)
+    _wait_for_port_free(port)
 
     # Patch preferences to suppress restore nag
     _suppress_restore_nag(profile_dir)
