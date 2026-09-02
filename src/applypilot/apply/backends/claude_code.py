@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Track active Claude Code processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
+_claude_stats: dict[int, dict] = {}  # worker_id -> last run's token accounting
 _claude_lock = threading.Lock()
 
 
@@ -253,6 +254,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
+            with _claude_lock:
+                _claude_stats[worker_id] = {
+                    "llm_requests": stats.get("turns") or None,
+                    "input_tokens": stats.get("input_tokens"),
+                    "output_tokens": stats.get("output_tokens"),
+                    "cache_read_tokens": stats.get("cache_read"),
+                    "cost_usd": stats.get("cost_usd"),
+                }
             cost = stats.get("cost_usd", 0)
             ws = get_state(worker_id)
             prev_cost = ws.total_cost if ws else 0.0
@@ -338,8 +347,9 @@ class ClaudeCodeBackend:
                        model=model, dry_run=dry_run)
 
     def pop_run_stats(self, worker_id: int) -> dict:
-        """No per-run LLM request count is exposed by the Claude Code CLI."""
-        return {}
+        """Return and clear token accounting from this worker's last run."""
+        with _claude_lock:
+            return _claude_stats.pop(worker_id, {})
 
     def preflight(self) -> None:
         """Confirm the Claude Code CLI is on PATH."""

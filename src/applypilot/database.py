@@ -202,6 +202,13 @@ _ALL_COLUMNS: dict[str, str] = {
     "pay_below_floor": "TEXT",
     "apply_backend": "TEXT",
     "apply_llm_requests": "INTEGER",
+    # Token accounting. The stream already reports these; recording them is what
+    # makes "are we paying for input or output" answerable, and shows whether
+    # prompt caching is actually working (cache_read should dominate).
+    "apply_input_tokens": "INTEGER",
+    "apply_output_tokens": "INTEGER",
+    "apply_cache_read_tokens": "INTEGER",
+    "apply_cost_usd": "REAL",
 }
 
 
