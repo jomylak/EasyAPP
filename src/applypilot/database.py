@@ -194,6 +194,10 @@ _ALL_COLUMNS: dict[str, str] = {
     # Pay as stated in the posting, and whether it falls under the candidate's
     # floor. Judged at scoring time (free) so below-floor jobs never reach the
     # apply stage; 'unknown' when the posting states no pay, which is common.
+    # Which ATS the posting routes to. Detected by pattern match (no LLM call),
+    # and re-detected at apply time when the real URL is known -- job boards
+    # front the ATS behind redirects.
+    "ats": "TEXT",
     "pay_text": "TEXT",
     "pay_below_floor": "TEXT",
     "apply_backend": "TEXT",

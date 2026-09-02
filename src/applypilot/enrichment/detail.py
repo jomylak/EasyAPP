@@ -663,10 +663,16 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
+                    from applypilot.ats import detect_ats
+                    detected = detect_ats(
+                        result.get("application_url") or url,
+                        result.get("full_description"),
+                    )
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        "detail_scraped_at = ?, detail_error = NULL, ats = ? WHERE url = ?",
+                        (result.get("full_description"), result.get("application_url"),
+                         now, detected, url),
                     )
                 else:
                     stats["error"] += 1
