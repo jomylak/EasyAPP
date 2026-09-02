@@ -61,13 +61,17 @@ if platform.system() != "Windows":
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0,
+                exclude_urls: set[str] | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        exclude_urls: URLs already attempted in this session. Needed because a
+            dry run deliberately leaves the job's status untouched, so without
+            this the same top-scoring job is handed back every iteration.
 
     Returns:
         Job dict or None if the queue is empty.
@@ -91,6 +95,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
             params: list = [min_score]
+            seen_clause = ""
+            if exclude_urls:
+                placeholders = ",".join("?" * len(exclude_urls))
+                seen_clause = f"AND url NOT IN ({placeholders})"
+                params.extend(sorted(exclude_urls))
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -112,6 +121,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND (pay_below_floor IS NULL OR pay_below_floor != 'yes')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
+                  {seen_clause}
                   {site_clause}
                   {url_clauses}
                 ORDER BY fit_score DESC, url
@@ -356,6 +366,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     """
     applied = 0
     failed = 0
+    attempted: set[str] = set()  # this session only -- see acquire_job docstring
     continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
@@ -369,7 +380,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, exclude_urls=attempted)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -386,6 +397,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             continue
 
         empty_polls = 0
+        attempted.add(job["url"])
 
         chrome_proc = None
         try:
