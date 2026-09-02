@@ -255,8 +255,12 @@ def apply(
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
     console.print(f"  Backend:  {effective_backend}")
-    console.print(f"  Model:    {model}" + ("  [dim](Skyvern configures its own model)[/dim]"
-                                            if effective_backend == "skyvern" else ""))
+    if effective_backend == "skyvern":
+        # --model selects a Claude model and is meaningless here; Skyvern's
+        # model lives in its own .env. Printing "haiku" just misleads.
+        console.print("  Model:    [dim]set in Skyvern's .env (OPENROUTER_MODEL)[/dim]")
+    else:
+        console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
