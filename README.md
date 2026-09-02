@@ -180,6 +180,7 @@ applypilot run [stages...]              # Run pipeline stages (or 'all')
 applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
+applypilot run score --rescore          # Re-score all jobs (after criteria change)
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
