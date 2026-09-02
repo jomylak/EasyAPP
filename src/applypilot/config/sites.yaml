@@ -36,13 +36,16 @@ blocked_sso:
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.
 base_urls:
-  "Intern List - SWE": "https://www.intern-list.com"
+  "Intern List - SWE": "https://jobright.ai"
   "NewGrad Jobs - SWE": "https://www.newgrad-jobs.com"
 
 sites:
   # ── Active targets ───────────────────────────────────────────────────
+  # intern-list.com renders its job table inside a jobright.ai iframe, so the
+  # wrapper page yields no Salary/Date columns -- scraping it was silently
+  # dropping pay data. Target the embed directly.
   - name: "Intern List - SWE"
-    url: "https://www.intern-list.com/swe-intern-list"
+    url: "https://jobright.ai/minisites-jobs/intern/us/swe?embed=true"
     type: static
 
   - name: "NewGrad Jobs - SWE"
