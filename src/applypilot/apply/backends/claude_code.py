@@ -21,6 +21,7 @@ from pathlib import Path
 
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod
+from applypilot.ats import detect_ats
 from applypilot.apply.chrome import reset_worker_dir, _kill_process_tree
 from applypilot.apply.dashboard import add_event, get_state, update_state
 
@@ -30,6 +31,13 @@ logger = logging.getLogger(__name__)
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_stats: dict[int, dict] = {}  # worker_id -> last run's token accounting
 _claude_lock = threading.Lock()
+
+# Only these models write to the known-quirks cache. A weaker model's claim
+# that a fallback "worked" isn't trustworthy without the same rigor a stronger
+# model applies -- Haiku has fabricated RESULT:APPLIED with blank fields, so a
+# self-reported fix from it could poison the cache for every future run on
+# that platform. Cheap models still READ the cache; they just don't write it.
+_TRUSTED_QUIRK_WRITERS = {"sonnet", "opus"}
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +192,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.close()
 
         text_parts: list[str] = []
+        navigated_urls: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
@@ -209,6 +218,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 inp = block.get("input", {})
                                 if "url" in inp:
                                     desc = f"{name} {inp['url'][:60]}"
+                                    if name == "browser_navigate":
+                                        navigated_urls.append(inp["url"])
                                 elif "ref" in inp:
                                     desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
                                 elif "fields" in inp:
@@ -252,6 +263,37 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
+
+        # Resolve the real ATS platform for this run. The stored URL is often
+        # an aggregator redirect (Jobright, Intern List) that detect_ats can't
+        # resolve -- but the agent's own browser_navigate calls reveal the
+        # real destination once it follows the posting to the employer's ATS.
+        # Check those before falling back to the stored (possibly unresolved)
+        # URLs, so a successful run tells future runs what platform this job
+        # actually lives on.
+        job_ats = None
+        for nav_url in navigated_urls:
+            resolved = detect_ats(nav_url)
+            if resolved and resolved != "aggregator (unresolved)":
+                job_ats = resolved
+                break
+        if not job_ats:
+            job_ats = detect_ats(job.get("application_url") or job.get("url"))
+
+        if job_ats and job_ats != job.get("ats"):
+            from applypilot.database import get_connection
+            conn = get_connection()
+            conn.execute("UPDATE jobs SET ats = ? WHERE url = ?", (job_ats, job["url"]))
+            conn.commit()
+
+        # Persist any self-reported widget fixes -- only from a trusted model,
+        # and only when the run actually succeeded (a QUIRK line attached to a
+        # failed run is an unverified guess, not a confirmed fix).
+        if "RESULT:APPLIED" in output and model in _TRUSTED_QUIRK_WRITERS and job_ats:
+            for out_line in output.split("\n"):
+                out_line = out_line.strip()
+                if out_line.startswith("QUIRK:"):
+                    config.append_known_quirk(job_ats, out_line[len("QUIRK:"):].strip())
 
         if stats:
             with _claude_lock:

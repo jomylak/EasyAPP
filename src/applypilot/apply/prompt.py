@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 from applypilot import config
+from applypilot.ats import detect_ats
 
 logger = logging.getLogger(__name__)
 
@@ -472,8 +473,27 @@ If CapSolver genuinely failed (errorId > 0):
 4. All else fails -> Output RESULT:CAPTCHA."""
 
 
+def _build_known_quirks_section(ats: str | None) -> str:
+    """Build the known-quirks section for one ATS platform, if any exist.
+
+    Empty when nothing has been recorded for this platform yet -- the section
+    disappears from the prompt entirely rather than printing a hollow header.
+    """
+    quirks = config.load_known_quirks(ats)
+    if not quirks:
+        return ""
+    return f"""== KNOWN QUIRKS ON {ats} (verified fixes from past runs) ==
+Try the normal approach first. Only reach for one of these if you've verified
+the normal approach failed on this specific field (read the value back and it
+didn't stick) -- these are fallbacks for a known failure mode, not a default
+to apply blindly, since not every posting on this platform hits the same bug.
+{quirks}"""
+
+
 def _prepare_context(job: dict, cover_letter: str | None = None,
-                     worker_id: int | None = None) -> dict:
+                     worker_id: int | None = None,
+                     email_override: str | None = None,
+                     password_override: str | None = None) -> dict:
     """Resolve documents and build every reusable prompt section for a job.
 
     Shared by both prompt assemblers so the Claude Code and Skyvern paths
@@ -488,11 +508,32 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
             backend needs this because it serves that directory over HTTP,
             and because parallel workers would otherwise overwrite each
             other's uploads.
+        email_override: For repeat-testing the same employer's form without
+            an ATS remembering a prior run's account. Gmail plus-addressing
+            (e.g. ``jomylak+test1@gmail.com``) is a distinct string to every
+            signup form but still lands in the same real inbox, so account
+            recovery and verification-code lookup keep working unchanged.
+            Never used for real applications -- only the test-harness path
+            passes this.
+        password_override: Same idea, for the account password. Test-harness
+            only.
 
     Returns:
         Dict of resolved paths, text and rendered prompt sections.
     """
     profile = config.load_profile()
+    if email_override or password_override:
+        # Override at the profile level, not just the local `personal`
+        # variable below -- every section builder (_build_profile_summary,
+        # _build_hard_rules, etc.) takes the whole `profile` dict and reads
+        # profile["personal"] itself, so the override has to live there to
+        # actually reach the rendered prompt.
+        overrides = {}
+        if email_override:
+            overrides["email"] = email_override
+        if password_override:
+            overrides["password"] = password_override
+        profile = {**profile, "personal": {**profile["personal"], **overrides}}
     search_config = config.load_search_config()
     personal = profile["personal"]
 
@@ -545,6 +586,20 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
     screening_section = _build_screening_section(profile, grad_date=grad_date)
     hard_rules = _build_hard_rules(profile)
     captcha_section = _build_captcha_section()
+    # The stored application_url is often an aggregator redirect (Jobright,
+    # Intern List) that resolves to nothing -- detect_ats correctly returns
+    # "aggregator (unresolved)" for it. A prior run that actually navigated to
+    # the real ATS may have already resolved and persisted the true platform
+    # to this column, which is a far better signal to preload quirks from than
+    # re-guessing off a redirect shim. Fresh, never-attempted aggregator jobs
+    # still get no preload here -- there is no way to know the real platform
+    # before the agent has navigated anywhere.
+    stored_ats = job.get("ats")
+    if stored_ats and stored_ats != "aggregator (unresolved)":
+        detected_ats = stored_ats
+    else:
+        detected_ats = detect_ats(job.get("application_url") or job.get("url"))
+    known_quirks_section = _build_known_quirks_section(detected_ats)
 
     # Cover letter fallback text
     city = personal.get("city", "the area")
@@ -590,6 +645,8 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
         "salary_section": salary_section,
         "screening_section": screening_section,
         "hard_rules": hard_rules,
+        "ats": detected_ats,
+        "known_quirks_section": known_quirks_section,
         "phone_digits": phone_digits,
         "blocked_sso": blocked_sso,
         "display_name": display_name,
@@ -599,7 +656,9 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
 
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
-                 dry_run: bool = False) -> str:
+                 dry_run: bool = False,
+                 email_override: str | None = None,
+                 password_override: str | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -611,11 +670,17 @@ def build_prompt(job: dict, tailored_resume: str,
         tailored_resume: Plain-text content of the tailored resume.
         cover_letter: Optional plain-text cover letter content.
         dry_run: If True, tell the agent not to click Submit.
+        email_override: See ``_prepare_context`` -- test-harness only, lets a
+            repeat run on the same employer's form sign up as a fresh
+            applicant instead of reusing a prior run's account and its
+            already-populated Application Questions page.
+        password_override: Same idea, for the account password.
 
     Returns:
         Complete prompt string for the AI agent.
     """
-    ctx = _prepare_context(job, cover_letter=cover_letter)
+    ctx = _prepare_context(job, cover_letter=cover_letter, email_override=email_override,
+                           password_override=password_override)
     profile = ctx["profile"]
     personal = ctx["personal"]
     full_name = ctx["full_name"]
@@ -627,6 +692,7 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = ctx["salary_section"]
     screening_section = ctx["screening_section"]
     hard_rules = ctx["hard_rules"]
+    known_quirks_section = ctx["known_quirks_section"]
     phone_digits = ctx["phone_digits"]
     blocked_sso = ctx["blocked_sso"]
     display_name = ctx["display_name"]
@@ -683,6 +749,13 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 {screening_section}
 
+== TOOL DISCOVERY ==
+Before step 1, if any tools you need are not yet loaded, load them all in ONE
+ToolSearch call (comma-separated names), not one call per tool. You will need
+the Playwright browser tools and, if this job needs account recovery, the
+Gmail tools -- load both sets up front rather than discovering them one at a
+time as you hit each need.
+
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
@@ -690,21 +763,35 @@ If something unexpected happens and these instructions don't cover it, figure it
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
    - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
    - Output RESULT:APPLIED. Done.
+  If clicking Apply opens an application-choice dialog with options such as
+  "Autofill with Resume", "Apply Manually", or "Use My Last Application", choose
+  "Autofill with Resume" when a resume is available. This is the preferred path
+  because it reduces unnecessary entry; after it loads, review and correct every
+  autofilled field against the APPLICANT PROFILE and TAILORED RESUME.
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
-5. Login wall?
+5. Account wall? Do NOT try to log in first. The candidate may not have an
+  account on this employer's ATS.
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {STD_PASSWORD}
-   5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-   5e. Sign in failed? Try sign up with the same email and password.
-   5f. Need email verification? See ACCOUNT RECOVERY below.
-   5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-   5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
+  5c. Look for Create account, Register, Sign up, or an equivalent new-applicant option. If available, register with {personal['email']} / {STD_PASSWORD}.
+  5d. If registration succeeds, complete any requested email verification, then continue. See ACCOUNT RECOVERY below.
+  5e. If registration explicitly says the email/account already exists, or explicitly switches to a sign-in view, and only then, sign in with {personal['email']} / {STD_PASSWORD}.
+  5f. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
+  5g. If that known-existing account rejects the password, use Forgot password/Reset password. Do not use password reset for a registration error, a generic login error, or an account whose existence was never confirmed.
+  5h. If registration is unavailable, registration fails without explicitly saying the account exists, verification cannot be completed, or recovery mail does not arrive -> RESULT:FAILED:login_issue. Do not guess, loop, or try a speculative login.
+  5i. After registration or login, run browser_tabs action "list" again. Switch back to the application tab if needed.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
-8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
+8. Check ALL pre-filled fields, then fill what's left in ONE pass, not field by field:
+   - Snapshot once. List every plain TEXT/number input still empty or wrong on
+     this page before touching any of them.
+   - Fill every one of those in a SINGLE browser_fill_form call. A page with
+     15 text fields costs ONE tool call this way, not 15 -- this is the
+     single biggest lever you have for keeping a multi-page form cheap.
+     Dropdowns, comboboxes, checkboxes, and date pickers are NOT included in
+     that call -- handle each of those individually, see TOOL DISCIPLINE below.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
-   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
+   - Compare every other field to the APPLICANT PROFILE. Fix mismatches.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
 11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
@@ -718,6 +805,14 @@ RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:reason -- any other failure (brief reason)
+
+If a field resisted the normal approach and you had to use a genuinely
+different fallback to make it work (not just retrying the same action), and
+your RESULT is APPLIED, add one line right before your RESULT line:
+QUIRK: <what the normal approach did wrong> -> <what worked instead>
+Only report this when you're confident the fix generalizes to this ATS
+platform, not just this one employer's form. Skip it for anything you're
+unsure actually worked, or that isn't specific to a widget type.
 
 == BROWSER EFFICIENCY ==
 - CONTEXT IS THE COST. Every snapshot you take is re-sent to you on every later
@@ -733,6 +828,14 @@ RESULT:FAILED:reason -- any other failure (brief reason)
     after a navigation unless you actually need new element refs.
   * For an overview of a large form, browser_snapshot accepts a `depth` limit --
     prefer a shallow snapshot over a full one.
+  * Don't browser_wait_for as a reflexive precaution after every click -- only
+    wait when you actually expect a page transition or async content load
+    (after Next/Continue, after an autofill/parse step, after a spinner
+    appears). Don't browser_evaluate to re-check something your last snapshot
+    or browser_find already showed you -- that's a second read of the same
+    state, not a needed one. This is about skipping REDUNDANT checks, not
+    skipping verification -- still confirm every value you set; just don't
+    confirm the same thing twice.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
 - Fill ALL plain text fields in ONE browser_fill_form call. Not one at a time.
   Custom comboboxes are the exception -- see TOOL DISCIPLINE below; batching them
@@ -745,6 +848,13 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
 - TOOL DISCIPLINE (this is the difference between a 4-minute run and a 20-minute one):
+  Read page state ONLY through browser_snapshot / browser_find. Do NOT use a
+  shell/terminal tool to cat, grep, or sed the Playwright MCP's own on-disk
+  snapshot files (paths like .playwright-mcp/page-*.yml) -- that is a
+  duplicate, slower path to information browser_find already gives you
+  directly, and every shell call is its own full turn on top of the browser
+  action that already ran. If you want to search a large page for one
+  keyword, that is exactly what browser_find is for.
   Set values with browser_type, browser_click, browser_fill_form and
   browser_file_upload. Use browser_evaluate ONLY to READ state you cannot see in
   a snapshot -- never to set a value. Assigning `el.value` and firing a synthetic
@@ -759,9 +869,18 @@ RESULT:FAILED:reason -- any other failure (brief reason)
     producing keystrokes, so the live-search filter never runs and the list never
     narrows. Worse, the value they leave behind concatenates with what you type
     next ("United StatesUnited States"). So: CLEAR the field first, then
-    browser_type the value with slow/character-by-character typing so real key
-    events fire, THEN click the matching option from a fresh snapshot. Do not
+    browser_type(text: value, slowly: true) -- this fires one real keystroke
+    per character in a SINGLE tool call, which both triggers the filter and
+    avoids the cost of typing digit-by-digit with separate browser_press_key
+    calls -- THEN click the matching option from a fresh snapshot. Do not
     scroll the unfiltered list hunting for it.
+  * Date field ignores browser_fill_form / fill(), or a value you set doesn't
+    read back correctly? Same fix: browser_type(text: "MM/DD/YYYY", slowly:
+    true) on the field. Try this BEFORE resorting to individual
+    browser_press_key calls for each digit -- one browser_type(slowly) call
+    replaces 8-10 press_key turns for the same result, and each turn re-reads
+    the whole conversation so far, so this is the single most expensive
+    mistake to make on a masked field.
   * A long option list (countries, states, universities) is usually paginated or
     virtualised: the option you want is not in the DOM until you type to filter.
     Clicking blind lands on whatever row happens to be rendered -- this is how a
@@ -782,36 +901,69 @@ RESULT:FAILED:reason -- any other failure (brief reason)
   Re-check the form for newly required fields before submitting.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
-- Date fields: {datetime.now().strftime('%m/%d/%Y')}
+- DATE FIELD PROTOCOL -- classify the widget before you act, don't guess-and-retry:
+  Today's date, if a field asks for it: {datetime.now().strftime('%m/%d/%Y')}
+  Snapshot or browser_find the field first and match it to ONE of these three
+  known patterns -- across real runs, a Workday-style ATS has used all three,
+  sometimes for different fields on the SAME application, so don't assume
+  yesterday's fix applies to today's field until you've checked:
+  1. A single typeable <input> holding a MM/DD/YYYY-style value or placeholder
+     -> browser_type(text: "MM/DD/YYYY", slowly: true) directly into it, then
+     verify with browser_find. Try this first whenever the field looks like an
+     ordinary text input -- it's the fastest path when it works.
+  2. Three sibling spinbutton inputs for month/day/year (often
+     data-automation-id*="dateSection...", or role="spinbutton") ->
+     browser_type(slowly) usually does NOT commit on this widget. Click the
+     first (month) segment, then send the digits for month, day, and year with
+     browser_press_key -- the widget auto-advances between segments as each
+     fills, so explicit Tab presses are usually unnecessary but harmless if
+     you add them anyway.
+  3. No typeable input at all -- only a calendar icon/button that opens a
+     popup with Previous/Next-month navigation and clickable day numbers ->
+     do NOT keep trying to type into it, however many times you retry --
+     typing will never commit here. The moment you see a calendar popup with
+     no focusable date text input beside it, switch immediately to: click the
+     calendar icon, click "Next month" (or "Previous month") the number of
+     times needed to reach the target month/year, then click the correct day.
+  To CHANGE a date already set wrong: for patterns 1 and 2, just re-enter the
+  value the same way you set it -- the field or spinbutton accepts new digits
+  directly, no separate clear step needed. For pattern 3, reopen the calendar
+  and click the correct day again; selecting a new day replaces the old one.
+  Verify with browser_find afterward, same as any other field.
 - Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
+
+{known_quirks_section}
 
 == ACCOUNT RECOVERY (the same password is used everywhere) ==
 The candidate uses ONE password on every employer site: {STD_PASSWORD}
 There is never a different password to look up -- if this one is rejected, the
 account exists with a password you do not have, and the answer is always to reset it.
 
-Do NOT pre-emptively sign in. Start the application normally; only branch when the
-site tells you an account exists. Checking first costs a login on every application;
-reacting costs one only on the few that need it.
+Do NOT pre-emptively sign in or open password recovery. Start the application
+normally and choose Create account/Register/Sign up when the ATS offers it. Only
+branch to login when registration explicitly says the email/account already exists
+or the site explicitly switches to a sign-in view. A generic login error is not proof
+that an account exists; never use it to justify a speculative login or reset.
 
-A. "Account already exists" / "email already registered" / the form flips to a
-   sign-in view -> sign in with {personal['email']} / {STD_PASSWORD}.
-B. Password rejected -> RESET IT. Click "Forgot password" / "Reset password",
+A. Registration succeeds -> complete verification if requested, then continue.
+B. "Account already exists" / "email already registered" / the form flips to a
+  sign-in view during registration -> sign in with {personal['email']} / {STD_PASSWORD}.
+C. Password rejected on that confirmed-existing account -> RESET IT. Click "Forgot password" / "Reset password",
    submit {personal['email']}, then get the mail (see C). Set the new password to
    exactly {STD_PASSWORD} if the site allows reuse; if it refuses to accept the old
    password, choose {STD_PASSWORD}2 and say so in your final output so the human
    can record it.
-C. Reading the email: use search_emails + read_email. Search the inbox first, then
+D. Reading the email: use search_emails + read_email. Search the inbox first, then
    ALSO search "in:spam" -- employer ATS mail routinely fails sender authentication
    at the destination and lands in spam. This is expected, not a bug. Reset links
    and codes usually expire in ~10 minutes, so check spam promptly instead of
    repeatedly retrying the inbox. If the mail contains a LINK rather than a code,
    open the link and complete the reset on that page.
-D. Signed in -> return to the application. The form often loses uploaded files
+E. Signed in -> return to the application. The form often loses uploaded files
    across a sign-in, so RE-CHECK the resume field and re-upload if it is empty.
-E. Reset mail never arrives after ~2 minutes, or the reset page errors ->
+F. Reset mail never arrives after ~2 minutes, or the reset page errors ->
    RESULT:FAILED:login_issue. Do not loop.
 
 {captcha_section}
@@ -937,19 +1089,20 @@ without it does not count as complete.
 {screening_section}
 
 == ACCOUNTS AND LOGINS ==
-If the site requires an account on the employer's own system, sign in with
-{personal.get('email', 'the profile email')} and the profile password, or register a new
-account with the same email. If sign-in and registration both fail, or the site demands
-SSO, stop and report login_issue rather than retrying indefinitely.
+If the site requires an account on the employer's own system, do NOT sign in first.
+Choose Create account/Register/Sign up with {personal.get('email', 'the profile email')}
+and the profile password. Only sign in if registration explicitly reports that the
+email/account already exists or explicitly switches to a sign-in view. If registration
+fails for any other reason, stop and report login_issue. A generic "wrong email or
+password" message is not evidence that an account exists.
 
 The candidate uses ONE password on every employer site, the profile password above.
-There is never a different one to look up: if it is rejected, the account exists with
-a password you do not have, and the answer is to reset it. Do not pre-emptively sign
-in -- start the application normally and only branch when the site says an account
-exists. Then: sign in with that password; if rejected, use "Forgot password" with the
-same email, complete the reset from the email, and set the password back to the same
-one. After signing in, re-check the resume field -- forms routinely drop uploaded
-files across a sign-in.
+There is never a different one to look up. Do not infer account existence from a
+generic login failure. After registration explicitly confirms that the account exists,
+sign in with that password; if that confirmed-existing account rejects it, use "Forgot
+password" with the same email, complete the reset from the email, and set the password
+back to the same one. After signing in, re-check the resume field -- forms routinely
+drop uploaded files across a sign-in.
 
 If a step asks for an emailed verification code, request the code and enter it -- it is
 fetched from the inbox automatically, including from the spam folder, so wait for it
