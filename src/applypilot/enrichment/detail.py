@@ -352,6 +352,67 @@ def extract_apply_url_deterministic(page) -> str | None:
     return None
 
 
+def resolve_original_job_url(page, candidate_url: str | None) -> str | None:
+    """Click through Jobright's Apply flow to the real employer ATS URL.
+
+    Jobright's own detail page is itself an aggregator wrapper -- its og:url
+    and default Apply link both stay on jobright.ai, so ATS detection run
+    against them always returns "aggregator (unresolved)" even though the
+    real Workday/Greenhouse/etc. posting is one click away.
+
+    The click path only works when this page's browser context is signed
+    into a real Jobright account (see ENRICHMENT_PROFILE_DIR) -- logged out,
+    the same click hits a permanent signup wall with no way through. Signed
+    in, the confirmed flow is: click "Apply Now" -> a "Customize Your Resume"
+    upsell dialog may appear, with an "Apply Without Customizing" skip link
+    -> a new tab opens with the real employer URL. Verified by hand against
+    a live job (resolved to a real careers.<company>.com URL) before writing
+    this.
+
+    Best-effort and silent on failure -- most jobs are not aggregator-wrapped,
+    a logged-out context can't get past the wall at all, and a page layout
+    this doesn't recognize should not break enrichment.
+    """
+    from applypilot.ats import _AGGREGATORS
+
+    if not candidate_url or not re.search(_AGGREGATORS, candidate_url.lower()):
+        return None
+
+    try:
+        apply_btn = None
+        for el in page.query_selector_all("a, button"):
+            text = (el.inner_text() or "").strip().lower()
+            if text == "apply now":
+                apply_btn = el
+                break
+        if not apply_btn:
+            return None
+
+        pages_before = set(page.context.pages)
+        apply_btn.click(timeout=5000)
+        page.wait_for_timeout(1200)
+
+        # The resume-customization upsell doesn't always appear (depends on
+        # how well the tailored resume already matches); skip it when it does.
+        skip = page.query_selector("text=Apply Without Customizing")
+        if skip:
+            skip.click(timeout=3000)
+
+        page.wait_for_timeout(1500)
+        new_pages = set(page.context.pages) - pages_before
+        if new_pages:
+            new_page = new_pages.pop()
+            new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+            resolved = new_page.url
+            new_page.close()
+            return resolved
+        if page.url != candidate_url:
+            return page.url
+        return None
+    except Exception:
+        return None
+
+
 def extract_description_deterministic(page) -> str | None:
     """Try known CSS patterns for the job description block."""
     for sel in DESCRIPTION_SELECTORS:
@@ -528,6 +589,26 @@ RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
 
+def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
+    """Attach elapsed time, resolving an aggregator's real ATS URL first.
+
+    Shared by every successful exit from scrape_detail_page so the click-
+    through only needs to be written once. Falls back to the page's own url
+    when no application_url was extracted -- for an aggregator-sourced job
+    (Jobright), that IS the aggregator wrapper page, and its own "Apply Now"
+    is a JS button with no href, so extract_apply_url_deterministic never
+    finds a candidate to hand to the resolver in the first place. Without
+    this fallback, resolve_original_job_url never even gets called.
+    """
+    resolved = resolve_original_job_url(page, result.get("application_url") or url)
+    if resolved:
+        result["application_url"] = resolved
+        if result.get("full_description"):
+            result["status"] = "ok"
+    result["elapsed"] = time.time() - t0
+    return result
+
+
 def scrape_detail_page(page, url: str) -> dict:
     """Full cascade for one detail page."""
     result: dict = {
@@ -571,8 +652,7 @@ def scrape_detail_page(page, url: str) -> dict:
             if apply:
                 result["application_url"] = apply
         result["status"] = "ok" if result.get("application_url") else "partial"
-        result["elapsed"] = time.time() - t0
-        return result
+        return _finalize_detail_result(result, page, t0, url)
 
     # Tier 2: Deterministic CSS
     desc = extract_description_deterministic(page)
@@ -583,8 +663,7 @@ def scrape_detail_page(page, url: str) -> dict:
         result["application_url"] = apply
         result["tier_used"] = 2
         result["status"] = "ok" if apply else "partial"
-        result["elapsed"] = time.time() - t0
-        return result
+        return _finalize_detail_result(result, page, t0, url)
 
     tier2_apply = apply
 
@@ -602,8 +681,7 @@ def scrape_detail_page(page, url: str) -> dict:
         result["status"] = "error"
         result["error"] = "no data extracted"
 
-    result["elapsed"] = time.time() - t0
-    return result
+    return _finalize_detail_result(result, page, t0, url)
 
 
 def scrape_site_batch(
@@ -633,12 +711,18 @@ def scrape_site_batch(
 
     try:
         with sync_playwright() as p:
-            launch_opts: dict = {"headless": True}
+            launch_opts: dict = {"headless": True, "user_agent": UA}
             if _PROXY_CONFIG:
                 launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
-            browser = p.chromium.launch(**launch_opts)
-            context = browser.new_context(user_agent=UA)
-            page = context.new_page()
+            # Persistent, enrichment-only profile: a signed-in Jobright
+            # session (set up once, manually, outside this pipeline) is what
+            # lets resolve_original_job_url get past its signup wall. A fresh
+            # throwaway context here would never carry that session.
+            config.ENRICHMENT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            context = p.chromium.launch_persistent_context(
+                str(config.ENRICHMENT_PROFILE_DIR), **launch_opts
+            )
+            page = context.pages[0] if context.pages else context.new_page()
 
             for i, (url, title) in enumerate(jobs):
                 log.info("[%d/%d] %s", i + 1, len(jobs), title[:50] if title else url[:50])
@@ -686,7 +770,7 @@ def scrape_site_batch(
                 if i < len(jobs) - 1:
                     time.sleep(delay)
 
-            browser.close()
+            context.close()
     finally:
         if own_conn:
             conn.close()

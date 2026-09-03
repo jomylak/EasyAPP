@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -97,42 +97,58 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
-def _posted_within_days(posted_date: str | None, days: int = 7) -> bool:
-    """Check if a scraped posting date is within the last N days.
+def _normalize_posted_date(posted_date: str | None) -> str | None:
+    """Best-effort parse of a scraped posting-date string into ISO 8601.
 
-    Best-effort: dates come from LLM-extracted card text in all sorts of
-    formats ("2 days ago", "Aug 28, 2026", "08/28/2026"). If it can't be
-    parsed at all, we keep the job rather than silently dropping it --
-    better to over-include than to zero out results because of a brittle
-    date field on a page we've never scraped before.
+    Handles relative formats ("2 days ago", "today", "yesterday") and
+    absolute ones ("Aug 28, 2026", "08/28/2026"). Returns None when the text
+    can't be parsed at all -- callers should fall back to discovered_at
+    rather than treat that as "posted today", which would understate age.
     """
     if not posted_date or not posted_date.strip():
-        return True
+        return None
 
     from dateutil import parser as dateutil_parser
 
     text = posted_date.strip().lower()
+    now = datetime.now(timezone.utc)
 
-    # Relative formats ("2 days ago", "today", "yesterday") -- common on
-    # job boards and not something dateutil parses on its own.
     relative_match = re.search(r"(\d+)\s*(hour|day|week)s?\s*ago", text)
     if relative_match:
         n, unit = int(relative_match.group(1)), relative_match.group(2)
-        age_days = n / 24 if unit == "hour" else n if unit == "day" else n * 7
-        return age_days <= days
+        delta_days = n / 24 if unit == "hour" else n if unit == "day" else n * 7
+        return (now - timedelta(days=delta_days)).isoformat()
     if "today" in text or "just posted" in text or "hour" in text:
-        return True
+        return now.isoformat()
     if "yesterday" in text:
-        return 1 <= days
+        return (now - timedelta(days=1)).isoformat()
 
     try:
         parsed = dateutil_parser.parse(posted_date, fuzzy=True)
     except (ValueError, OverflowError):
-        return True
+        return None
 
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    age = datetime.now(timezone.utc) - parsed
+    return parsed.isoformat()
+
+
+def _posted_within_days(posted_date: str | None, days: int = 7) -> bool:
+    """Check if a scraped posting date is within the last N days.
+
+    Best-effort: dates come from LLM-extracted card text in all sorts of
+    formats. If it can't be parsed at all, we keep the job rather than
+    silently dropping it -- better to over-include than to zero out results
+    because of a brittle date field on a page we've never scraped before.
+    """
+    if not posted_date or not posted_date.strip():
+        return True
+
+    normalized = _normalize_posted_date(posted_date)
+    if normalized is None:
+        return True
+
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(normalized)
     return age.days <= days
 
 
@@ -169,15 +185,16 @@ def _store_jobs_filtered(
         if not _location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
-        if not _posted_within_days(job.get("posted_date"), days=7):
+        if not _posted_within_days(job.get("posted_date"), days=config.DEFAULTS["discovery_posted_within_days"]):
             too_old += 1
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now, job_type),
+                 job.get("location"), site, strategy, now, job_type,
+                 _normalize_posted_date(job.get("posted_date"))),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -923,12 +940,125 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     return selectors, jobs
 
 
+def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
+    """Bespoke scraper for Airtable-embedded job boards with a Button-field
+    apply link (newgrad-jobs.com's structure).
+
+    The generic two-phase LLM strategy correctly finds row titles from the
+    virtualized grid, but a Button field's real <a href> only exists in the
+    DOM once a row is expanded into its record-detail modal -- the grid cell
+    itself is a non-interactive rendering of the button, not a link. This
+    expands each row, reads the href directly, and closes the modal before
+    moving on: one extra step per row, but a stable direct DOM read instead
+    of guessing at virtualized cell selectors that come and go with scroll.
+
+    Deliberately extracts ONLY title and url. These rows link to jobright.ai
+    detail pages -- the same backing source Intern List uses -- so the normal
+    enrichment stage fills in full_description, real salary/location, and the
+    resolved ATS the same way it already does for Intern List jobs. Trying to
+    also parse salary/location/qualifications out of the modal's flat text
+    here would be fragile (blank fields don't get a placeholder value line,
+    so position-based pairing breaks) for data enrichment recovers anyway.
+    """
+    from playwright.sync_api import sync_playwright
+
+    jobs: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 900})
+        try:
+            page.goto(url, timeout=45000)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+            row_count = len(page.query_selector_all('[data-testid="expandRowWrapper"]'))
+            log.info("Airtable grid: %d rows found", row_count)
+
+            for i in range(row_count):
+                try:
+                    expand_links = page.query_selector_all('[data-testid="expandRowWrapper"]')
+                    if i >= len(expand_links):
+                        break
+                    target = expand_links[i]
+                    target.scroll_into_view_if_needed(timeout=3000)
+                    target.click(timeout=5000)
+                    page.wait_for_selector('[role="dialog"]', timeout=5000)
+                    dialog = page.query_selector('[role="dialog"]')
+                    if not dialog:
+                        continue
+
+                    # The record's primary field (Position Title for this
+                    # base) is always the dialog's first line of text.
+                    full_text = dialog.inner_text()
+                    title = full_text.split("\n")[0].strip() if full_text else None
+
+                    link_el = dialog.query_selector('a[data-button-field-button="true"]')
+                    apply_url = link_el.get_attribute("href") if link_el else None
+
+                    if title and apply_url:
+                        jobs.append({
+                            "title": title,
+                            "url": apply_url,
+                            "salary": None,
+                            "description": None,
+                            "location": None,
+                            "posted_date": None,
+                        })
+                except Exception as e:
+                    log.debug("Row %d extraction failed: %s", i, e)
+                finally:
+                    # Escape leaves the dialog's outer container mounted in
+                    # the DOM (a stale, invisible copy that intercepts the
+                    # NEXT row's click), even though it looks fully closed --
+                    # clicking the dialog's own close button does a complete
+                    # teardown instead. Without this, every other row failed.
+                    try:
+                        dialog = page.query_selector('[role="dialog"]')
+                        close_btn = dialog.query_selector(
+                            'button[aria-label="Close"], [data-tutorial-selector-id="detailViewCloseButton"]'
+                        ) if dialog else None
+                        if close_btn:
+                            close_btn.click(timeout=2000)
+                        else:
+                            page.keyboard.press("Escape")
+                    except Exception:
+                        try:
+                            page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                    page.wait_for_timeout(300)
+        finally:
+            browser.close()
+
+    log.info("Airtable grid: extracted %d of %d rows with a usable url", len(jobs), row_count)
+    return jobs
+
+
 # -- Main per-site extraction ------------------------------------------------
 
 def _run_one_site(name: str, url: str) -> dict:
     """Run full smart extraction pipeline on one site URL."""
     log.info("=" * 60)
     log.info("%s: %s", name, url)
+
+    # Airtable-embedded job boards (Button-field apply links) need the
+    # bespoke expand-and-read scraper above -- the generic two-phase strategy
+    # finds titles fine but can't read a Button field's href from the
+    # virtualized grid view, only from each row's expanded record modal.
+    if "airtable.com/embed/" in url:
+        jobs = _scrape_airtable_button_grid(url)
+        return {
+            "name": name,
+            "url": url,
+            "status": "PASS" if jobs else "FAIL",
+            "jobs": jobs,
+            "total": len(jobs),
+            "titles": len(jobs),
+            "strategy": "airtable_button_expand",
+        }
 
     # Step 1: Collect intelligence
     log.info("[1] Collecting page intelligence...")

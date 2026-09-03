@@ -126,9 +126,13 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   {seen_clause}
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY
+                  fit_score - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ? DESC,
+                  COALESCE(posted_date, discovered_at) DESC,
+                  url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"]] + params
+                 + [config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
 
         if not row:
             conn.rollback()
