@@ -2,6 +2,7 @@
 
 import os
 import platform
+import re
 import shutil
 from pathlib import Path
 
@@ -25,6 +26,12 @@ LOG_DIR = APP_DIR / "logs"
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+
+# Separate from CHROME_WORKER_DIR on purpose: apply workers get reset/cloned
+# between runs (see chrome.setup_worker_profile), which would silently wipe a
+# signed-in Jobright session. This profile is enrichment-only and never reset,
+# so logging into Jobright here once keeps working across every future run.
+ENRICHMENT_PROFILE_DIR = APP_DIR / "chrome-enrichment-profile"
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
@@ -152,6 +159,46 @@ def load_blocked_sso() -> list[str]:
     return cfg.get("blocked_sso", [])
 
 
+def _quirks_path(ats: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "_", ats.lower()).strip("_")
+    return CONFIG_DIR / "known_quirks" / f"{slug}.md"
+
+
+def load_known_quirks(ats: str | None) -> str:
+    """Load verified widget-handling fallbacks for one ATS platform.
+
+    Keyed by platform (Workday, SAP SuccessFactors, ...), never by employer --
+    the same widget bug recurs across every tenant on a platform, but the
+    literal DOM structure does not, so caching structure instead of behavior
+    would misfire on the next company's instance of the same ATS.
+    """
+    if not ats:
+        return ""
+    path = _quirks_path(ats)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def append_known_quirk(ats: str | None, entry: str) -> None:
+    """Append one verified fallback fix to an ATS's quirks file.
+
+    Called only after a run that actually completed, and only with a fix the
+    agent confirmed worked -- an unverified "fix" is worse than no cache entry
+    at all, since future runs would trust it blindly.
+    """
+    entry = (entry or "").strip()
+    if not ats or not entry:
+        return
+    path = _quirks_path(ats)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if entry in existing:
+        return
+    with path.open("a", encoding="utf-8") as f:
+        f.write(("\n" if existing and not existing.endswith("\n") else "") + f"- {entry}\n")
+
+
 def load_base_urls() -> dict[str, str | None]:
     """Load site base URLs for URL resolution from sites.yaml."""
     cfg = load_sites_config()
@@ -165,6 +212,20 @@ def load_base_urls() -> dict[str, str | None]:
 DEFAULTS = {
     "min_score": 7,
     "max_apply_attempts": 3,
+    # Queue ordering only -- never rewrites the stored fit_score. A job's
+    # real chance of still being open falls off the longer it's sat in the
+    # queue, but the LLM's skill-match judgment doesn't change, so age is
+    # applied as a priority penalty at pick-time instead of corrupting the
+    # score itself. 0.05/day means a 20-day-old job loses about 1 point of
+    # priority -- enough to let a fresher, slightly-lower-scored job jump
+    # ahead of a stale one, not enough to bury an otherwise excellent match.
+    "job_age_decay_per_day": 0.15,
+    # How far back discovery accepts a posting's date. 14 supports an
+    # occasional big catch-up sweep; run discovery more often (daily/hourly)
+    # with this same window and near-duplicate postings are simply skipped
+    # by the url PRIMARY KEY, so a wide window is safe to leave on
+    # permanently rather than needing a separate "sweep vs sync" mode.
+    "discovery_posted_within_days": 14,
     "max_tailor_attempts": 5,
     "poll_interval": 60,
     "apply_timeout": 300,

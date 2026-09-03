@@ -158,6 +158,13 @@ _ALL_COLUMNS: dict[str, str] = {
     "strategy": "TEXT",
     "discovered_at": "TEXT",
     "job_type": "TEXT",
+    # Best-effort posting date, as scraped from the card text ("2 days ago",
+    # "Aug 28, 2026", etc.) and normalized to ISO 8601. Used for the age-decay
+    # ordering in the apply queue -- discovered_at alone conflates "how long
+    # we've known about this" with "how long it's actually been open", and a
+    # posting can be up to 7 days old on first discovery (see
+    # _posted_within_days). Null when the source page gave no parseable date.
+    "posted_date": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",

@@ -48,8 +48,14 @@ sites:
     url: "https://jobright.ai/minisites-jobs/intern/us/swe?embed=true"
     type: static
 
+  # newgrad-jobs.com renders its job table inside an Airtable embed, so the
+  # wrapper page (like intern-list.com before this fix) yields zero jobs --
+  # confirmed via raw fetch, only ~5KB of nav/footer text, no listings. The
+  # wrapper has 4 overlapping Airtable views (all/remote/no-degree/full-time
+  # subsets of the same base); this targets the broadest one directly, right
+  # after the page's "Entry-Level Software Engineer for New Grads" heading.
   - name: "NewGrad Jobs - SWE"
-    url: "https://www.newgrad-jobs.com/entry-level-jobs/software-engineer-jobs"
+    url: "https://airtable.com/embed/appxfacPDgUWOvRWa/shr45FBB1GB53RCwo?viewControls=on"
     type: static
 
   # ── Everything below is disabled for this profile. ────────────────────
