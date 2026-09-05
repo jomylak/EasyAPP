@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from jobspy import scrape_jobs
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +129,9 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
+        # JobSpy returns the employer as a structured field. It used to be
+        # extracted here and then dropped from the INSERT, which left the
+        # scorer re-deriving it from the description with an LLM call.
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
@@ -168,10 +171,10 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, "
+                "discovered_at, full_description, application_url, detail_scraped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
                  full_description, apply_url, detail_scraped_at),
             )
             new += 1

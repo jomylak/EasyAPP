@@ -145,7 +145,9 @@ as eligible: a wrong "no" silently costs a real opportunity, while a wrong "yes"
 risks a single application.
 
 COMPANY, LOCATION AND PRESTIGE:
-Name the hiring company and the job's location from the posting. Report the location
+Name the hiring company and the job's location from the posting. When a COMPANY
+line is already given above, that name came from the job board's own structured
+data -- echo it back as-is and do not second-guess it from the description. Report the location
 even when it is stated only in passing -- for many of these postings the description is
 the only place it appears at all.
 
@@ -356,8 +358,16 @@ def score_job(resume_text: str, job: dict) -> dict:
     # lives: 40 of the 121 jobs on the board carry a real range here, while
     # just 3 descriptions mention a figure at all. Leaving it out is why every
     # job previously scored "not stated" / BELOW_FLOOR unknown.
+    #
+    # Some sources DO know the employer, though: JobSpy returns it as a
+    # structured field. Where discovery captured a real name, hand it over
+    # rather than paying for the model to re-read it out of the description
+    # -- it still rates prestige, which is the part that needs a judgement.
+    known_company = (job.get("company") or "").strip()
+    company_line = f"COMPANY: {known_company}\n" if known_company else ""
     job_text = (
         f"TITLE: {job['title']}\n"
+        f"{company_line}"
         f"SOURCE BOARD: {job['site']}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n"
         f"SALARY: {job.get('salary') or 'not stated'}\n\n"
@@ -870,7 +880,10 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
             "requires_returning_student = ?, pay_text = ?, pay_below_floor = ?, "
-            "company = ?, company_prestige = ?, eligible = ?, eligibility_reason = ?, "
+            # Never let an "unknown" from the model erase a real name that
+            # discovery already captured -- keep the existing value instead.
+            "company = COALESCE(NULLIF(?, ''), company), "
+            "company_prestige = ?, eligible = ?, eligibility_reason = ?, "
             "keywords = ? "
             "WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now,
