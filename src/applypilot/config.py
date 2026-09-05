@@ -102,6 +102,18 @@ def ensure_dirs():
         d.mkdir(parents=True, exist_ok=True)
 
 
+def playwright_output_dir() -> str:
+    """Where Playwright MCP spills page snapshots and console logs.
+
+    Shared by both apply backends and every worker. One directory for all of
+    them is fine: filenames are timestamped, and the size-capped eviction can
+    only ever discard debug spill that nothing reads back.
+    """
+    d = APP_DIR / "playwright-output"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d)
+
+
 def load_profile() -> dict:
     """Load user profile from ~/.applypilot/profile.json."""
     import json
@@ -239,6 +251,12 @@ DEFAULTS = {
     "poll_interval": 60,
     "apply_timeout": 300,
     "viewport": "1280x900",
+    # Playwright MCP dumps a page snapshot + console log per browser step.
+    # Left at its default it writes ".playwright-mcp/" into whatever the
+    # cwd is -- 412 files / 7.4 MB accumulated in the repo root. Nothing
+    # ever reads these back; they are debug spill, so they go under the
+    # app dir with a size cap that evicts the oldest.
+    "playwright_output_max_bytes": 200_000_000,
     # --- Goose backend (the default) ---
     # Best measured cost/reliability tradeoff on real ATS forms: $0.045 and
     # ~140 turns on a Workday application, ~99% cache-hit ratio. GLM 5.3 Flash

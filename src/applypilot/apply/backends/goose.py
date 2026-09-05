@@ -66,10 +66,13 @@ def _extension_args(cdp_port: int) -> list[str]:
     ``gmail__*`` instead of both being named after ``npx``.
     """
     viewport = config.DEFAULTS["viewport"]
+    out_dir = config.playwright_output_dir()
+    max_bytes = config.DEFAULTS["playwright_output_max_bytes"]
     return [
         "--with-extension",
         f"playwright:npx @playwright/mcp@latest "
-        f"--cdp-endpoint=http://localhost:{cdp_port} --viewport-size={viewport}",
+        f"--cdp-endpoint=http://localhost:{cdp_port} --viewport-size={viewport} "
+        f"--output-dir={out_dir} --output-max-size={max_bytes}",
         "--with-extension",
         "gmail:npx -y @gongrzhe/server-gmail-autoauth-mcp",
     ]

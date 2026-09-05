@@ -45,3 +45,24 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+# Agent / browser scratch. Playwright MCP drops a page snapshot and a console
+# log per step into here -- 400+ files and 7 MB after a few apply runs.
+.playwright-mcp/
+uploads/
+
+# Test + lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# SQLite sidecars (the -wal can outlive a crashed run)
+*.db-journal
+*.db-wal
+*.db-shm

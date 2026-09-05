@@ -54,6 +54,8 @@ def _make_mcp_config(cdp_port: int) -> dict:
                     "@playwright/mcp@latest",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
+                    f"--output-dir={config.playwright_output_dir()}",
+                    f"--output-max-size={config.DEFAULTS['playwright_output_max_bytes']}",
                 ],
             },
             "gmail": {
