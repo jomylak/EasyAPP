@@ -7,6 +7,14 @@ Auto-detects provider from environment:
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
 
 LLM_MODEL env var overrides the model name for any provider.
+
+If OPENROUTER_API_KEY is also set, a Gemini client falls back to a free
+OpenRouter model once Gemini's retries are truly exhausted (see
+_OPENROUTER_FALLBACK_MODEL below) -- this only fires after 429/503 survives
+every retry, which in practice means the daily quota is gone, not a
+transient per-minute limit (those already resolve via the existing
+backoff). The fallback model is hardcoded, not configurable, specifically
+so this can never silently switch to a paid model.
 """
 
 import logging
@@ -79,6 +87,18 @@ _GEMINI_MIN_CALL_INTERVAL = 4.3
 _GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
 _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+# Hardcoded, not read from any env var -- this is the one thing standing
+# between "fall back automatically" and "silently start spending money".
+# "openrouter/free" is OpenRouter's own auto-router scoped to free models
+# only (unlike "openrouter/auto", which can pick paid ones) -- it picks
+# whichever free model is best available/least saturated at request time,
+# so this rides out any single free model's daily cap instead of pinning to
+# one (verified with a live 200 response, cost=0, this session). If this
+# ever needs to change, change the literal here, not a config value someone
+# could accidentally point at a paid model.
+_OPENROUTER_FALLBACK_MODEL = "openrouter/free"
+
 
 class LLMClient:
     """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
@@ -102,6 +122,36 @@ class LLMClient:
         # and all of them share this one client instance.
         self._pace_lock = threading.Lock()
         self._last_call_at: float = 0.0
+        # True once Gemini's retries have been exhausted and we've switched
+        # to the free OpenRouter fallback for the rest of this process.
+        self._openrouter_fallback_active: bool = False
+
+    def _switch_to_openrouter_fallback(self) -> bool:
+        """Switch this client to the free OpenRouter fallback, once.
+
+        Returns False (does nothing) if no OPENROUTER_API_KEY is configured
+        or we're not on Gemini in the first place -- callers should re-raise
+        the original error in that case, exactly like before this existed.
+        """
+        if self._openrouter_fallback_active or not self._is_gemini:
+            return False
+        key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        if not key:
+            return False
+
+        log.warning(
+            "Gemini retries exhausted -- likely the daily free-tier quota, "
+            "not a transient rate limit. Falling back to OpenRouter's free "
+            "'%s' for the rest of this run.",
+            _OPENROUTER_FALLBACK_MODEL,
+        )
+        self.base_url = _OPENROUTER_BASE
+        self.model = _OPENROUTER_FALLBACK_MODEL
+        self.api_key = key
+        self._is_gemini = False
+        self._use_native_gemini = False
+        self._openrouter_fallback_active = True
+        return True
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -252,7 +302,7 @@ class LLMClient:
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "
@@ -295,14 +345,27 @@ class LLMClient:
                     )
                     time.sleep(wait)
                     continue
+
+                # Retries exhausted. In practice this means the DAILY quota
+                # is gone, not the per-minute limit (that already resolved
+                # via the backoff above) -- switch providers and retry fresh
+                # instead of hard-stopping the rest of the run.
+                if resp.status_code in (429, 503) and self._switch_to_openrouter_fallback():
+                    return self.chat(messages, temperature, max_tokens)
                 raise
 
-            except httpx.TimeoutException:
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                # TransportError covers ConnectError/"No route to host", DNS
+                # blips, network resets -- anything below the HTTP layer.
+                # These used to propagate straight past this retry loop as a
+                # permanent failure after one bad network moment, which is
+                # how a single Wi-Fi hiccup turned into hundreds of jobs
+                # getting a score=0 error sentinel written to the DB.
                 if attempt < _MAX_RETRIES - 1:
                     wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
                     log.warning(
-                        "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
+                        "LLM request failed (%s: %s), retrying in %ds (attempt %d/%d)",
+                        type(exc).__name__, exc, wait, attempt + 1, _MAX_RETRIES,
                     )
                     time.sleep(wait)
                     continue

@@ -105,12 +105,14 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             application_url       TEXT,
             detail_scraped_at     TEXT,
             detail_error          TEXT,
+            detail_attempts       INTEGER DEFAULT 0,
 
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
             score_reasoning       TEXT,
             scored_at             TEXT,
             requires_returning_student TEXT,
+            is_terminal_internship TEXT,
 
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
@@ -170,11 +172,36 @@ _ALL_COLUMNS: dict[str, str] = {
     "application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
+    "detail_attempts": "INTEGER DEFAULT 0",
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
     "requires_returning_student": "TEXT",
+    "is_terminal_internship": "TEXT",
+    # ATS keywords from the job description that match or could match the
+    # candidate, extracted at scoring time (same Gemini call, no extra cost).
+    # Was previously folded into score_reasoning as an unstructured first
+    # line; broken out so the apply prompt can use it directly for the
+    # skills-field augmentation without string-parsing reasoning text.
+    "keywords": "TEXT",
+    # The hiring company, as named in the posting. Discovery can't supply this
+    # -- `site` is the board we found the job on ("Intern List - SWE"), not the
+    # employer -- so the scorer extracts it from the description alongside the
+    # score, in the same LLM call rather than a second pass.
+    "company": "TEXT",
+    # 1-10 brand/reputation judgement, an input to desirability_score only.
+    # Never affects fit_score, which stays a pure skill match.
+    "company_prestige": "INTEGER",
+    # Hard eligibility gate: 'yes' | 'no' | 'unclear'. Only a stated, hard
+    # disqualifier (degree level, class year, non-US, clearance) earns a 'no';
+    # 'unclear' is treated as eligible, because a false 'no' silently costs an
+    # opportunity while a false 'yes' only risks one apply run.
+    "eligible": "TEXT",
+    "eligibility_reason": "TEXT",
+    # Computed from company_prestige + location + salary with no LLM call, so
+    # re-tuning the weights is free and never needs a re-score.
+    "desirability_score": "REAL",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -284,6 +311,24 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     ).fetchall()
     stats["by_site"] = [(row[0], row[1]) for row in rows]
 
+    # Last discovery per site -- lets `status` show "how stale is each
+    # source" without needing to actually re-run discovery to find out.
+    rows = conn.execute(
+        "SELECT site, MAX(discovered_at) FROM jobs GROUP BY site"
+    ).fetchall()
+    stats["last_discovered_by_site"] = [(row[0], row[1]) for row in rows]
+
+    # Last activity timestamps for enrich/score -- these plus the running-
+    # process check (see is_stage_running() in cli.py) are what makes
+    # `applypilot status` show real pipeline activity instead of just a
+    # point-in-time count.
+    stats["last_enrich_at"] = conn.execute(
+        "SELECT MAX(detail_scraped_at) FROM jobs"
+    ).fetchone()[0]
+    stats["last_score_at"] = conn.execute(
+        "SELECT MAX(scored_at) FROM jobs"
+    ).fetchone()[0]
+
     # Enrichment stage
     stats["pending_detail"] = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
@@ -314,6 +359,38 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "GROUP BY fit_score ORDER BY fit_score DESC"
     ).fetchall()
     stats["score_distribution"] = [(row[0], row[1]) for row in dist_rows]
+
+    # Same distribution split by internship vs new_grad -- the raw top-tier
+    # count differs enough between the two (internships routinely score
+    # higher in volume) that a plain "highest score wins" apply order would
+    # silently skew toward one type without this ever being visible.
+    type_dist_rows = conn.execute(
+        "SELECT job_type, fit_score, COUNT(*) as cnt FROM jobs "
+        "WHERE fit_score IS NOT NULL AND fit_score >= 7 "
+        "GROUP BY job_type, fit_score ORDER BY job_type, fit_score DESC"
+    ).fetchall()
+    stats["score_distribution_by_type"] = [
+        (row[0] or "unknown", row[1], row[2]) for row in type_dist_rows
+    ]
+
+    # Total scored per type regardless of score -- scale context for the 7+
+    # breakdown above, so e.g. "270 internships scored 7+" reads against
+    # "out of 700 scored" rather than floating with no denominator.
+    total_scored_rows = conn.execute(
+        "SELECT job_type, COUNT(*) as cnt FROM jobs "
+        "WHERE fit_score IS NOT NULL GROUP BY job_type"
+    ).fetchall()
+    stats["total_scored_by_type"] = {
+        (row[0] or "unknown"): row[1] for row in total_scored_rows
+    }
+
+    # Terminal internships -- ones that don't require returning to school,
+    # functionally a new-grad bridge role -- get guaranteed top apply
+    # priority (see acquire_job()). Surfaced on its own rather than folded
+    # into the score distribution, since it's an orthogonal flag, not a tier.
+    stats["terminal_internships"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE is_terminal_internship = 'yes'"
+    ).fetchone()[0]
 
     # Tailoring stage
     stats["tailored"] = conn.execute(
@@ -398,6 +475,37 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     return new, existing
 
 
+def fit_gate_sql(min_score: int) -> tuple[str, list]:
+    """SQL for "worth applying to", plus its bind params.
+
+    Normally this is just `fit_score >= min_score`, but a strong enough
+    employer earns a shot at a lower bar: a prestigious company is worth an
+    application even on an imperfect match, because the downside is one
+    application's cost and the upside is asymmetric.
+
+    The tiers come from `prestige_override_tiers` in settings.json as
+    [min_prestige, min_fit] pairs, so the trade can be retuned (or switched
+    off with an empty list) without touching code.
+
+    Shared by the tailor stage and the apply queue deliberately: if only the
+    queue knew about the override, the extra jobs would never get a resume
+    attached and so could never actually be picked up.
+    """
+    from applypilot.config import load_settings
+
+    clauses = ["fit_score >= ?"]
+    params: list = [min_score]
+    for tier in load_settings().get("prestige_override_tiers", []) or []:
+        try:
+            min_prestige, min_fit = int(tier[0]), int(tier[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        clauses.append("(company_prestige >= ? AND fit_score >= ?)")
+        params.extend([min_prestige, min_fit])
+
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
                       stage: str = "discovered",
                       min_score: int | None = None,
@@ -437,7 +545,15 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     where = conditions.get(stage, "1=1")
     params: list = []
 
-    if "?" in where and min_score is not None:
+    if stage == "pending_tailor":
+        # The fit bar for tailoring isn't a single comparison any more -- a
+        # prestigious employer qualifies at a lower score (see fit_gate_sql) --
+        # so this stage substitutes its own multi-param clause rather than
+        # going through the single-? path below.
+        gate_sql, gate_params = fit_gate_sql(min_score if min_score is not None else 7)
+        where = where.replace("fit_score >= ?", gate_sql)
+        params.extend(gate_params)
+    elif "?" in where and min_score is not None:
         params.append(min_score)
     elif "?" in where:
         params.append(7)  # default min_score
