@@ -14,6 +14,7 @@ import atexit
 import json
 import logging
 import platform
+import re
 import signal
 import sys
 import threading
@@ -84,7 +85,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
             row = conn.execute("""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path,
+                       fit_score, location, full_description, cover_letter_path, keywords,
                        apply_status AS prior_status, applied_at AS prior_applied_at
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
@@ -94,8 +95,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             """, (target_url, target_url, like, like)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
+            _settings = config.load_settings()
             # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
+            from applypilot.database import fit_gate_sql
+            fit_gate, params = fit_gate_sql(min_score)
             seen_clause = ""
             if exclude_urls:
                 placeholders = ",".join("?" * len(exclude_urls))
@@ -108,11 +111,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path,
+                       fit_score, location, full_description, cover_letter_path, keywords,
                        apply_status AS prior_status, applied_at AS prior_applied_at
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
@@ -121,18 +124,47 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   -- (free) rather than burning an apply run to discover it.
                   -- NULL/'unknown' still applies: most postings state no pay.
                   AND (pay_below_floor IS NULL OR pay_below_floor != 'yes')
+                  -- Hard eligibility (degree level, class year, non-US,
+                  -- clearance) decided at scoring time. NULL passes so jobs
+                  -- scored before this gate existed aren't silently dropped,
+                  -- and 'unclear' passes because a wrong reject costs a real
+                  -- opportunity while a wrong accept costs one apply run.
+                  AND (eligible IS NULL OR eligible != 'no')
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                  AND {fit_gate}
                   {seen_clause}
                   {site_clause}
                   {url_clauses}
+                -- Terminal internships -- ones that don't require returning
+                -- to school, functionally a new-grad bridge role -- are rare
+                -- (a few dozen out of thousands) and have already cleared
+                -- every gate above (pay floor, eligibility) by the time we
+                -- get here, so there's no reason to hold one back waiting
+                -- for something hypothetically better: sort on the flag
+                -- FIRST, ahead of the score blend entirely, so one always
+                -- wins when it exists.
+                --
+                -- Below that: rank on a weighted blend of skill match and
+                -- desirability, then decay by age, then a small blanket edge
+                -- for new_grad roles generally -- internships consistently
+                -- outnumber new_grad roles in the high-score tiers here (see
+                -- `applypilot status`), so a plain highest-score-wins order
+                -- would apply to a lot more internships than new-grad roles
+                -- by volume alone, not because they're actually better
+                -- matches. Jobs scored before desirability existed fall back
+                -- to their fit_score so they still order sanely.
                 ORDER BY
-                  fit_score - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ? DESC,
+                  (CASE WHEN is_terminal_internship = 'yes' THEN 1 ELSE 0 END) DESC,
+                  (fit_score * ? + COALESCE(desirability_score, fit_score) * ?)
+                  - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ?
+                  + (CASE WHEN job_type = 'new_grad' THEN 0.5 ELSE 0 END) DESC,
                   COALESCE(posted_date, discovered_at) DESC,
                   url
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params
-                 + [config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
+                 + [_settings.get("fit_weight", 0.5),
+                    _settings.get("desirability_weight", 0.5),
+                    config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
 
         if not row:
             conn.rollback()
@@ -165,6 +197,89 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         raise
 
 
+def _flip_grad_year(variant: str) -> str | None:
+    """Return the same resume track with the other graduation year.
+
+    The failure this serves is specifically a grad_date_mismatch, so the year
+    is the only axis that should move -- the track was chosen from the job's
+    own title and keywords and is still correct. Back when there were exactly
+    two variants, "the other one" happened to mean this; with six it does not,
+    and picking an arbitrary other variant could answer a returning-student
+    posting with a May-2027 resume, which is the mismatch this is meant to fix.
+    """
+    # Rows tailored before tracks existed carry the old two-variant names.
+    # Map them onto the current scheme so they keep swapping as they used to
+    # instead of silently becoming un-swappable.
+    legacy = {"default": "swe_2027", "returning_2028": "swe_2028"}
+    variant = legacy.get(variant, variant)
+
+    if "_" not in variant:
+        return None
+    track, _, year = variant.rpartition("_")
+    other = {"2027": "2028", "2028": "2027"}.get(year)
+    return f"{track}_{other}" if other else None
+
+
+def swap_resume_variant_for_retry(job_url: str, title: str, site: str) -> None:
+    """After a grad_date_mismatch failure, switch to the same resume track
+    with the other graduation year so the next retry (this failure isn't in
+    PERMANENT_FAILURES, so a retry is already permitted) uses a resume that
+    actually matches what the form required, instead of repeating the exact
+    same mismatch up to max_apply_attempts times.
+
+    Best-effort and silent on failure -- a job that can't be swapped just
+    retries with its current resume, no worse off than before this existed.
+    """
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT resume_variant FROM jobs WHERE url = ?", (job_url,)
+        ).fetchone()
+        settings = config.load_settings()
+        current_variant = (row["resume_variant"] if row else None) or \
+            settings.get("default_resume_variant", "default")
+
+        variants = settings.get("resume_variants", {})
+        new_variant = _flip_grad_year(current_variant)
+        if not new_variant or new_variant not in variants:
+            logger.warning("No opposite-grad-year variant for %r; not swapping.",
+                           current_variant)
+            return
+
+        txt_path, pdf_path, _grad_date, _start_date = config.get_resume_variant_paths(new_variant)
+        if not txt_path.exists() or not pdf_path.exists():
+            logger.warning("Can't swap to resume variant '%s': files missing", new_variant)
+            return
+
+        safe_title = re.sub(r"[^\w\s-]", "", title or "")[:50].strip().replace(" ", "_")
+        safe_site = re.sub(r"[^\w\s-]", "", site or "")[:20].strip().replace(" ", "_")
+        prefix = f"{safe_site}_{safe_title}"
+        dest_txt = config.TAILORED_DIR / f"{prefix}.txt"
+        dest_pdf = config.TAILORED_DIR / f"{prefix}.pdf"
+        dest_txt.write_bytes(txt_path.read_bytes())
+        dest_pdf.write_bytes(pdf_path.read_bytes())
+
+        # A grad_date_mismatch is only ever discovered here because the form
+        # itself required a graduation window scoring judged this candidate
+        # already satisfied without returning to school -- i.e. the job
+        # turned out not to be a "terminal" internship after all, even if it
+        # was flagged as one. Clear the flag so it drops back to being
+        # ranked on plain fit+desirability like any other internship,
+        # instead of keeping a guaranteed-top-priority sort that its own
+        # apply attempt just proved wrong.
+        conn.execute(
+            "UPDATE jobs SET resume_variant = ?, tailored_resume_path = ?, "
+            "is_terminal_internship = 'no' WHERE url = ?",
+            (new_variant, str(dest_txt), job_url),
+        )
+        conn.commit()
+        logger.info("grad_date_mismatch: swapped resume variant %s -> %s for %s "
+                     "(cleared is_terminal_internship if it was set)",
+                     current_variant, new_variant, title)
+    except Exception as e:
+        logger.warning("Could not swap resume variant after grad_date_mismatch: %s", e)
+
+
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
                 task_id: str | None = None, backend: str | None = None,
@@ -175,7 +290,7 @@ def mark_result(url: str, status: str, error: str | None = None,
         backend: Which apply backend produced this outcome. Recorded so
             completion rates can be compared between backends and models.
         llm_requests: How many LLM steps the run took, where the backend
-            reports it (Skyvern does; the Claude CLI does not).
+            reports it.
         stats: Optional token accounting -- input_tokens, output_tokens,
             cache_read_tokens, cost_usd.
     """
@@ -348,9 +463,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         port: CDP port of this worker's Chrome.
         worker_id: Numeric worker identifier.
         model: Claude model name (ignored by backends that configure their
-            model server-side, such as Skyvern).
+            own model, such as Goose).
         dry_run: Don't click the final Submit.
-        backend: Backend name -- 'claude' or 'skyvern'.
+        backend: Backend name -- 'goose' or 'claude'.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -386,7 +501,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
-                backend: str = "claude") -> tuple[int, int]:
+                backend: str = "goose",
+                fallback_backend: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -397,7 +513,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         headless: Run Chrome headless.
         model: Claude model name.
         dry_run: Don't click Submit.
-        backend: Apply backend name -- 'claude' or 'skyvern'.
+        backend: Primary apply backend name -- 'goose' or 'claude'.
+        fallback_backend: Backend to retry a job on when the primary one gives
+            up for a driver-side reason. None disables the retry.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -446,6 +564,32 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                           model=model, dry_run=dry_run,
                                           backend=backend)
             run_stats = get_backend(backend).pop_run_stats(worker_id)
+            used_backend = backend
+
+            # Second chance on the fallback backend. Only for failures that
+            # mean the *driver* gave up (outcomes.should_fall_back) -- a job
+            # that is expired, already applied to, or behind an SSO wall is
+            # just as dead for the stronger model, and retrying it would burn
+            # Claude quota for nothing.
+            if (not dry_run
+                    and fallback_backend
+                    and fallback_backend != backend
+                    and not _stop_event.is_set()
+                    and outcomes.should_fall_back(result)):
+                first_reason = result.split(":", 1)[-1]
+                add_event(f"[W{worker_id}] {backend} gave up ({first_reason[:20]}), "
+                          f"retrying on {fallback_backend}")
+                # Give the retry a clean browser. Goose may have left the page
+                # mid-form, and the fallback prompt assumes a fresh start.
+                if chrome_proc:
+                    cleanup_worker(worker_id, chrome_proc)
+                chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+                result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+                                              model=model, dry_run=dry_run,
+                                              backend=fallback_backend)
+                run_stats = get_backend(fallback_backend).pop_run_stats(worker_id)
+                used_backend = fallback_backend
+
             llm_requests = run_stats.get("llm_requests")
 
             if result == "skipped":
@@ -472,7 +616,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 continue
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms,
-                            backend=backend, llm_requests=llm_requests,
+                            backend=used_backend, llm_requests=llm_requests,
                             stats=run_stats)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
@@ -481,8 +625,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 mark_result(job["url"], "failed", reason,
                             permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms, backend=backend,
+                            duration_ms=duration_ms, backend=used_backend,
                             llm_requests=llm_requests, stats=run_stats)
+                if reason == "grad_date_mismatch":
+                    swap_resume_variant_for_retry(job["url"], job["title"], job.get("site", ""))
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
@@ -519,7 +665,8 @@ def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         backend: str = "claude") -> None:
+         backend: str = "goose",
+         fallback_backend: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -532,8 +679,10 @@ def main(limit: int = 1, target_url: str | None = None,
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
-        backend: Apply backend name -- 'claude' (Claude Code CLI) or
-            'skyvern' (local Skyvern server on a cheaper model).
+        backend: Primary apply backend -- 'goose' (Goose CLI on a cheap
+            OpenRouter model) or 'claude' (Claude Code CLI).
+        fallback_backend: Backend to retry a job on when the primary one gives
+            up for a driver-side reason. None disables the retry.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -544,14 +693,25 @@ def main(limit: int = 1, target_url: str | None = None,
 
     # Resolve the backend up front: a missing dependency or unset API key
     # should surface before Chrome launches and a job is locked, not after.
+    from rich.markup import escape  # backend hints contain [brackets] Rich would eat
     try:
         get_backend(backend).preflight()
     except (ValueError, RuntimeError) as exc:
-        # escape(): backend hints contain pip extras like "applypilot[skyvern]",
-        # which Rich would otherwise swallow as markup and print as "applypilot".
-        from rich.markup import escape
         console.print(f"[red]Cannot use --backend {backend}:[/red]\n{escape(str(exc))}")
         raise SystemExit(1)
+
+    # The fallback is a nice-to-have, so a missing one is a warning rather than
+    # a hard stop -- but it is checked here, not on the first job that needs it,
+    # so the run doesn't discover the problem an hour in.
+    if fallback_backend and fallback_backend != backend:
+        try:
+            get_backend(fallback_backend).preflight()
+        except (ValueError, RuntimeError) as exc:
+            console.print(
+                f"[yellow]Fallback backend {fallback_backend!r} unavailable, "
+                f"continuing without it:[/yellow]\n{escape(str(exc))}"
+            )
+            fallback_backend = None
 
     if continuous:
         effective_limit = 0
@@ -614,6 +774,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     model=model,
                     dry_run=dry_run,
                     backend=backend,
+                    fallback_backend=fallback_backend,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -638,6 +799,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             backend=backend,
+                    fallback_backend=fallback_backend,
                         ): i
                         for i in range(workers)
                     }

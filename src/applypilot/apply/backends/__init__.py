@@ -5,11 +5,13 @@ backend returns the same ``(status, duration_ms)`` tuple the worker loop has
 always expected, so job acquisition, Chrome lifecycle, the dashboard, and the
 retry/review classification in ``launcher`` stay backend-agnostic.
 
-- ``claude``  -- the original path: a ``claude -p`` session driving Playwright
-  MCP against the worker's Chrome. Costs Claude subscription quota.
-- ``skyvern`` -- a local Skyvern server driving the *same* Chrome over CDP,
-  running on whatever model Skyvern is configured with (typically a cheap
-  OpenRouter one). Costs nothing against the Claude quota.
+- ``goose``  -- the default: a ``goose run`` session driving Playwright MCP
+  against the worker's Chrome on a cheap OpenRouter model. Costs cents per
+  application and nothing against the Claude quota.
+- ``claude`` -- the original path: a ``claude -p`` session driving the *same*
+  MCP servers against the same Chrome. Stronger driver, costs Claude
+  subscription quota. Used as the fallback when Goose gives up on a job
+  (see ``launcher.worker_loop``).
 
 Backends are singletons: each keeps a registry of its in-flight child
 processes / runs so Ctrl+C can interrupt them.
@@ -20,7 +22,7 @@ from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
-BACKEND_NAMES = ("claude", "skyvern")
+BACKEND_NAMES = ("goose", "claude")
 
 
 class ApplyBackend(Protocol):
@@ -72,22 +74,22 @@ def get_backend(name: str) -> ApplyBackend:
     """Look up a backend by name, constructing it on first use.
 
     Args:
-        name: Either 'claude' or 'skyvern'.
+        name: Either 'goose' or 'claude'.
 
     Raises:
         ValueError: If the name is not a known backend.
         RuntimeError: If the backend's optional dependencies are missing.
     """
-    name = (name or "claude").lower()
+    name = (name or "goose").lower()
     if name in _instances:
         return _instances[name]
 
-    if name == "claude":
+    if name == "goose":
+        from applypilot.apply.backends.goose import GooseBackend
+        backend: ApplyBackend = GooseBackend()
+    elif name == "claude":
         from applypilot.apply.backends.claude_code import ClaudeCodeBackend
-        backend: ApplyBackend = ClaudeCodeBackend()
-    elif name == "skyvern":
-        from applypilot.apply.backends.skyvern import SkyvernBackend
-        backend = SkyvernBackend()
+        backend = ClaudeCodeBackend()
     else:
         raise ValueError(
             f"Unknown apply backend {name!r}. Expected one of: {', '.join(BACKEND_NAMES)}"

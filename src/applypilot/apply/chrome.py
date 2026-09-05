@@ -216,7 +216,7 @@ def _wait_for_cdp(port: int, worker_id: int, proc: subprocess.Popen,
 
     This previously slept a flat 3 seconds, but Chrome typically does not open
     the port until ~4s, so whatever connected next could race it. The Claude
-    path masked this because Playwright MCP takes a while to boot; Skyvern
+    path masked this because Playwright MCP takes a while to boot; a backend
     connects over CDP immediately and lost the race with
     "connect ECONNREFUSED 127.0.0.1:<port>".
 

@@ -17,11 +17,22 @@ from applypilot.ats import detect_ats
 logger = logging.getLogger(__name__)
 
 
-def _build_profile_summary(profile: dict) -> str:
+def _build_profile_summary(profile: dict, start_date_override: str = "") -> str:
     """Format the applicant profile section of the prompt.
 
     Reads all relevant fields from the profile dict and returns a
     human-readable multi-line summary for the agent.
+
+    Args:
+        start_date_override: The active resume variant's configured
+            start_date (see settings.json resume_variants). The gap between
+            graduating and being available isn't a fixed offset across
+            variants -- May 2027 grad -> August 2027 start (+3 months), but
+            January 2028 grad -> February 2028 start (+1 month) -- so this
+            must come from the variant's own config, never computed from
+            grad_date with one formula. Falls back to the profile's static
+            availability.earliest_start_date only if a variant lookup wasn't
+            available at all.
     """
     p = profile
     personal = p["personal"]
@@ -71,8 +82,8 @@ def _build_profile_summary(profile: dict) -> str:
     if exp.get("education_level"):
         lines.append(f"Education: {exp['education_level']}")
 
-    # Availability
-    lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
+    # Availability -- variant-specific start_date takes priority; see docstring
+    lines.append(f"Available: {start_date_override or avail.get('earliest_start_date', 'Immediately')}")
 
     # Standard responses
     lines.extend([
@@ -120,7 +131,7 @@ def _build_location_check(profile: dict, search_config: dict) -> str:
     )
 
     if blanket:
-        return f"""== LOCATION CHECK (do this FIRST before any form) ==
+        return """== LOCATION CHECK (do this FIRST before any form) ==
 Read the job page. Determine the work arrangement. Then decide:
 - Remote, hybrid, or onsite ANYWHERE IN THE UNITED STATES -> ELIGIBLE. Apply.
   This includes cities far from where the candidate currently lives. Distance,
@@ -184,7 +195,9 @@ def _build_salary_section(profile: dict) -> str:
     return f"""== SALARY (think, don't just copy) ==
 {intern_rule}FULL-TIME ROLES: ${floor} {currency} is the FLOOR. Never go below it. But don't always use it either.
 
-Decision tree:
+0. Is the desired-salary FIELD ITSELF optional (no asterisk, no "required" marker)? -> Leave it blank. Do not volunteer a number just because you have one -- an optional field with a number in it can anchor negotiation against you for no reason. Only proceed to the rules below when the field is required or the posting explicitly asks the question.
+
+Decision tree (once you've confirmed the field is required):
 1. Job posting shows a range (e.g. "$120K-$160K")? -> Answer with the MIDPOINT ($140K).
 2. Title says Senior, Staff, Lead, Principal, Architect, or level II/III/IV? -> Minimum $110K {currency}. Use midpoint of posted range if higher.
 3. {convert_line}
@@ -193,7 +206,7 @@ Decision tree:
 6. Hourly rate? -> Divide your annual answer by 2080. ({hourly_line})"""
 
 
-def _build_screening_section(profile: dict, grad_date: str = "") -> str:
+def _build_screening_section(profile: dict, grad_date: str = "", keywords: str = "") -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
@@ -202,13 +215,56 @@ def _build_screening_section(profile: dict, grad_date: str = "") -> str:
     target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
     work_auth = profile["work_authorization"]
 
+    skills_section = ""
+    if keywords.strip():
+        skills_section = f"""
+
+== SKILLS FIELD ==
+If the application has a skills field pre-populated by resume-parsing, don't
+just leave it as-is. These keywords were pulled from THIS job's description
+as things that match or could match the candidate: {keywords.strip()}
+Add any of these that aren't already listed -- but only if you can honestly
+defend it as something the candidate could reasonably claim (already implied
+elsewhere on the resume, or a close variant of a listed skill/tool in the
+same domain). Skip anything you can't defend that way, even if it's on the
+list above -- this list was generated with looser judgment than what belongs
+on a submitted application. This is the same field type you already know how
+to handle (tag input, combobox, or plain text) -- no new interaction, just
+don't leave free value on the table by accepting the pre-filled list as-is."""
+
     grad_line = ""
+    grad_mismatch_section = ""
     if grad_date:
         grad_line = (
             f"  - Expected graduation date / class standing: {grad_date}. This MUST match the "
             f"resume attached to this application -- do not give a different date than what's "
             f"printed on the resume, even if your training data suggests otherwise.\n"
         )
+        grad_mismatch_section = f"""
+
+== GRADUATION DATE -- VERIFY, DO NOT GUESS ==
+This application uses a resume printed with graduation date {grad_date}. Getting
+this wrong is one of the few mistakes that can disqualify the candidate outright,
+so treat it as seriously as work authorization -- never paper over a conflict.
+
+Before you finish the Education section, actively check for a conflict:
+- A graduation-date or class-standing DROPDOWN whose available options do NOT
+  include {grad_date} (e.g. it only offers 2028, 2029, ... with no 2027) is a
+  hard signal -- the employer's form expects a different cohort than the resume
+  you're carrying.
+- A job requirement explicitly stated in the posting ("must graduate between
+  X and Y") that excludes {grad_date} is the same kind of signal.
+
+If you find a genuine conflict like this:
+1. Do NOT pick the closest wrong option and keep going -- a submitted
+   application with a graduation date that contradicts the attached resume is
+   worse than no application at all, and finishing the rest of the form first
+   only spends more cost on a doomed submission.
+2. Stop immediately and output RESULT:FAILED:grad_date_mismatch, with a one-line
+   note on what the form actually required (e.g. "dropdown only offered 2028
+   and 2029, no 2027 option").
+Do not use this for a vague or ambiguous posting -- only for a form field or
+explicit requirement that concretely contradicts {grad_date}."""
 
     return f"""== SCREENING QUESTIONS (be strategic) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
@@ -224,7 +280,7 @@ Open-ended questions ("Why do you want this role?", "Tell us about yourself", "W
 EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything.
 Gender, Race/Ethnicity, Veteran status and Disability status always get this same
 answer -- there is nothing to decide. Set them as one consecutive batch and verify
-them together with a single browser_find, rather than open/click/verify four times."""
+them together with a single browser_find, rather than open/click/verify four times.{grad_mismatch_section}{skills_section}"""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -238,7 +294,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -496,18 +551,16 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
                      password_override: str | None = None) -> dict:
     """Resolve documents and build every reusable prompt section for a job.
 
-    Shared by both prompt assemblers so the Claude Code and Skyvern paths
-    describe the same candidate, the same eligibility rules and the same
-    salary/screening strategy -- only the surrounding tool instructions differ.
+    Kept separate from the assembler itself so every backend describes the
+    same candidate, the same eligibility rules and the same salary/screening
+    strategy regardless of which engine ends up driving the browser.
 
     Args:
         job: Job dict from the database.
         cover_letter: Optional plain-text cover letter override.
         worker_id: When given, documents are copied into a per-worker
-            directory instead of the shared ``current`` one. The Skyvern
-            backend needs this because it serves that directory over HTTP,
-            and because parallel workers would otherwise overwrite each
-            other's uploads.
+            directory instead of the shared ``current`` one, so parallel
+            workers don't overwrite each other's uploads.
         email_override: For repeat-testing the same employer's form without
             an ATS remembering a prior run's account. Gmail plus-addressing
             (e.g. ``jomylak+test1@gmail.com``) is a distinct string to every
@@ -575,17 +628,17 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
             shutil.copy(str(cl_pdf_src), str(cl_upload))
             cl_upload_path = str(cl_upload)
 
-    # --- Resume variant -> graduation date (must match what's on the resume) ---
+    # --- Resume variant -> graduation date + start date (must match the resume) ---
     resume_variant = job.get("resume_variant") or "default"
-    _, _, grad_date = config.get_resume_variant_paths(resume_variant)
+    _, _, grad_date, variant_start_date = config.get_resume_variant_paths(resume_variant)
 
     # --- Build all prompt sections ---
-    profile_summary = _build_profile_summary(profile)
+    profile_summary = _build_profile_summary(profile, start_date_override=variant_start_date)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
-    screening_section = _build_screening_section(profile, grad_date=grad_date)
+    screening_section = _build_screening_section(profile, grad_date=grad_date,
+                                                 keywords=job.get("keywords") or "")
     hard_rules = _build_hard_rules(profile)
-    captcha_section = _build_captcha_section()
     # The stored application_url is often an aggregator redirect (Jobright,
     # Intern List) that resolves to nothing -- detect_ats correctly returns
     # "aggregator (unresolved)" for it. A prior run that actually navigated to
@@ -681,9 +734,7 @@ def build_prompt(job: dict, tailored_resume: str,
     """
     ctx = _prepare_context(job, cover_letter=cover_letter, email_override=email_override,
                            password_override=password_override)
-    profile = ctx["profile"]
     personal = ctx["personal"]
-    full_name = ctx["full_name"]
     pdf_path = ctx["pdf_path"]
     cl_upload_path = ctx["cl_upload_path"]
     cl_display = ctx["cl_display"]
@@ -804,6 +855,8 @@ RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account
 RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote option
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
+RESULT:FAILED:grad_date_mismatch -- form/posting requires a graduation date that
+  conflicts with the attached resume (see GRADUATION DATE section above)
 RESULT:FAILED:reason -- any other failure (brief reason)
 
 If a field resisted the normal approach and you had to use a genuinely
@@ -975,173 +1028,3 @@ F. Reset mail never arrives after ~2 minutes, or the reset page errors ->
 Stop immediately. Output your RESULT code. Do not loop."""
 
     return prompt
-
-
-def build_skyvern_goal(job: dict, tailored_resume: str,
-                       resume_url: str,
-                       cover_letter_url: str = "",
-                       cover_letter_text: str = "",
-                       profile_summary: str = "",
-                       location_check: str = "",
-                       salary_section: str = "",
-                       screening_section: str = "",
-                       hard_rules: str = "",
-                       display_name: str = "",
-                       phone_digits: str = "",
-                       personal: dict | None = None,
-                       dry_run: bool = False) -> str:
-    """Build the navigation goal for the Skyvern backend.
-
-    Deliberately different from ``build_prompt``, not just a trimmed copy:
-
-    - No Playwright MCP tool names. ``browser_snapshot``/``browser_click``/
-      ``browser_fill_form`` are Claude Code's tools; naming them here would
-      describe an API Skyvern does not have and actively mislead the model.
-    - No CAPTCHA section. That flow drives the CapSolver REST API by hand and
-      has no Skyvern equivalent.
-    - No ``RESULT:`` codes. Skyvern reports the outcome through the run's
-      ``data_extraction_schema`` instead of by printing a line we regex out.
-    - No step-by-step browser mechanics or "when to give up" rules. Skyvern
-      has its own action layer and a ``max_steps`` budget.
-
-    What it keeps is everything about *the candidate and the decision rules* --
-    profile, eligibility, salary strategy, screening guidance, hard rules --
-    so both backends apply as the same person under the same constraints.
-
-    Args:
-        resume_url: Loopback URL the tailored resume is served at. Skyvern
-            uploads files by downloading them first, so this must be a URL,
-            not a path. See ``apply.fileserver``.
-        cover_letter_url: Same, for the cover letter PDF (may be empty).
-
-    Returns:
-        The navigation goal string.
-    """
-    personal = personal or {}
-
-    if dry_run:
-        submit_instruction = (
-            "DRY RUN: fill in every field completely, but do NOT click the final "
-            "Submit/Apply button. Once the form is filled and reviewed, stop and "
-            "report the result as applied, noting that this was a dry run."
-        )
-    else:
-        submit_instruction = (
-            "Before submitting, re-read every field on the page and confirm it matches "
-            "the applicant profile and resume -- name, email, phone, location, work "
-            "authorization, resume uploaded, cover letter if applicable. Fix anything "
-            "wrong or missing first. Then submit, and confirm the submission landed "
-            "(a confirmation page, 'thank you', or 'application received')."
-        )
-
-    cl_block = cover_letter_text or (
-        "None available. Skip if optional. If required, write two factual sentences "
-        "drawn from the resume."
-    )
-    cl_file_line = (
-        f"Cover letter PDF (download and upload if a file field asks for one): {cover_letter_url}"
-        if cover_letter_url else "Cover letter PDF: none"
-    )
-
-    return f"""Apply to this job on behalf of the candidate described below, and submit the application.
-
-== JOB ==
-Title: {job['title']}
-Company: {job.get('site', 'Unknown')}
-
-== FILES ==
-Resume PDF (upload this to any resume/CV file field): {resume_url}
-{cl_file_line}
-
-The resume is served over HTTP. When a file upload field asks for a resume or CV,
-use that URL. Always upload this resume even if the form already has one attached --
-it is tailored to this specific job. This is required; an application submitted
-without it does not count as complete.
-
-== APPLICANT PROFILE ==
-{profile_summary}
-
-== RESUME TEXT (source of truth for any text field) ==
-{tailored_resume}
-
-== COVER LETTER TEXT (paste if a text field asks for one) ==
-{cl_block}
-
-{hard_rules}
-
-== NEVER DO THESE (stop and report failure instead) ==
-- Never grant camera, microphone, screen sharing, or location permissions -> unsafe_permissions
-- Never do video/audio verification, selfie capture, ID photo upload, or biometrics -> unsafe_verification
-- Never create a freelancing or contractor marketplace profile (Mercor, Toptal, Upwork,
-  Fiverr, Turing). Those are not job applications -> not_a_job_application
-- Never agree to hourly/contract rates, availability calendars, or "set your rate" flows.
-  This candidate is applying for full-time salaried roles only.
-- Never install browser extensions, download executables, or run assessment software.
-- Never enter payment details, bank details, or a national ID / SSN / SIN.
-- Never sign in through Google, Microsoft, or any other SSO/OAuth provider -> sso_required
-- If the page is not actually a job application (profile builder, talent network signup,
-  skills marketplace, coding assessment platform) -> not_a_job_application
-
-{location_check}
-
-{salary_section}
-
-{screening_section}
-
-== ACCOUNTS AND LOGINS ==
-If the site requires an account on the employer's own system, do NOT sign in first.
-Choose Create account/Register/Sign up with {personal.get('email', 'the profile email')}
-and the profile password. Only sign in if registration explicitly reports that the
-email/account already exists or explicitly switches to a sign-in view. If registration
-fails for any other reason, stop and report login_issue. A generic "wrong email or
-password" message is not evidence that an account exists.
-
-The candidate uses ONE password on every employer site, the profile password above.
-There is never a different one to look up. Do not infer account existence from a
-generic login failure. After registration explicitly confirms that the account exists,
-sign in with that password; if that confirmed-existing account rejects it, use "Forgot
-password" with the same email, complete the reset from the email, and set the password
-back to the same one. After signing in, re-check the resume field -- forms routinely
-drop uploaded files across a sign-in.
-
-If a step asks for an emailed verification code, request the code and enter it -- it is
-fetched from the inbox automatically, including from the spam folder, so wait for it
-rather than giving up. Codes usually expire in about 10 minutes, so ask for a fresh one
-if the first has gone stale. If instead the email contains a "verify"/"confirm" LINK
-rather than a code, it is opened for you in the background: wait a few seconds, reload
-the page, and continue -- you do not need to find or click the link yourself.
-
-== FILLING THE FORM ==
-Set values by typing and clicking as a person would. Do not set fields by running
-JavaScript: assigning a value and firing a synthetic input event does not commit on
-SAP SuccessFactors, Oracle HCM or Workday widgets, which listen to their own event
-bus -- the field silently keeps its old value.
-
-If a field will not take a value, do not repeat the same action -- inspect the
-element first. An <input> with role="combobox" is a filterable combobox: type the
-value to filter the list, then click the matching option. Long option lists
-(countries, states) are paginated, so the option you want is not present until you
-filter -- clicking blind is how a Country field ends up set to "Sierra Leone".
-Always read the value back after setting it; an action that reports success has
-often left the field wrong. Read back just that field rather than re-reading the
-whole page -- everything you read stays in context and is re-processed on every
-later step, so re-reading a large form after each field is the main thing that
-makes a run expensive. Keep working a field until it holds the right value. Answering one question can also reveal a new required
-field, so re-check the form before submitting.
-
-Applications are often multi-page: an upload/parse step, then the real form, then review.
-Work through every page until the application is actually submitted. ATS systems pre-fill
-fields by parsing the resume and frequently get them wrong -- check every pre-filled value
-against the applicant profile above and correct it. Answer all required questions.
-Skip honeypot fields that are hidden or say to leave them blank.
-For phone fields that already show a country prefix, enter only the digits {phone_digits}.
-Match any format hint shown in a field's placeholder text.
-
-{submit_instruction}
-
-== REPORTING THE OUTCOME ==
-When you are done -- successfully or not -- report the result using the required schema.
-Use `applied` only if the application was genuinely submitted and confirmed.
-If the posting is closed or no longer accepting applications, use `expired`.
-If an unsolvable CAPTCHA blocks you, use `captcha`.
-Otherwise use `failed` with the most specific reason code that fits."""
