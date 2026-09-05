@@ -19,15 +19,15 @@
 #
 # Each test index maps to a distinct-looking but still real, deliverable
 # address: Gmail ignores dots in the local part, so test index N inserts a
-# dot at position N into "23omylakj@gmail.com" -- e.g. index 1 gives
-# "2.3omylakj@gmail.com". All of them land in that same real inbox (the one
-# the gmail MCP extension is authenticated against), so account recovery and
-# email verification keep working. This is deliberately NOT the real
-# jomylak@purdue.edu profile email -- that address forwards to the same
-# inbox too, but its forwarding rule almost certainly matches the literal
-# address only, not a variant, so it can't be used for this trick. The
-# account password is also swapped to a fixed test password so these test
-# signups never collide with or need the real STD_PASSWORD.
+# dot at position N into the profile's own Gmail address -- for
+# "someone@gmail.com", index 1 gives "s.omeone@gmail.com". All of them land
+# in that same real inbox (the one the gmail MCP extension is authenticated
+# against), so account recovery and email verification keep working. This
+# needs the profile email to BE the Gmail inbox: a forwarding alias at
+# another domain almost certainly matches the literal address only, not a
+# dotted variant, so the script refuses a non-Gmail profile. The account
+# password is also swapped to a fixed test password so these test signups
+# never collide with or need the real STD_PASSWORD.
 #
 # Give each run its own index -- reusing one still pollutes state for the
 # NEXT run at that index, though it's harmless for a true from-scratch retry.
@@ -98,11 +98,20 @@ test_index = '$TEST_INDEX'
 email_override = None
 password_override = None
 if test_index:
+    # Derive the alias from whatever address this machine's profile uses --
+    # hardcoding one leaked a real address into a shared repo, and the trick
+    # only works against the inbox the gmail extension is authed against
+    # anyway, which is the profile's own.
+    real_email = config.load_profile().get('personal', {}).get('email', '')
+    if '@' not in real_email:
+        sys.exit('profile.json has no personal.email -- cannot build a test alias.')
+    local_part, domain = real_email.split('@', 1)
+    if domain.lower() not in ('gmail.com', 'googlemail.com'):
+        sys.exit('The dotted-alias trick is Gmail-only; profile email is ' + domain + '.')
     n = int(test_index)
-    local_part = '23omylakj'
     n = max(1, min(n, len(local_part) - 1))
     dotted = local_part[:n] + '.' + local_part[n:]
-    email_override = dotted + '@gmail.com'
+    email_override = dotted + '@' + domain
     password_override = 'Password123!'
     print('Test account:', email_override)
 
