@@ -173,6 +173,12 @@ def apply(
              "Pass 'none' to disable.",
     ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
+    queued: Optional[str] = typer.Option(
+        None, "--queued",
+        help="Apply to the jobs in this queue batch, in the order they were "
+             "selected. Set by the web UI; ignores --min-score and the other "
+             "ranked-queue filters, because a person already chose these.",
+    ),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
@@ -218,8 +224,20 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: Tailored resumes exist (skip for --gen with --url)
-    if not (gen and url):
+    # Check 3: there is actually something to apply to. For a queued batch the
+    # question is whether that batch has anything left in it, not whether the
+    # ranked queue does -- a batch can be perfectly valid while the ranked
+    # queue is empty, and vice versa.
+    if queued:
+        conn = get_connection()
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE queue_batch = ? AND apply_status = 'queued'",
+            (queued,),
+        ).fetchone()[0]
+        if pending == 0:
+            console.print(f"[red]Batch {queued} has no jobs waiting.[/red]")
+            raise typer.Exit(code=1)
+    elif not (gen and url):
         conn = get_connection()
         ready = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE tailored_resume_path IS NOT NULL AND applied_at IS NULL"
@@ -253,7 +271,14 @@ def apply(
 
     from applypilot.apply.launcher import main as apply_main
 
-    effective_limit = limit if limit is not None else (0 if continuous else 1)
+    if limit is not None:
+        effective_limit = limit
+    elif queued:
+        # The batch is the limit. Defaulting to 1 here would apply to the first
+        # job the user picked and silently drop the other nineteen.
+        effective_limit = 0
+    else:
+        effective_limit = 0 if continuous else 1
 
     from applypilot.config import load_settings
     from applypilot.apply.backends import BACKEND_NAMES
@@ -298,6 +323,8 @@ def apply(
     console.print(f"  Dry run:  {dry_run}")
     if url:
         console.print(f"  Target:   {url}")
+    if queued:
+        console.print(f"  Batch:    {queued}")
     console.print()
 
     apply_main(
@@ -311,7 +338,41 @@ def apply(
         workers=workers,
         backend=effective_backend,
         fallback_backend=effective_fallback,
+        queue_batch=queued,
     )
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(8420, "--port", help="Port to listen on."),
+    no_open: bool = typer.Option(False, "--no-open", help="Don't open a browser."),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload on code changes (development)."),
+) -> None:
+    """Open the web UI for browsing jobs and choosing which to apply to.
+
+    Always bound to 127.0.0.1. There is no --host flag: this serves your
+    resumes and drives Chrome profiles holding your logged-in sessions, so it
+    is not something to expose on a network.
+    """
+    _bootstrap()
+
+    from applypilot.web.server import HOST, serve as run_server
+
+    url = f"http://{HOST}:{port}"
+    console.print(f"\n[bold blue]ApplyPilot[/bold blue]  {url}")
+    console.print("[dim]Loopback only. Ctrl+C to stop.[/dim]\n")
+
+    if not no_open:
+        # Fire the browser slightly late so the server is accepting by the
+        # time the tab asks for the page.
+        import threading
+        import webbrowser
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+
+    try:
+        run_server(port=port, reload=reload)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Stopped.[/dim]")
 
 
 def _is_stage_running(stage: str) -> bool:
@@ -479,6 +540,50 @@ def status(
                 time.sleep(interval)
     except KeyboardInterrupt:
         pass
+
+
+@app.command(name="ats-stats")
+def ats_stats_cmd() -> None:
+    """Show per-ATS run cost, duration, and token stats (Workday, Greenhouse, ...)."""
+    _bootstrap()
+
+    from applypilot import costs
+
+    rows = costs.ats_stats()
+    if not rows:
+        console.print("[dim]No completed apply runs recorded yet.[/dim]")
+        return
+
+    table = Table(title="Per-ATS Apply Stats", show_header=True, header_style="bold cyan")
+    table.add_column("ATS")
+    table.add_column("Backend")
+    table.add_column("Runs", justify="right")
+    table.add_column("Success", justify="right")
+    table.add_column("Median cost", justify="right")
+    table.add_column("Total cost", justify="right")
+    table.add_column("Median time", justify="right")
+    table.add_column("Median turns", justify="right")
+    table.add_column("Median in tok", justify="right")
+    table.add_column("Median out tok", justify="right")
+    table.add_column("Median cache tok", justify="right")
+
+    def _fmt(v, suffix: str = "", digits: int = 0) -> str:
+        return "-" if v is None else f"{v:.{digits}f}{suffix}"
+
+    for r in rows:
+        table.add_row(
+            r["ats"], r["backend"], str(r["n_runs"]),
+            f"{r['success_rate'] * 100:.0f}%",
+            _fmt(r["median_cost_usd"], digits=3),
+            f"${r['total_cost_usd']:.2f}",
+            _fmt(r["median_duration_s"], "s", 0),
+            _fmt(r["median_llm_requests"], digits=0),
+            _fmt(r["median_input_tokens"], digits=0),
+            _fmt(r["median_output_tokens"], digits=0),
+            _fmt(r["median_cache_read_tokens"], digits=0),
+        )
+
+    console.print(table)
 
 
 @app.command()

@@ -20,6 +20,12 @@ RESUME_PDF_PATH = APP_DIR / "resume.pdf"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 SETTINGS_PATH = APP_DIR / "settings.json"
+# Live state of an in-flight apply run, written by apply/dashboard.py and read
+# by the web server. A file rather than a DB table on purpose: worker progress
+# updates land once or twice a second per worker, and putting that much write
+# traffic through the same WAL the workers commit their real outcomes to buys
+# contention for no durability -- mark_result() is already the durable record.
+RUN_STATE_PATH = APP_DIR / "run_state.json"
 
 # Generated output
 TAILORED_DIR = APP_DIR / "tailored_resumes"
@@ -214,6 +220,49 @@ def append_known_quirk(ats: str | None, entry: str) -> None:
         f.write(("\n" if existing and not existing.endswith("\n") else "") + f"- {entry}\n")
 
 
+def _issues_path(ats: str) -> Path:
+    slug = re.sub(r"[^a-z0-9]+", "_", ats.lower()).strip("_")
+    return CONFIG_DIR / "known_issues" / f"{slug}.md"
+
+
+def load_known_issues(ats: str | None) -> str:
+    """Load recorded failure modes for one ATS platform.
+
+    Distinct from known_quirks: a quirk is a *verified fix*, safe to apply;
+    an issue is just "a past run got stuck here" -- a heads-up, not something
+    to act on blindly. Keyed by platform for the same reason quirks are: the
+    same CAPTCHA vendor or widget bug recurs across every tenant on a
+    platform, but the literal DOM structure does not.
+    """
+    if not ats:
+        return ""
+    path = _issues_path(ats)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def append_known_issue(ats: str | None, entry: str) -> None:
+    """Append one failure-mode note to an ATS's issues file.
+
+    Called after a run that did NOT reach RESULT:APPLIED, with whatever the
+    agent reported blocked it. Unlike append_known_quirk this has no
+    trusted-writer restriction -- a wrong "watch out for X" only wastes a
+    little of the next run's attention, whereas a wrong "verified fix" makes
+    it click the wrong thing, so the bar for recording it is much lower.
+    """
+    entry = (entry or "").strip()
+    if not ats or not entry:
+        return
+    path = _issues_path(ats)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if entry in existing:
+        return
+    with path.open("a", encoding="utf-8") as f:
+        f.write(("\n" if existing and not existing.endswith("\n") else "") + f"- {entry}\n")
+
+
 def load_base_urls() -> dict[str, str | None]:
     """Load site base URLs for URL resolution from sites.yaml."""
     cfg = load_sites_config()
@@ -284,6 +333,14 @@ DEFAULT_SETTINGS: dict = {
     # Code CLI, costs subscription quota). Override per run with
     # `applypilot apply --backend`.
     "apply_backend": "goose",
+    # Fallback price per application, in USD, used only until enough real runs
+    # have accumulated to measure it (see costs.estimate_batch). Seeded from
+    # measured numbers: Goose on MiMo-V2.5 came in at ~$0.04 on a Workday
+    # application, and Claude has averaged around $1.16 across its runs.
+    # Anything here is a guess by definition -- the UI is expected to say so,
+    # and costs.estimate_batch stops consulting these the moment there are
+    # enough real runs to take a median from.
+    "cost_defaults": {"goose": 0.04, "claude": 1.20},
     # Backend to retry a job on when the primary one fails for a reason that
     # looks like the *engine* gave up rather than the job being genuinely
     # inapplicable (see outcomes.FALLBACK_REASONS). Claude is the stronger,

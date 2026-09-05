@@ -1,0 +1,1 @@
+- The Submit button can throw a stale/false-positive resume file-size validation error ("file too large") even for a small file well under any stated limit (observed: 0.11MB flagged). Re-uploading the same file and retrying submit did not clear it within a 15-minute session -- this looks like a genuine Lever-side UI bug, not something fixable by changing upload approach.

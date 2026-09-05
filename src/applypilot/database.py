@@ -142,6 +142,9 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    # Indexes come after the columns they cover, since several are composite
+    # over columns that only arrive via ensure_columns on an older database.
+    ensure_indexes(conn)
 
     return conn
 
@@ -216,6 +219,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "cover_attempts": "INTEGER DEFAULT 0",
     # Application
     "applied_at": "TEXT",
+    # NULL | 'queued' | 'in_progress' | 'applied' | 'failed' | 'manual'
+    # | 'captcha' | 'expired' | 'login_issue'  (see apply/outcomes.py).
+    # 'queued' is written only by the web UI when the user confirms a batch;
+    # 'in_progress' is a live lock held by a worker and carries agent_id.
     "apply_status": "TEXT",
     "apply_error": "TEXT",
     "apply_attempts": "INTEGER DEFAULT 0",
@@ -246,7 +253,86 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_output_tokens": "INTEGER",
     "apply_cache_read_tokens": "INTEGER",
     "apply_cost_usd": "REAL",
+    # Selection queue. The web UI is the only writer: confirming a batch stamps
+    # each chosen row with the batch id and its position and sets apply_status
+    # to 'queued'. acquire_job() in queued mode then drains exactly that set in
+    # exactly that order, skipping its own ranking entirely -- when a human has
+    # picked the jobs, their selection IS the ranking, and re-gating it on
+    # fit/pay/eligibility would silently drop rows they explicitly chose.
+    # Stated pay normalised to dollars per hour so one threshold works across
+    # "/hr", "/wk", "/mon" and "/yr" postings. See applypilot/pay.py. -1 means
+    # "parsed and unusable" (a non-dollar currency, or "N/A"); NULL means not
+    # looked at yet, and the two must stay distinct or every startup re-parses
+    # the same unparseable strings.
+    "pay_min_hourly": "REAL",
+    "pay_max_hourly": "REAL",
+    "queued_at": "TEXT",
+    "queue_batch": "TEXT",
+    "queue_position": "INTEGER",
 }
+
+
+# Indexes. The table ran without any of these until the web UI existed, which
+# was survivable while the only reader was a CLI doing one full pass per stage.
+# The browse view reads a single day at a time, filtered and sorted, many times
+# per session -- that is a different access pattern and it needs support.
+#
+# The day expression must be written character-for-character the way the query
+# writes it, or SQLite will not match the index to the query.
+_DAY_EXPR = "date(COALESCE(posted_date, discovered_at))"
+
+_ALL_INDEXES: dict[str, str] = {
+    # Day bucketing: the browse tab groups by this and nothing else.
+    "idx_jobs_day": f"({_DAY_EXPR})",
+    # The two quick chips, each a sort within one day. Composite so the day
+    # filter and the ordering are served by one index instead of a scan+sort.
+    "idx_jobs_day_prestige": f"({_DAY_EXPR}, company_prestige DESC)",
+    "idx_jobs_day_fit": f"({_DAY_EXPR}, fit_score DESC)",
+    # Dashboard tab and the stale-lock sweep both filter on status.
+    "idx_jobs_apply_status": "(apply_status)",
+    # Draining one batch in order.
+    "idx_jobs_queue": "(queue_batch, queue_position)",
+    # Pipeline backlog counts, run every time the stats endpoint is polled.
+    "idx_jobs_detail_pending": "(detail_scraped_at)",
+    "idx_jobs_scored": "(scored_at)",
+    "idx_jobs_site": "(site)",
+    "idx_jobs_pay": "(pay_max_hourly)",
+}
+
+
+def ensure_indexes(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Create any missing indexes on the jobs table.
+
+    Idempotent, like ensure_columns -- CREATE INDEX IF NOT EXISTS means this is
+    safe on every startup. Returns the names that did not already exist, which
+    is only useful for logging; an index that was already there is not an
+    error.
+
+    Args:
+        conn: Database connection. Uses get_connection() if None.
+
+    Returns:
+        List of index names created (empty if all were already present).
+    """
+    if conn is None:
+        conn = get_connection()
+
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
+    created = []
+
+    for name, cols in _ALL_INDEXES.items():
+        if name not in existing:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON jobs {cols}")
+            created.append(name)
+
+    if created:
+        conn.commit()
+
+    return created
 
 
 def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:

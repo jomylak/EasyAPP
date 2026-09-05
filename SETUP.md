@@ -149,6 +149,19 @@ npx -y @gongrzhe/server-gmail-autoauth-mcp auth
 Credentials land in `~/.gmail-mcp/`. Without this, applications that hit an email
 verification step stall out.
 
+### Optional: the web UI
+
+```bash
+applypilot serve
+```
+
+Opens a browser tab at `http://127.0.0.1:8420` for browsing discovered jobs day
+by day, filtering/sorting each day's table, and ticking the ones you want
+applied to — instead of letting the ranked queue auto-pick. It only queues and
+launches `applypilot apply` for you; the CLI commands above still work exactly
+the same with `serve` never started. Loopback only, no `--host` flag, by
+design (see [What you don't need](#what-you-dont-need)).
+
 ---
 
 ## How applying works
@@ -204,6 +217,12 @@ that required running a separate Skyvern server; Goose does the same job with
 no server to run. If you have a `~/skyvern` directory or a `~/.venvs/skyvern`
 from an older setup, nothing here uses them and you can delete them. Any
 `SKYVERN_*` lines in your `.env` are ignored.
+
+Note that `applypilot serve` does start a local web server, which is not a
+walking back of the above. Skyvern was a service the *apply pipeline* depended
+on to function; `serve` is an optional UI for you, bound to `127.0.0.1`, that
+the pipeline neither knows nor cares about. The CLI works exactly as it did
+with the server never started.
 
 **Someone else's `.env`.** Don't copy it, and don't let anyone copy yours:
 

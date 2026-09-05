@@ -1,0 +1,1 @@
+- The job posting explicitly states a compensation range of $18.00–$26.00/hour for this internship, which is clearly below the $30/hour floor for internship roles.

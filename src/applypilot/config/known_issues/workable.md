@@ -1,0 +1,1 @@
+- Cloudflare Turnstile can appear AFTER the Submit button is clicked (not before) -- a run that stops before Submit (as instructed in dry-run mode) may never see it, so its absence in a dry run does not mean the real submit path is clear.

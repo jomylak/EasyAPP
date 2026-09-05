@@ -204,6 +204,7 @@ applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
 applypilot apply --backend claude       # Use Claude Code instead of Goose
 applypilot status                       # Pipeline statistics
+applypilot serve                        # Web UI: browse by day, pick jobs, apply
 applypilot dashboard                    # Open HTML results dashboard
 ```
 
