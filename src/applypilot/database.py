@@ -185,10 +185,13 @@ _ALL_COLUMNS: dict[str, str] = {
     # line; broken out so the apply prompt can use it directly for the
     # skills-field augmentation without string-parsing reasoning text.
     "keywords": "TEXT",
-    # The hiring company, as named in the posting. Discovery can't supply this
-    # -- `site` is the board we found the job on ("Intern List - SWE"), not the
-    # employer -- so the scorer extracts it from the description alongside the
-    # score, in the same LLM call rather than a second pass.
+    # The hiring company, as named in the posting. Most discovery sources
+    # can't supply this -- `site` is the board we found the job on ("Intern
+    # List - SWE"), not the employer -- so the scorer extracts it from the
+    # description alongside the score, in the same LLM call rather than a
+    # second pass. JobSpy is the exception: it returns the employer as a
+    # structured field, so that path writes it at discovery time and the
+    # scorer is handed the name instead of re-deriving it.
     "company": "TEXT",
     # 1-10 brand/reputation judgement, an input to desirability_score only.
     # Never affects fit_score, which stays a pure skill match.
