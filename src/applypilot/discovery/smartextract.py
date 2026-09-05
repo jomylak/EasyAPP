@@ -20,7 +20,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
@@ -31,7 +30,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import get_connection, init_db, store_jobs, get_stats
+from applypilot.database import init_db, get_stats
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -203,7 +202,8 @@ def _store_jobs_filtered(
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
     if too_old:
-        log.info("Filtered %d jobs (posted more than 7 days ago)", too_old)
+        log.info("Filtered %d jobs (posted more than %d days ago)",
+                 too_old, config.DEFAULTS["discovery_posted_within_days"])
     conn.commit()
     return new, existing
 
@@ -517,7 +517,7 @@ def format_strategy_briefing(intel: dict) -> str:
             sections.append(f"\nJSON-LD: {len(job_postings)} JobPosting entries found (usable!)")
             sections.append(f"First JobPosting:\n{json.dumps(job_postings[0], indent=2)[:3000]}")
         else:
-            sections.append(f"\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
+            sections.append("\nJSON-LD: NO JobPosting entries (json_ld strategy will NOT work)")
         if other:
             types = [j.get("@type", "?") if isinstance(j, dict) else "?" for j in other]
             sections.append(f"Other JSON-LD types (NOT job data): {types}")
@@ -1037,6 +1037,110 @@ def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
     return jobs
 
 
+# Matches the real request body Jobright's own embed widget sends (captured
+# from live network traffic) -- keeps low-quality data-labeling/AI-training
+# postings out before they ever reach our own filters.
+_JOBRIGHT_EXCLUDE_TITLES = [
+    "AI Trainer", "AI Tutor", "AI Training", "AI Coach", "AI Reviewer", "AI Rater",
+    "AI Content Evaluator", "Search Quality Rater", "Ads Quality Rater", "Annotator",
+    "Annotation Specialist", "Data Annotation", "AI Annotation", "Data Labeler",
+    "Data Labeling", "Labeler", "AI Data Specialist", "Data Collector",
+    "Data Collection", "Prompt Optimization", "Prompt Creator",
+]
+
+
+def _scrape_jobright_minisite_api(category: str) -> list[dict]:
+    """Pull jobs directly from Jobright's own public minisite JSON API.
+
+    Found by watching network traffic on the embedded widget both
+    Intern List and NewGrad Jobs use: `POST /swan/mini-sites/list` is what
+    the widget itself calls to page through results as you scroll. No
+    cookies or auth required -- confirmed with a bare curl POST, no browser
+    session at all. Paginates cleanly by `position`/`count` up to the
+    response's own `total`.
+
+    This replaces BOTH the Jobright-iframe CSS scraper (Intern List) and the
+    Airtable Button-field scraper (NewGrad Jobs): each of those was limited
+    to whatever the widget rendered on its initial view (~20-30 rows) since
+    neither drove real pagination, when the underlying dataset is actually
+    ~3000-4700 jobs. It's also strictly richer data per job -- full
+    qualifications text, a real salary field, and a precise `postedAt`
+    timestamp -- instead of a scraped card snippet and a fuzzy "2 days ago"
+    string, for free, in the same call.
+
+    Args:
+        category: Jobright's own category slug, e.g. "intern:us:swe" or
+            "newgrad:us:swe". Determines which board this pulls.
+    """
+    jobs: list[dict] = []
+    position = 0
+    count = 50
+    total: int | None = None
+    headers = {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        "Referer": "https://jobright.ai/",
+        "Accept": "application/json",
+    }
+    body = {
+        "category": category,
+        "excludeTitle": _JOBRIGHT_EXCLUDE_TITLES,
+        "excludedTitle": _JOBRIGHT_EXCLUDE_TITLES,
+    }
+
+    with httpx.Client(timeout=20.0) as client:
+        while total is None or position < total:
+            try:
+                resp = client.post(
+                    f"https://jobright.ai/swan/mini-sites/list?position={position}&count={count}",
+                    headers=headers, json=body,
+                )
+                data = resp.json()
+            except Exception as e:
+                log.warning("Jobright minisite API request failed at position %d: %s", position, e)
+                break
+
+            if not data.get("success"):
+                log.warning("Jobright minisite API error at position %d: %s",
+                            position, data.get("errorMsg"))
+                break
+
+            result = data.get("result", {})
+            batch = result.get("jobList", [])
+            total = result.get("total", 0)
+            if not batch:
+                break
+
+            for item in batch:
+                props = item.get("properties", {}) or {}
+                job_id = item.get("jobId")
+                if not job_id:
+                    continue
+                posted_at_ms = item.get("postedAt")
+                posted_date = None
+                if posted_at_ms:
+                    posted_date = datetime.fromtimestamp(
+                        posted_at_ms / 1000, tz=timezone.utc
+                    ).isoformat()
+                salary = props.get("salary")
+                if salary in (None, "N/A", ""):
+                    salary = None
+
+                jobs.append({
+                    "title": props.get("title"),
+                    "salary": salary,
+                    "description": props.get("qualifications"),
+                    "location": props.get("location"),
+                    "url": f"https://jobright.ai/jobs/info/{job_id}",
+                    "posted_date": posted_date,
+                })
+
+            position += count
+
+    log.info("Jobright minisite API (%s): pulled %d of %d total jobs", category, len(jobs), total or 0)
+    return jobs
+
+
 # -- Main per-site extraction ------------------------------------------------
 
 def _run_one_site(name: str, url: str) -> dict:
@@ -1044,10 +1148,32 @@ def _run_one_site(name: str, url: str) -> dict:
     log.info("=" * 60)
     log.info("%s: %s", name, url)
 
+    # Jobright's own public minisite API -- see _scrape_jobright_minisite_api.
+    # Supersedes both the Jobright-iframe CSS scraper (Intern List) and the
+    # Airtable Button-field scraper (NewGrad Jobs) below: both were capped at
+    # whatever the widget rendered on first view, when this pulls the real
+    # full dataset directly. Configure a site for this in sites.yaml with a
+    # url of "jobright-category:<category-slug>", e.g.
+    # "jobright-category:intern:us:swe" or "jobright-category:newgrad:us:swe".
+    if url.startswith("jobright-category:"):
+        category = url[len("jobright-category:"):]
+        jobs = _scrape_jobright_minisite_api(category)
+        return {
+            "name": name,
+            "url": url,
+            "status": "PASS" if jobs else "FAIL",
+            "jobs": jobs,
+            "total": len(jobs),
+            "titles": len(jobs),
+            "strategy": "jobright_minisite_api",
+        }
+
     # Airtable-embedded job boards (Button-field apply links) need the
     # bespoke expand-and-read scraper above -- the generic two-phase strategy
     # finds titles fine but can't read a Button field's href from the
     # virtualized grid view, only from each row's expanded record modal.
+    # Kept as a fallback for any future site with this same structure; the
+    # jobright-category path above is what NewGrad Jobs actually uses now.
     if "airtable.com/embed/" in url:
         jobs = _scrape_airtable_button_grid(url)
         return {

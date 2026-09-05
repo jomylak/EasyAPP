@@ -14,19 +14,17 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from applypilot.config import (
     RESUME_PATH, TAILORED_DIR, load_profile, load_settings, get_resume_variant_paths,
 )
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.scoring.router import route_resume_track
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -60,7 +58,11 @@ def _build_tailor_prompt(profile: dict) -> str:
     real_metrics = resume_facts.get("real_metrics", [])
 
     companies_str = ", ".join(companies) if companies else "N/A"
-    projects_str = ", ".join(projects) if projects else "N/A"
+    # NOTE: unlike companies_str and metrics_str below, this is not yet
+    # interpolated into the prompt, so preserved_projects are not pinned
+    # against the "PROJECTS: reorder / drop irrelevant" instruction.
+    # Deliberately parked, not dead -- see the tailoring TODO.
+    projects_str = ", ".join(projects) if projects else "N/A"  # noqa: F841
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
     # Include ALL banned words from the validator so the LLM knows exactly
@@ -460,22 +462,38 @@ def tailor_resume(
 def _pick_resume_variant(job: dict, settings: dict) -> str:
     """Pick which base resume variant to use for a job, no LLM involved.
 
-    Jobs the scorer flagged as requiring a returning student get the
-    'returning_2028' variant; everything else gets the configured default.
+    Two independent axes, composed into a "{track}_{gradyear}" settings key:
+
+    - **track** -- swe / aiml / data, from scoring.router.route_resume_track.
+      Deterministic regex over the title, then the scorer's `keywords`, then
+      the description. Picking between three static files does not warrant an
+      LLM call, and a regex is auditable after the fact: you can read a title
+      and predict which resume it got.
+    - **grad year** -- 2028 when the scorer flagged the posting as requiring a
+      returning student, else 2027.
+
+    get_resume_variant_paths falls back along a year-preserving chain when a
+    variant's files aren't on disk yet, so this keeps working before all six
+    PDFs have been exported.
     """
-    if job.get("requires_returning_student") == "yes":
-        return "returning_2028"
-    return settings.get("default_resume_variant", "default")
+    track = route_resume_track(job)
+    year = "2028" if job.get("requires_returning_student") == "yes" else "2027"
+    variant = f"{track}_{year}"
+    if variant not in settings.get("resume_variants", {}):
+        return settings.get("default_resume_variant", "swe_2027")
+    return variant
 
 
 def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
     """Skip LLM tailoring entirely -- attach the base resume as-is per job.
 
-    Used while `tailoring_enabled` is False in settings.json (e.g. while the
-    LaTeX-based tailoring path is still being built). Still picks between
-    resume variants (default vs returning-student) based on what the scorer
-    detected from the job description -- that part doesn't need an LLM call
-    since scoring already reads the full description.
+    This is the intended production path, not a stopgap: the resumes are
+    hand-authored LaTeX compiled on Overleaf, so there is nothing to generate
+    at run time. `tailoring_enabled` stays False on purpose. Tailoring happens
+    by *selection* -- _pick_resume_variant routes each job to one of six
+    prebuilt variants (three tracks x two grad years) with no LLM call, which
+    is what keeps this stage free across thousands of jobs and makes resume
+    formatting, one-page overflow, and fabrication structurally impossible.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
@@ -499,7 +517,7 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
 
     for job in jobs:
         variant = _pick_resume_variant(job, settings)
-        txt_path, pdf_path, grad_date = get_resume_variant_paths(variant)
+        txt_path, pdf_path, grad_date, _start_date = get_resume_variant_paths(variant)
 
         safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
         safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")

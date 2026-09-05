@@ -10,14 +10,13 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
-import os
 import webbrowser
 from html import escape
 from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR, DB_PATH
+from applypilot.config import APP_DIR
 from applypilot.database import get_connection
 
 console = Console()
@@ -48,6 +47,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
     high_fit = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE fit_score >= 7"
     ).fetchone()[0]
+    terminal_count = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE is_terminal_internship = 'yes'"
+    ).fetchone()[0]
 
     # Score distribution
     score_dist: dict[int, int] = {}
@@ -76,7 +78,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     jobs = conn.execute("""
         SELECT url, title, salary, description, location, site, strategy,
                full_description, application_url, detail_error,
-               fit_score, score_reasoning
+               fit_score, score_reasoning, is_terminal_internship, company
         FROM jobs
         WHERE fit_score >= 5
         ORDER BY fit_score DESC, site, title
@@ -150,6 +152,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         url = escape(j["url"] or "")
         salary = escape(j["salary"] or "")
         location = escape(j["location"] or "")
+        company = escape(j["company"] or "")
         site = escape(j["site"] or "")
         site_color = colors.get(j["site"] or "", "#6b7280")
         apply_url = escape(j["application_url"] or "")
@@ -168,6 +171,8 @@ def generate_dashboard(output_path: str | None = None) -> str:
         meta_parts.append(
             f'<span class="meta-tag site-tag" style="background:{site_color}33;color:{site_color}">{site}</span>'
         )
+        if company:
+            meta_parts.append(f'<span class="meta-tag company">{company}</span>')
         if salary:
             meta_parts.append(f'<span class="meta-tag salary">{salary}</span>')
         if location:
@@ -178,11 +183,18 @@ def generate_dashboard(output_path: str | None = None) -> str:
         if apply_url:
             apply_html = f'<a href="{apply_url}" class="apply-link" target="_blank">Apply</a>'
 
+        is_terminal = j["is_terminal_internship"] == "yes"
+        terminal_badge = (
+            '<span class="terminal-badge" title="No return-to-school requirement -- top apply priority">TERMINAL</span>'
+            if is_terminal else ""
+        )
+
         job_sections += f"""
-        <div class="job-card" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}">
+        <div class="job-card{' job-card-terminal' if is_terminal else ''}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}" data-terminal="{'1' if is_terminal else '0'}">
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>
             <a href="{url}" class="job-title" target="_blank">{title}</a>
+            {terminal_badge}
           </div>
           <div class="meta-row">{meta_html}</div>
           {f'<div class="keywords-row">{escape(keywords)}</div>' if keywords else ''}
@@ -209,7 +221,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .subtitle {{ color: #94a3b8; margin-bottom: 2rem; }}
 
   /* Summary cards */
-  .summary {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
+  .summary {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 1rem; margin-bottom: 2.5rem; }}
   .stat-card {{ background: #1e293b; border-radius: 12px; padding: 1.25rem; }}
   .stat-num {{ font-size: 2rem; font-weight: 700; }}
   .stat-label {{ color: #94a3b8; font-size: 0.85rem; margin-top: 0.25rem; }}
@@ -217,6 +229,10 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .stat-scored .stat-num {{ color: #60a5fa; }}
   .stat-high .stat-num {{ color: #f59e0b; }}
   .stat-total .stat-num {{ color: #e2e8f0; }}
+  .stat-terminal .stat-num {{ color: #a78bfa; }}
+
+  .terminal-badge {{ font-size: 0.65rem; font-weight: 700; letter-spacing: 0.03em; color: #a78bfa; background: #a78bfa22; border: 1px solid #a78bfa55; padding: 0.1rem 0.4rem; border-radius: 4px; margin-left: auto; flex-shrink: 0; }}
+  .job-card-terminal {{ border-left-color: #a78bfa; }}
 
   /* Filters */
   .filters {{ background: #1e293b; border-radius: 12px; padding: 1.25rem; margin-bottom: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }}
@@ -271,6 +287,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   .meta-tag {{ font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 4px; background: #334155; color: #94a3b8; }}
   .meta-tag.salary {{ background: #064e3b; color: #6ee7b7; }}
   .meta-tag.location {{ background: #1e3a5f; color: #93c5fd; }}
+  .meta-tag.company {{ background: #334155; color: #e2e8f0; font-weight: 600; }}
 
   .keywords-row {{ font-size: 0.75rem; color: #10b981; margin-bottom: 0.3rem; line-height: 1.4; }}
   .reasoning-row {{ font-size: 0.75rem; color: #94a3b8; margin-bottom: 0.5rem; font-style: italic; line-height: 1.4; }}
@@ -309,6 +326,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <div class="stat-card stat-ok"><div class="stat-num">{ready}</div><div class="stat-label">Ready (desc + URL)</div></div>
   <div class="stat-card stat-scored"><div class="stat-num">{scored}</div><div class="stat-label">Scored by LLM</div></div>
   <div class="stat-card stat-high"><div class="stat-num">{high_fit}</div><div class="stat-label">Strong Fit (7+)</div></div>
+  <div class="stat-card stat-terminal"><div class="stat-num">{terminal_count}</div><div class="stat-label">Terminal Internships</div></div>
 </div>
 
 <div class="filters">
@@ -317,6 +335,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
   <button class="filter-btn" onclick="filterScore(7)">7+ Strong</button>
   <button class="filter-btn" onclick="filterScore(8)">8+ Excellent</button>
   <button class="filter-btn" onclick="filterScore(9)">9+ Perfect</button>
+  <button class="filter-btn" id="terminal-filter-btn" onclick="toggleTerminal()">Terminal Only</button>
   <span class="filter-label" style="margin-left:1rem">Search:</span>
   <input type="text" class="search-input" placeholder="Filter by title, site..." oninput="filterText(this.value)">
 </div>
@@ -339,11 +358,20 @@ def generate_dashboard(output_path: str | None = None) -> str:
 <script>
 let minScore = 0;
 let searchText = '';
+let terminalOnly = false;
 
 function filterScore(min) {{
   minScore = min;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.filter-btn').forEach(b => {{
+    if (b.id !== 'terminal-filter-btn') b.classList.remove('active');
+  }});
   event.target.classList.add('active');
+  applyFilters();
+}}
+
+function toggleTerminal() {{
+  terminalOnly = !terminalOnly;
+  event.target.classList.toggle('active', terminalOnly);
   applyFilters();
 }}
 
@@ -361,7 +389,8 @@ function applyFilters() {{
     const text = card.textContent.toLowerCase();
     const scoreMatch = score >= (minScore || 5);
     const textMatch = !searchText || text.includes(searchText);
-    if (scoreMatch && textMatch) {{
+    const terminalMatch = !terminalOnly || card.dataset.terminal === '1';
+    if (scoreMatch && textMatch && terminalMatch) {{
       card.classList.remove('hidden');
       shown++;
     }} else {{

@@ -41,21 +41,20 @@ base_urls:
 
 sites:
   # ── Active targets ───────────────────────────────────────────────────
-  # intern-list.com renders its job table inside a jobright.ai iframe, so the
-  # wrapper page yields no Salary/Date columns -- scraping it was silently
-  # dropping pay data. Target the embed directly.
+  # Both Intern List and NewGrad Jobs embed Jobright widgets that call
+  # Jobright's own public `POST /swan/mini-sites/list` API to page through
+  # results as you scroll (found by watching network traffic, confirmed
+  # working with a bare curl POST -- no auth needed). Targeting that API
+  # directly pulls the REAL full dataset (~3000-4700 jobs each) instead of
+  # the ~20-30 rows either widget renders on its initial view, which is all
+  # the earlier iframe/Airtable-scraping approaches ever saw. See
+  # _scrape_jobright_minisite_api in discovery/smartextract.py.
   - name: "Intern List - SWE"
-    url: "https://jobright.ai/minisites-jobs/intern/us/swe?embed=true"
+    url: "jobright-category:intern:us:swe"
     type: static
 
-  # newgrad-jobs.com renders its job table inside an Airtable embed, so the
-  # wrapper page (like intern-list.com before this fix) yields zero jobs --
-  # confirmed via raw fetch, only ~5KB of nav/footer text, no listings. The
-  # wrapper has 4 overlapping Airtable views (all/remote/no-degree/full-time
-  # subsets of the same base); this targets the broadest one directly, right
-  # after the page's "Entry-Level Software Engineer for New Grads" heading.
   - name: "NewGrad Jobs - SWE"
-    url: "https://airtable.com/embed/appxfacPDgUWOvRWa/shr45FBB1GB53RCwo?viewControls=on"
+    url: "jobright-category:newgrad:us:swe"
     type: static
 
   # ── Everything below is disabled for this profile. ────────────────────

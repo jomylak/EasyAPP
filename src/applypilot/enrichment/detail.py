@@ -13,6 +13,7 @@ Three-tier extraction cascade (cheapest first):
 import json
 import logging
 import re
+import socket
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,8 +24,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
-from applypilot.config import DB_PATH
-from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.database import init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -352,65 +352,141 @@ def extract_apply_url_deterministic(page) -> str | None:
     return None
 
 
-def resolve_original_job_url(page, candidate_url: str | None) -> str | None:
-    """Click through Jobright's Apply flow to the real employer ATS URL.
+def _extract_page_description(page) -> str | None:
+    """Best-effort description pull from a page already loaded in the
+    browser -- JSON-LD first (free, structured), falling back to the same
+    deterministic CSS patterns used for a normal detail-page scrape.
+    """
+    try:
+        intel = collect_detail_intelligence(page)
+        json_ld_result = extract_from_json_ld(intel)
+        if json_ld_result and json_ld_result.get("full_description"):
+            return json_ld_result["full_description"]
+    except Exception:
+        pass
+    try:
+        return extract_description_deterministic(page)
+    except Exception:
+        return None
+
+
+def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
+    """Primary strategy: click Jobright's "Original Job Post" toolbar link.
+
+    A single stable link present on every job page regardless of which Apply
+    button variant that posting shows ("Apply Now" vs "Apply With Autofill"
+    vs others not yet seen) -- one click straight to the real employer URL,
+    no upsell dialog, no skip-link dance. Verified against two different
+    jobs with two different Apply-button variants; both resolved correctly
+    through this one link.
+
+    Returns (resolved_url, description) -- description is a best-effort pull
+    from the real employer's own page before closing it, since we're already
+    there: the original posting is more likely to state salary than
+    Jobright's own summary of it (pay-transparency law requires it on the
+    original in many states; Jobright's paraphrase doesn't reliably carry it
+    over), and it costs nothing extra -- this tab was already being opened
+    and closed to get the URL.
+    """
+    link = page.query_selector("text=Original Job Post")
+    if not link:
+        return None, None
+    pages_before = set(page.context.pages)
+    link.click(timeout=5000)
+    page.wait_for_timeout(2000)
+    new_pages = set(page.context.pages) - pages_before
+    if new_pages:
+        new_page = new_pages.pop()
+        new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+        resolved = new_page.url
+        description = _extract_page_description(new_page)
+        new_page.close()
+        return resolved, description
+    return None, None
+
+
+def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
+    """Fallback strategy: the Apply button's own flow.
+
+    Only reached if "Original Job Post" isn't present for some job layout
+    this hasn't seen yet. Jobright shows different Apply-button labels on
+    different postings ("Apply Now", "Apply With Autofill", possibly others)
+    -- match on either seen so far rather than one exact string. Clicking it
+    can surface a "Customize Your Resume" upsell dialog with an "Apply
+    Without Customizing" skip link before the real navigation happens; not
+    every posting shows it. See _resolve_via_original_job_post for why a
+    description is captured here too.
+    """
+    apply_btn = None
+    for el in page.query_selector_all("a, button"):
+        text = (el.inner_text() or "").strip().lower()
+        if text in ("apply now", "apply with autofill"):
+            apply_btn = el
+            break
+    if not apply_btn:
+        return None, None
+
+    pages_before = set(page.context.pages)
+    apply_btn.click(timeout=5000)
+    page.wait_for_timeout(1200)
+
+    skip = page.query_selector("text=Apply Without Customizing")
+    if skip:
+        skip.click(timeout=3000)
+
+    page.wait_for_timeout(1500)
+    new_pages = set(page.context.pages) - pages_before
+    if new_pages:
+        new_page = new_pages.pop()
+        new_page.wait_for_load_state("domcontentloaded", timeout=10000)
+        resolved = new_page.url
+        description = _extract_page_description(new_page)
+        new_page.close()
+        return resolved, description
+    return None, None
+
+
+def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | None, str | None]:
+    """Get the real employer ATS URL (and a best-effort description from
+    that page) behind a Jobright-wrapped job page.
 
     Jobright's own detail page is itself an aggregator wrapper -- its og:url
     and default Apply link both stay on jobright.ai, so ATS detection run
     against them always returns "aggregator (unresolved)" even though the
-    real Workday/Greenhouse/etc. posting is one click away.
+    real Workday/Greenhouse/etc. posting is one click away. Requires this
+    page's browser context to be signed into a real Jobright account (see
+    ENRICHMENT_PROFILE_DIR) -- logged out, every path here hits a permanent
+    signup wall with no way through.
 
-    The click path only works when this page's browser context is signed
-    into a real Jobright account (see ENRICHMENT_PROFILE_DIR) -- logged out,
-    the same click hits a permanent signup wall with no way through. Signed
-    in, the confirmed flow is: click "Apply Now" -> a "Customize Your Resume"
-    upsell dialog may appear, with an "Apply Without Customizing" skip link
-    -> a new tab opens with the real employer URL. Verified by hand against
-    a live job (resolved to a real careers.<company>.com URL) before writing
-    this.
+    Tries the "Original Job Post" link first (simpler, one click, works
+    regardless of which Apply-button variant the posting shows), falling
+    back to the Apply button's own flow only if that link isn't present.
 
-    Best-effort and silent on failure -- most jobs are not aggregator-wrapped,
-    a logged-out context can't get past the wall at all, and a page layout
-    this doesn't recognize should not break enrichment.
+    Returns (resolved_url, description) -- either or both may be None.
+    Best-effort and silent on failure -- most jobs are not aggregator-
+    wrapped, a logged-out context can't get past the wall at all, and a page
+    layout neither strategy recognizes should not break enrichment.
     """
     from applypilot.ats import _AGGREGATORS
 
     if not candidate_url or not re.search(_AGGREGATORS, candidate_url.lower()):
-        return None
+        return None, None
 
     try:
-        apply_btn = None
-        for el in page.query_selector_all("a, button"):
-            text = (el.inner_text() or "").strip().lower()
-            if text == "apply now":
-                apply_btn = el
-                break
-        if not apply_btn:
-            return None
+        # scrape_detail_page navigates `page` to the job's own url, which for
+        # an Intern List job is intern-list.com, not jobright.ai -- candidate
+        # is only a string at that point until this navigates there.
+        if page.url.split("?")[0] != candidate_url.split("?")[0]:
+            page.goto(candidate_url, timeout=30000)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1500)
 
-        pages_before = set(page.context.pages)
-        apply_btn.click(timeout=5000)
-        page.wait_for_timeout(1200)
-
-        # The resume-customization upsell doesn't always appear (depends on
-        # how well the tailored resume already matches); skip it when it does.
-        skip = page.query_selector("text=Apply Without Customizing")
-        if skip:
-            skip.click(timeout=3000)
-
-        page.wait_for_timeout(1500)
-        new_pages = set(page.context.pages) - pages_before
-        if new_pages:
-            new_page = new_pages.pop()
-            new_page.wait_for_load_state("domcontentloaded", timeout=10000)
-            resolved = new_page.url
-            new_page.close()
-            return resolved
-        if page.url != candidate_url:
-            return page.url
-        return None
+        resolved, description = _resolve_via_original_job_post(page)
+        if not resolved:
+            resolved, description = _resolve_via_apply_flow(page)
+        return resolved, description
     except Exception:
-        return None
+        return None, None
 
 
 def extract_description_deterministic(page) -> str | None:
@@ -588,6 +664,62 @@ SITE_DELAYS = {
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 PERMANENT_FAILURES = {404, 410, 451}
 
+# Substrings of Playwright/Chromium error messages that mean "the machine has
+# no usable network path right now" (wifi off, laptop asleep/closed, DNS
+# server unreachable) rather than "this particular page/site is broken".
+# Matched case-insensitively against result["error"].
+NETWORK_DOWN_MARKERS = (
+    "err_internet_disconnected",
+    "err_name_not_resolved",
+    "err_connection_reset",
+    "err_connection_closed",
+    "err_connection_refused",
+    "err_connection_timed_out",
+    "err_timed_out",
+    "err_network_changed",
+    "err_network_io_suspended",
+    "err_address_unreachable",
+    "err_proxy_connection_failed",
+    "err_socket_not_connected",
+    "err_empty_response",
+)
+
+
+def is_network_down_error(err: str | None) -> bool:
+    """True if `err` looks like a local connectivity outage, not a bad page."""
+    if not err:
+        return False
+    low = err.lower()
+    return any(marker in low for marker in NETWORK_DOWN_MARKERS)
+
+
+def wait_for_connectivity(max_wait: float = 1800.0, check_every: float = 10.0) -> bool:
+    """Block until DNS/internet is reachable again, or `max_wait` elapses.
+
+    Used as a circuit breaker when the batch loop hits a network-down error:
+    without this, a tight `while pending: applypilot run enrich` loop (see
+    scripts/overnight_pipeline.sh) burns through every job's retry budget in
+    seconds while offline, since a DNS failure returns almost instantly.
+    Polling here instead pauses the whole batch until the network is back,
+    so no job's attempt count gets spent on an outage that had nothing to do
+    with the job itself.
+    """
+    deadline = time.time() + max_wait
+    waited = 0.0
+    while time.time() < deadline:
+        try:
+            socket.create_connection(("1.1.1.1", 443), timeout=5).close()
+            if waited:
+                log.info("Connectivity restored after %.0fs, resuming enrichment.", waited)
+            return True
+        except OSError:
+            time.sleep(check_every)
+            waited += check_every
+            if waited and waited % 60 < check_every:
+                log.warning("Still offline after %.0fs, waiting for connectivity...", waited)
+    log.error("Still offline after %.0fs (giving up on this wait, will retry job normally).", max_wait)
+    return False
+
 
 def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
     """Attach elapsed time, resolving an aggregator's real ATS URL first.
@@ -600,11 +732,24 @@ def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
     finds a candidate to hand to the resolver in the first place. Without
     this fallback, resolve_original_job_url never even gets called.
     """
-    resolved = resolve_original_job_url(page, result.get("application_url") or url)
+    candidate = result.get("application_url") or url
+
+    resolved, original_description = resolve_original_job_url(page, candidate)
     if resolved:
         result["application_url"] = resolved
         if result.get("full_description"):
             result["status"] = "ok"
+
+        # The employer's own posting is more likely to state salary than
+        # Jobright's paraphrase of it (pay-transparency law requires it on
+        # the original in many states; the summary doesn't reliably carry it
+        # over). Prefer it whenever it's richer than what we already have --
+        # this came from a page we were already opening and closing to get
+        # the URL, so capturing it costs nothing extra.
+        if original_description and len(original_description) > len(result.get("full_description") or ""):
+            result["full_description"] = original_description
+            result["status"] = "ok"
+
     result["elapsed"] = time.time() - t0
     return result
 
@@ -760,10 +905,65 @@ def scrape_site_batch(
                     )
                 else:
                     stats["error"] += 1
-                    conn.execute(
-                        "UPDATE jobs SET detail_error = ?, detail_scraped_at = ? WHERE url = ?",
-                        (result.get("error", "unknown"), now, url),
-                    )
+                    err = result.get("error")
+
+                    if is_network_down_error(err):
+                        # This isn't the job's fault -- the machine itself
+                        # has no network path right now (wifi off, laptop
+                        # closed, DNS unreachable). Don't spend one of the
+                        # job's 3 attempts on it, and don't mark it scraped:
+                        # leave detail_attempts untouched so it's retried
+                        # exactly as if this pass never happened. Block here
+                        # until connectivity is back (or max_wait elapses)
+                        # instead of racing through the rest of the batch --
+                        # every remaining job would otherwise fail the same
+                        # way in under a second each, burning attempts across
+                        # the whole backlog for one outage.
+                        conn.execute(
+                            "UPDATE jobs SET detail_error = ? WHERE url = ?",
+                            (err, url),
+                        )
+                        conn.commit()
+                        if wait_for_connectivity():
+                            continue
+                        # Still offline after the long wait -- stop hammering
+                        # this batch job-by-job (each would wait the same
+                        # 30min again) and let the caller's outer loop
+                        # (overnight/hourly pipeline script) retry the whole
+                        # batch later instead.
+                        log.error(
+                            "Giving up on this batch (%d/%d done) -- still offline.",
+                            i + 1, len(jobs),
+                        )
+                        break
+
+                    # detail_scraped_at is what takes a job out of the
+                    # "pending" queue -- setting it unconditionally on every
+                    # error used to permanently strand a job the moment it
+                    # hit one bad network blip (net::ERR_INTERNET_DISCONNECTED,
+                    # DNS failure, timeout), with no retry ever. Only give up
+                    # for real after 3 attempts; before that, leave it NULL
+                    # so the next enrichment pass picks it back up on its own,
+                    # the same self-healing model scoring already uses.
+                    # Read the count fresh from the DB rather than the `jobs`
+                    # list passed in -- that list is built once per batch by
+                    # two different callers (_run_detail_scraper, stream_detail),
+                    # neither of which needs to carry this value through.
+                    prev_attempts = conn.execute(
+                        "SELECT detail_attempts FROM jobs WHERE url = ?", (url,)
+                    ).fetchone()
+                    attempts = ((prev_attempts[0] if prev_attempts else 0) or 0) + 1
+                    if attempts >= 3:
+                        conn.execute(
+                            "UPDATE jobs SET detail_error = ?, detail_scraped_at = ?, "
+                            "detail_attempts = ? WHERE url = ?",
+                            (err or "unknown", now, attempts, url),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE jobs SET detail_error = ?, detail_attempts = ? WHERE url = ?",
+                            (err or "unknown", attempts, url),
+                        )
 
                 conn.commit()
 
