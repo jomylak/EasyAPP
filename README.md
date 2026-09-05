@@ -24,11 +24,12 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
 
-Three commands. That's it.
+Three commands. That's it. (Setting up from scratch? See **[SETUP.md](SETUP.md)** for a step-by-step walkthrough.)
 
 ```bash
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
+curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash  # apply engine
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot run           # discover > enrich > score > tailor > cover letters
@@ -45,7 +46,7 @@ applypilot apply --dry-run  # fill forms without submitting
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
+**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), OpenRouter API key, Goose CLI, Chrome
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
@@ -65,7 +66,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **6. Auto-Apply** | An agent navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -92,7 +93,9 @@ Each stage is independent. Run them all or pick what you need.
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| Goose CLI | Auto-apply (default engine) | [Install guide](https://block.github.io/goose/docs/getting-started/installation/) |
+| OpenRouter API key | The model Goose runs on | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| Claude Code CLI | Optional fallback engine | Install from [claude.ai/code](https://claude.ai/code) |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
 
@@ -144,21 +147,30 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+The apply agent launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
-**Choosing a backend.** `--backend claude` (the default) drives the browser with the
-Claude Code CLI and spends Claude subscription quota. `--backend skyvern` hands the
-same job to a local [Skyvern](https://github.com/Skyvern-AI/skyvern) server attached to
-the same Chrome, running on whatever model Skyvern is configured with — typically a
-cheap or free OpenRouter one — so applications don't consume your Claude usage window.
-Both apply as the same candidate and record the same outcome codes, so you can compare
-their completion rates directly. See [docs/skyvern-backend.md](docs/skyvern-backend.md)
-for setup.
+**Choosing a backend.** Two engines can drive the browser, using the same prompt,
+the same Playwright + Gmail MCP servers, and the same Chrome.
+
+| Backend | Model | Cost | Role |
+|---|---|---|---|
+| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default.** Tries every job first. |
+| `claude` | Claude Code CLI | Claude subscription quota | Fallback for jobs Goose can't finish. |
+
+Because both apply as the same candidate and record the same outcome codes, their
+completion rates are directly comparable.
+
+The fallback is narrow on purpose: Claude retries a job only when Goose gave up for
+a reason that means the *driver* lost the thread (stuck, timed out, broken page, no
+outcome reported). A posting that is expired, already applied to, or behind an SSO
+wall is just as dead for the stronger model, so it is never retried.
 
 ```bash
-applypilot apply --backend skyvern --url URL --dry-run
+applypilot apply --backend claude       # skip Goose entirely
+applypilot apply --fallback none        # Goose only, no second attempt
+applypilot apply --url URL --dry-run    # fill the form without submitting
 ```
 
 ```bash
@@ -190,7 +202,7 @@ applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
-applypilot apply --backend skyvern      # Drive via local Skyvern (off Claude quota)
+applypilot apply --backend claude       # Use Claude Code instead of Goose
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```

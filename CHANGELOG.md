@@ -5,6 +5,215 @@ All notable changes to ApplyPilot will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-09-04
+
+### Added
+- **Goose apply backend, now the default.** `applypilot apply` drives the
+  browser with the Goose CLI on a cheap OpenRouter model (default
+  `xiaomi/mimo-v2.5`, ~$0.05/application) instead of Claude subscription
+  quota. Same prompt, same Playwright + Gmail MCP servers, same Chrome, same
+  `RESULT:` vocabulary and known-quirks cache as the Claude path -- only the
+  model behind the loop differs, so completion rates stay comparable.
+  Promoted from `scripts/goose_quicktest.sh`, which had already proven the
+  approach against real ATS forms.
+- **Automatic Claude fallback.** A job Goose gives up on is retried once on
+  the Claude backend, but only for failures meaning the *driver* lost the
+  thread (`stuck`, `timeout`, `page_error`, `no_result_line`, `unknown` --
+  `outcomes.FALLBACK_REASONS`). Expired, already-applied, and SSO-walled
+  postings are just as dead for the stronger model, so they are never
+  retried. Chrome is restarted between attempts so the retry starts clean.
+  Configure with `apply_fallback_backend`, or `--fallback none` per run.
+- `--fallback` CLI flag; `goose_model`, `goose_provider`, `goose_max_turns`,
+  `goose_max_tool_repetitions`, `goose_timeout` and `goose_writes_quirks`
+  settings.
+- Wall-clock timeout on apply runs (`goose_timeout`, default 2400s).
+  `--max-turns` bounds turns, not time, and a cheap model can sit in a slow
+  tool call indefinitely.
+- `tests/test_goose_backend.py`: 37 tests covering command construction,
+  stream-json parsing, and fallback routing.
+
+### Changed
+- `doctor` reports which backend is primary vs. fallback, and checks Goose and
+  `OPENROUTER_API_KEY` alongside the Claude CLI.
+- Tier 3 (auto-apply) is unlocked by *either* backend. It previously required
+  the Claude CLI specifically, which would have reported tier 2 for a working
+  Goose-only install -- the new default.
+- `.env.example` rewritten: `OPENROUTER_API_KEY` promoted to required,
+  `LLM_API_KEY` documented, provider precedence spelled out.
+- `SETUP.md` added for from-scratch setup; linked from the README.
+
+### Fixed
+- `doctor` reported the LLM provider as Gemini whenever `GEMINI_API_KEY` was
+  set, even when `LLM_URL` was also set and `llm._detect_provider()` was
+  therefore routing every call elsewhere. It now mirrors the real precedence
+  and warns when `LLM_URL` shadows a key.
+
+### Removed
+- **Skyvern backend, entirely.** Along with `apply/fileserver.py`,
+  `apply/verification.py`, `apply/gmail.py` (all Skyvern-only),
+  `prompt.build_skyvern_goal()`, `outcomes.ERROR_CODE_MAPPING`, the
+  `skyvern_*`/`verification_*` settings, and `docs/skyvern-backend.md`. Goose
+  covers the same "don't burn Claude quota" case with no server to run.
+  `SKYVERN_*` env vars are now ignored.
+
+## [2026-09-03] - 2026-09-01 to 2026-09-03
+
+Two sessions' worth of changes across the apply agent, discovery, and
+enrichment pipeline. See `HANDOFF.md` for full context, open items, and
+known limitations -- this section is the terse historical record.
+
+### Added
+- Housing/relocation support now counts toward internship desirability:
+  `offers_housing()` plus a flat `housing_bonus` (0.5) applied outside the
+  weighted components, reaching all 250 of 1101 internships that offer it.
+  Explicit refusals ("No Corporate Housing Provided") score nothing.
+  Detection only -- no dollar parsing: an hourly-conversion version was built
+  first and measured, and it credited 249 jobs but changed only 56 scores,
+  always by exactly +1.00, because the pay tier is a step function that threw
+  the precision away. It also dropped 36 jobs in preferred metros, where
+  _location_desirability returns before the pay tier is consulted, so a San
+  Francisco internship with a stipend got nothing in the city where housing
+  matters most. Reading no numbers also removes the whole class of
+  wage-mistaken-for-stipend bugs
+- `terminal_evidence()` + `compute_terminal_internships()` in `scoring/scorer.py`:
+  deterministic, no LLM, derived from stored columns like `compute_desirability`.
+  Matches explicit acceptance ("or recently graduated", "recently completed a
+  degree", upper bounds like "must graduate before December 2027") and vetoes
+  graduation *windows* that exclude the candidate ("December 2027 and beyond",
+  "or later", "must continue enrollment"). 100% precision against the audited
+  sample
+- `terminal_min_fit` (9) and `terminal_min_desirability` (6.0) settings
+- Deterministic resume-track routing (`scoring/router.py`): picks one of three
+  hand-authored LaTeX resume variants (`swe` / `aiml` / `data`) per job from
+  the title, then the scorer's `keywords`, then the description -- no LLM call,
+  so the tailor stage stays free across thousands of jobs and a misroute can be
+  predicted by reading the title. Precedence is AI/ML > SWE > Data; SWE is also
+  the fallback for the ~33% of titles matching no track
+- Two-tier routing vocabulary: terms common to all three tracks (Python, Git,
+  AWS, SQL) are excluded outright, and bare "AI"/"ML"/"dashboard" are decisive
+  only in a *title*. Bare "AI" fired 38 times across the tailorable set --
+  more than every genuine AI term combined -- because postings list "AI tools"
+  as boilerplate, which was routing "IoT Engineer" to the AI/ML resume
+- Six resume variants in `settings.json` keyed `{track}_{gradyear}`, from three
+  maintained LaTeX sources compiled twice each with a different `\graddate`
+- `tests/` with 37 cases covering routing precedence, the weak-term tier, the
+  field cascade, and variant composition
+- Per-ATS known-quirks cache (`config/known_quirks/<platform>.md`): verified
+  widget-handling fallbacks loaded into the apply prompt, self-reported by
+  the agent via a `QUIRK:` line and written back only for trusted models
+  (Sonnet/Opus) on a successful run
+- `DATE FIELD PROTOCOL` in the apply prompt: classify a date widget into one
+  of three confirmed patterns (typeable / spinbutton-triplet / calendar-
+  popup-only) before acting
+- ATS resolution at enrichment time: `resolve_original_job_url()` clicks
+  through Jobright's real Apply flow to the actual employer URL, requires a
+  signed-in Jobright session (`ENRICHMENT_PROFILE_DIR`, a persistent Chrome
+  profile separate from the apply-workers' profiles)
+- NewGrad Jobs discovery: bespoke Airtable Button-field scraper (the site
+  embeds an Airtable grid, not a Jobright iframe like Intern List)
+- Job queue age-decay: small priority penalty at pick-time based on
+  `posted_date`/`discovered_at`, tunable via `job_age_decay_per_day`
+  (queue-ordering only, never rewrites `fit_score`)
+- `scripts/goose_quicktest.sh`: paste a job URL + OpenRouter model, get a
+  real ApplyPilot prompt run through Goose against the same Playwright MCP
+  server the Claude Code backend uses, with `email_override`/
+  `password_override` support for same-job regression testing
+- Per-resume-variant `start_date` in `settings.json` (alongside `grad_date`)
+  -- the gap between graduating and being available isn't a fixed offset
+  across variants, so it's configured explicitly per variant, not computed
+- `RESULT:FAILED:grad_date_mismatch` + automatic resume-variant swap on that
+  failure, so a retry uses the corrected resume instead of repeating the
+  same mismatch
+- Two-number job scoring: `fit_score` stays a pure skill match, and a new
+  `desirability_score` (company prestige + pay + location, weighted, no LLM
+  call) captures how much the candidate actually wants the role. The apply
+  queue orders on a configurable blend of the two (`fit_weight` /
+  `desirability_weight` in settings.json), so ordering can be re-tuned without
+  re-scoring anything
+- Prestige override on the apply queue (`prestige_override_tiers`, applied by
+  `database.fit_gate_sql()` to both the tailor stage and `acquire_job`): a
+  strong enough employer qualifies below the normal fit bar, on the trade that
+  one application's cost is bounded while the upside isn't. Safe only because
+  the eligibility gate independently drops roles that can't be filled
+- Roles requiring 3+ years of professional experience (internships excluded)
+  are a hard disqualifier; 1-2 years is not, since those asks are often soft
+- Hard eligibility gate at scoring time (`eligible` / `eligibility_reason`):
+  rejects Master's/PhD-only, freshman/sophomore-only, non-US, and
+  clearance-required postings before they reach an apply run. Graduation
+  timing is explicitly NOT a disqualifier -- the resume-variant swap already
+  handles it -- and work authorization is passed in from the profile as fact
+  rather than left for the model to infer
+- `company` and `company_prestige` columns, extracted by the scorer in its
+  existing call. Previously the scorer was passed `site` ("Intern List - SWE")
+  as COMPANY, so it never saw the employer at all
+- `parse_pay_range()` / `pay_below_floor()`: normalize discovery's `salary`
+  strings (`$23-$43/hr`, `$6k-$11k/mon`, `$43k-$74k/yr`) to an hourly range.
+  The floor test is on the range MAXIMUM, so a band that straddles the floor
+  isn't rejected
+
+### Fixed
+- Housing detection needs two guards that each caught a real posting: word
+  boundaries (PepsiCo's "data warehousing" contains "housing") and a benefit
+  word alongside the noun ("Freddie Mac is a housing finance company" is not
+  an offer)
+- `is_terminal_internship` was flagging jobs on *absence* of evidence. It keyed
+  off `requires_returning_student == "no"`, but the scoring prompt tells the
+  model to answer "no" when "the posting states no graduation timing
+  requirement at all", and the parser collapses every non-"yes" answer --
+  including a malformed one -- to "no". An LLM audit of 40 of the 94 flagged
+  jobs found **77.5% flagged on silence, 20% with real evidence, 2.5%
+  outright wrong** (PepsiCo: "graduate ... within one (1) year of internship
+  completion", a window a May-2027 grad falls before). The flag now requires
+  an explicit statement (`terminal_evidence()`), and 94 -> 4
+- The flag is an absolute first sort key in `acquire_job`, so it had taken
+  **93 of the top 100 queue slots** -- a fit-9/desirability-2.0 role at an
+  unknown company outranked fit-10/desirability-10.0 roles at Google,
+  Mastercard and Adobe. Added a `terminal_min_desirability` floor so the
+  override also requires a job worth jumping the queue for
+- 308 jobs held `fit_score = 0`, the scoring error sentinel, all from a single
+  outage hour. Because `pending_score` keys off `fit_score IS NULL`, they were
+  stranded permanently rather than retried; 297 were `new_grad`, dragging that
+  cohort's mean fit from 5.23 to 3.91 and making internships look far stronger
+  by comparison than they are. Reset to NULL so they re-enter the queue. (The
+  guard that prevents writing the sentinel already exists; this is residue
+  from before it landed.)
+- 45 of 139 qualifying jobs had `is_terminal_internship` NULL -- one scoring
+  batch wrote every other column but not that one. The flag is now derived by
+  `compute_terminal_internships()` from stored columns, so it is repairable by
+  re-running a free pass instead of a full LLM re-score
+- Resume-variant swap on `grad_date_mismatch` picked an arbitrary other
+  variant (`other_variants[0]`), which was correct only while exactly two
+  existed. With six it could answer a returning-student posting with a
+  May-2027 resume -- reintroducing the mismatch it exists to fix. It now flips
+  only the graduation year and keeps the routed track
+- `get_resume_variant_paths` falls back along a *year-preserving* chain when a
+  variant's files aren't on disk, so a missing track resume degrades to the
+  same-year SWE one rather than silently misstating the graduation date
+- Scoring never saw the `salary` column, which is the only place pay actually
+  lives (~40 of 121 jobs have a range there; 3 descriptions mention a figure).
+  Every job therefore scored `PAY: not stated` / `BELOW_FLOOR: unknown` and
+  the pay gate in `acquire_job` had never once fired
+- Scoring now backfills `location` where discovery left it blank -- enrichment
+  never wrote that column despite the NewGrad Jobs scraper's docstring saying
+  it did, leaving half the board location-blind
+- Account recovery (sign in -> reset via Gmail -> re-check dropped uploads)
+- `--dry-run` no longer marks jobs applied, erases a prior real outcome, or
+  re-acquires the same job
+- Location check no longer rejects valid US postings
+- Salary floor is intern-aware (hourly floor for internships, annual for
+  full-time); salary field left blank when the form field itself is optional
+- CDP watchdog ends a run when Chrome's DevTools port dies (was hanging ~10
+  minutes)
+- Resume-variant `start_date` was a single static profile value regardless
+  of which resume was actually attached -- now variant-specific
+
+### Changed
+- Discovery freshness window widened 7 -> 14 days (safe to run on a
+  recurring schedule; near-duplicates are deduped by the url primary key)
+- Prompt efficiency: explicit `browser_type(slowly)` guidance for masked
+  fields, batched `ToolSearch`/`browser_fill_form` calls, a guard against
+  reading Playwright's own on-disk snapshot files via a shell tool
+
 ## [0.2.0] - 2026-02-17
 
 ### Added

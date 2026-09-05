@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import time
 from typing import Optional
 
 import typer
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.table import Table
 
 from applypilot import __version__
@@ -159,9 +162,15 @@ def apply(
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     backend: Optional[str] = typer.Option(
         None, "--backend", "-b",
-        help="Engine that drives the browser: 'claude' (Claude Code CLI) or "
-             "'skyvern' (local Skyvern server, cheaper model). "
-             "Defaults to apply_backend in settings.json.",
+        help="Engine that drives the browser: 'goose' (Goose CLI on a cheap "
+             "OpenRouter model) or 'claude' (Claude Code CLI, uses your "
+             "subscription quota). Defaults to apply_backend in settings.json.",
+    ),
+    fallback: Optional[str] = typer.Option(
+        None, "--fallback",
+        help="Backend to retry a job on when the primary one gives up. "
+             "Defaults to apply_fallback_backend in settings.json. "
+             "Pass 'none' to disable.",
     ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -198,7 +207,7 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (Chrome + an apply backend)
     check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
@@ -223,7 +232,7 @@ def apply(
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -234,7 +243,7 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
             f"  claude --model {model} -p "
             f"--mcp-config {mcp_path} "
@@ -249,7 +258,8 @@ def apply(
     from applypilot.config import load_settings
     from applypilot.apply.backends import BACKEND_NAMES
 
-    effective_backend = (backend or load_settings().get("apply_backend", "claude")).lower()
+    _settings = load_settings()
+    effective_backend = (backend or _settings.get("apply_backend", "goose")).lower()
     if effective_backend not in BACKEND_NAMES:
         console.print(
             f"[red]Unknown backend {effective_backend!r}.[/red] "
@@ -257,16 +267,33 @@ def apply(
         )
         raise typer.Exit(code=1)
 
+    raw_fallback = fallback if fallback is not None else _settings.get("apply_fallback_backend")
+    effective_fallback = (raw_fallback or "").strip().lower() or None
+    if effective_fallback in ("none", "off"):
+        effective_fallback = None
+    if effective_fallback and effective_fallback not in BACKEND_NAMES:
+        console.print(
+            f"[red]Unknown fallback backend {effective_fallback!r}.[/red] "
+            f"Expected one of: {', '.join(BACKEND_NAMES)}, or 'none'"
+        )
+        raise typer.Exit(code=1)
+    if effective_fallback == effective_backend:
+        effective_fallback = None
+
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
     console.print(f"  Backend:  {effective_backend}")
-    if effective_backend == "skyvern":
-        # --model selects a Claude model and is meaningless here; Skyvern's
-        # model lives in its own .env. Printing "haiku" just misleads.
-        console.print("  Model:    [dim]set in Skyvern's .env (OPENROUTER_MODEL)[/dim]")
+    if effective_backend == "goose":
+        # --model selects a Claude model and is meaningless here; Goose's model
+        # is goose_model in settings.json. Printing "haiku" just misleads.
+        from applypilot.config import DEFAULTS as _D
+        _gm = _settings.get("goose_model") or _D["goose_model"]
+        _gp = _settings.get("goose_provider") or _D["goose_provider"]
+        console.print(f"  Model:    {_gm} [dim]({_gp})[/dim]")
     else:
         console.print(f"  Model:    {model}")
+    console.print(f"  Fallback: {effective_fallback or '[dim]none[/dim]'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -283,19 +310,58 @@ def apply(
         continuous=continuous,
         workers=workers,
         backend=effective_backend,
+        fallback_backend=effective_fallback,
     )
 
 
-@app.command()
-def status() -> None:
-    """Show pipeline statistics from the database."""
-    _bootstrap()
+def _is_stage_running(stage: str) -> bool:
+    """Whether an `applypilot run <stage>` process is alive right now.
 
-    from applypilot.database import get_stats
+    Plain `ps` grep rather than a pidfile/lock -- every stage here is a
+    short-lived CLI subprocess the overnight/hourly scripts spawn and let
+    exit, not a daemon that manages its own lock file, so this is the only
+    signal available without adding new bookkeeping. macOS/Linux only.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "aux"], capture_output=True, text=True, timeout=5,
+        ).stdout
+        needle = f"applypilot run {stage}"
+        return any(
+            needle in line and "grep" not in line
+            for line in out.splitlines()
+        )
+    except Exception:
+        return False
 
-    stats = get_stats()
 
-    console.print("\n[bold]ApplyPilot Pipeline Status[/bold]\n")
+def _build_status_renderables(stats: dict) -> list:
+    """Build the Rich renderables for `status` -- shared by the one-shot
+    print and the --watch live-refresh loop so they never drift apart.
+    """
+    renderables: list = []
+
+    # Pipeline activity -- last-seen timestamps plus whether each stage's
+    # process is actually running right now, so this answers "is anything
+    # happening" without needing a separate `ps aux` by hand.
+    activity = Table(title="Pipeline Activity", show_header=True, header_style="bold blue")
+    activity.add_column("Stage")
+    activity.add_column("Status", justify="center")
+    activity.add_column("Last activity")
+
+    enrich_running = _is_stage_running("enrich")
+    score_running = _is_stage_running("score")
+    activity.add_row(
+        "Enrich", "[green]running[/green]" if enrich_running else "[dim]idle[/dim]",
+        stats.get("last_enrich_at") or "never",
+    )
+    activity.add_row(
+        "Score", "[green]running[/green]" if score_running else "[dim]idle[/dim]",
+        stats.get("last_score_at") or "never",
+    )
+    for site, last_discovered in stats.get("last_discovered_by_site", []):
+        activity.add_row(f"Discover ({site or 'unknown'})", "", last_discovered or "never")
+    renderables.append(activity)
 
     # Summary table
     summary = Table(title="Pipeline Overview", show_header=True, header_style="bold cyan")
@@ -314,12 +380,11 @@ def status() -> None:
     summary.add_row("Ready to apply", str(stats["ready_to_apply"]))
     summary.add_row("Applied", str(stats["applied"]))
     summary.add_row("Apply errors", str(stats["apply_errors"]))
-
-    console.print(summary)
+    renderables.append(summary)
 
     # Score distribution
     if stats["score_distribution"]:
-        dist_table = Table(title="\nScore Distribution", show_header=True, header_style="bold yellow")
+        dist_table = Table(title="Score Distribution", show_header=True, header_style="bold yellow")
         dist_table.add_column("Score", justify="center")
         dist_table.add_column("Count", justify="right")
         dist_table.add_column("Bar")
@@ -336,20 +401,84 @@ def status() -> None:
             bar = f"[{color}]{'=' * bar_len}[/{color}]"
             dist_table.add_row(str(score), str(count), bar)
 
-        console.print(dist_table)
+        renderables.append(dist_table)
+
+    # Score distribution split internship vs new_grad (7+ only -- these are
+    # the tiers that actually compete for apply slots).
+    if stats.get("score_distribution_by_type"):
+        by_type: dict[str, dict[int, int]] = {}
+        for job_type, score, count in stats["score_distribution_by_type"]:
+            by_type.setdefault(job_type, {})[score] = count
+
+        total_scored_by_type = stats.get("total_scored_by_type", {})
+
+        type_table = Table(title="Top-Tier Score by Job Type (7+)", show_header=True, header_style="bold cyan")
+        type_table.add_column("Job Type")
+        for s in (10, 9, 8, 7):
+            type_table.add_column(str(s), justify="right")
+        type_table.add_column("Total 7+", justify="right", style="bold")
+        type_table.add_column("Total Scored", justify="right", style="dim")
+
+        for job_type in sorted(by_type):
+            row_counts = [by_type[job_type].get(s, 0) for s in (10, 9, 8, 7)]
+            type_table.add_row(
+                job_type, *[str(c) for c in row_counts], str(sum(row_counts)),
+                str(total_scored_by_type.get(job_type, 0)),
+            )
+
+        renderables.append(type_table)
+
+    if stats.get("terminal_internships"):
+        renderables.append(
+            f"[bold green]Terminal internships (no return-to-school required, "
+            f"guaranteed top apply priority):[/bold green] {stats['terminal_internships']}"
+        )
 
     # By site
     if stats["by_site"]:
-        site_table = Table(title="\nJobs by Source", show_header=True, header_style="bold magenta")
+        site_table = Table(title="Jobs by Source", show_header=True, header_style="bold magenta")
         site_table.add_column("Site")
         site_table.add_column("Count", justify="right")
 
         for site, count in stats["by_site"]:
             site_table.add_row(site or "Unknown", str(count))
 
-        console.print(site_table)
+        renderables.append(site_table)
 
-    console.print()
+    return renderables
+
+
+@app.command()
+def status(
+    watch: bool = typer.Option(False, "--watch", "-w", help="Auto-refresh live instead of a one-shot snapshot."),
+    interval: float = typer.Option(5.0, "--interval", help="Seconds between refreshes in --watch mode."),
+) -> None:
+    """Show pipeline statistics from the database."""
+    _bootstrap()
+
+    from applypilot.database import get_stats
+
+    if not watch:
+        console.print("\n[bold]ApplyPilot Pipeline Status[/bold]\n")
+        for r in _build_status_renderables(get_stats()):
+            console.print(r)
+            console.print()
+        return
+
+    console.print("[dim]Watching -- Ctrl+C to stop[/dim]")
+    try:
+        with Live(console=console, refresh_per_second=1, screen=True) as live:
+            while True:
+                group = Group(
+                    "[bold]ApplyPilot Pipeline Status[/bold] "
+                    f"[dim](refreshing every {interval:.0f}s, {time.strftime('%H:%M:%S')})[/dim]",
+                    "",
+                    *_build_status_renderables(get_stats()),
+                )
+                live.update(group)
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
 
 
 @app.command()
@@ -368,7 +497,8 @@ def doctor() -> None:
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, get_chrome_path, DEFAULTS,
+        load_settings,
     )
 
     load_env()
@@ -413,26 +543,73 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    # Mirror llm._detect_provider()'s precedence exactly: LLM_URL wins over both
+    # key-based providers. Checking GEMINI_API_KEY first reported "Gemini" for a
+    # setup that was really routing every call to the LLM_URL endpoint.
+    if has_local:
+        model = os.environ.get("LLM_MODEL", "local-model")
+        results.append(("LLM API key", ok_mark,
+                        f"{os.environ.get('LLM_URL')} ({model})"))
+        if has_gemini or has_openai:
+            results.append(("LLM_URL override", warn_mark,
+                            "LLM_URL is set, so GEMINI_API_KEY/OPENAI_API_KEY are ignored"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-3.1-flash-lite")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
         results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
-    elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
                         "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
+    # Apply backend: whichever one is actually configured is the one that has
+    # to be present. The other is reported as the fallback it is.
+    _s = load_settings()
+    primary = (_s.get("apply_backend") or "goose").lower()
+    fallback = (_s.get("apply_fallback_backend") or "").lower() or None
+
+    def _role(name: str) -> str:
+        if name == primary:
+            return "apply backend"
+        if name == fallback:
+            return "apply fallback"
+        return "unused"
+
+    # Goose CLI
+    goose_bin = shutil.which("goose")
+    goose_role = _role("goose")
+    if goose_bin:
+        results.append(("Goose CLI", ok_mark, f"{goose_bin} ({goose_role})"))
+    elif goose_role == "unused":
+        results.append(("Goose CLI", "[dim]optional[/dim]", "not the configured backend"))
+    else:
+        results.append(("Goose CLI", fail_mark if goose_role == "apply backend" else warn_mark,
+                        f"{goose_role}; install from "
+                        "https://block.github.io/goose/docs/getting-started/installation/"))
+
+    # OpenRouter key -- what Goose runs on
+    if primary == "goose" or fallback == "goose":
+        if os.environ.get("OPENROUTER_API_KEY"):
+            model = _s.get("goose_model") or DEFAULTS["goose_model"]
+            results.append(("OpenRouter key", ok_mark, f"Goose model: {model}"))
+        else:
+            results.append(("OpenRouter key", fail_mark,
+                            "Goose needs OPENROUTER_API_KEY in ~/.applypilot/.env "
+                            "(https://openrouter.ai/keys)"))
+
     # Claude Code CLI
     claude_bin = shutil.which("claude")
+    claude_role = _role("claude")
     if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
+        results.append(("Claude Code CLI", ok_mark, f"{claude_bin} ({claude_role})"))
+    elif claude_role == "unused":
+        results.append(("Claude Code CLI", "[dim]optional[/dim]", "not the configured backend"))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Claude Code CLI",
+                        fail_mark if claude_role == "apply backend" else warn_mark,
+                        f"{claude_role}; install from https://claude.ai/code"))
 
     # Chrome
     try:
@@ -476,9 +653,11 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome + Node.js, plus "
+                      "Goose+OpenRouter key or the Claude Code CLI)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Chrome + Node.js, plus "
+                      "Goose+OpenRouter key or the Claude Code CLI)[/dim]")
 
     console.print()
 

@@ -399,7 +399,7 @@ class ClaudeCodeBackend:
         if not shutil.which("claude"):
             raise RuntimeError(
                 "The 'claude' CLI is not on PATH. Install Claude Code from "
-                "https://claude.ai/code, or use --backend skyvern."
+                "https://claude.ai/code, or use --backend goose."
             )
 
     def interrupt_all(self) -> None:

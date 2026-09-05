@@ -6,9 +6,8 @@ flagged for a human to look at. They previously lived in ``launcher``; they
 moved here so backends can build on them without importing the launcher (which
 imports the backends in turn).
 
-The Skyvern backend also feeds these codes to Skyvern as its
-``error_code_mapping``, so the model reports outcomes in the same vocabulary
-the Claude Code path prints as ``RESULT:FAILED:<reason>``.
+Every backend prints them the same way -- ``RESULT:FAILED:<reason>`` -- so the
+Goose and Claude paths are interchangeable from the launcher's point of view.
 """
 
 # Reasons that mean "never try this job again".
@@ -65,22 +64,22 @@ def is_permanent_failure(result: str) -> bool:
     )
 
 
-# Human-readable guidance for each reason code, handed to Skyvern as its
-# error_code_mapping so the model knows which code fits which wall it hit.
-ERROR_CODE_MAPPING: dict[str, str] = {
-    "expired": "The posting is closed, filled, or no longer accepting applications.",
-    "captcha": "A CAPTCHA blocks progress and cannot be solved.",
-    "login_issue": "Could not sign in or create an account on the employer's own system.",
-    "sso_required": "The site requires signing in through Google, Microsoft, or another SSO/OAuth provider.",
-    "account_required": "An pre-existing account is required that this candidate does not have.",
-    "already_applied": "The candidate has already applied to this posting.",
-    "not_eligible_location": "The role is onsite or hybrid outside the acceptable area with no remote option.",
-    "not_eligible_salary": "The compensation is below the candidate's stated floor.",
-    "not_a_job_application": "This is not a job application -- it is a profile builder, talent network, freelancing marketplace, or assessment platform.",
-    "unsafe_permissions": "The site demanded camera, microphone, screen sharing, or location access.",
-    "unsafe_verification": "The site demanded video/audio verification, a selfie, an ID photo, or biometrics.",
-    "site_blocked": "The site blocked automated access.",
-    "cloudflare_blocked": "Cloudflare blocked access to the site.",
-    "page_error": "The page is broken, blank, or returned a server error.",
-    "stuck": "Made no progress after repeated attempts on the same page.",
+# Failures worth one retry on the fallback backend (settings.json:
+# `apply_fallback_backend`). These all mean "the engine driving the browser
+# gave up", not "this job cannot be applied to" -- a stronger model may well
+# get through where a cheap one lost the thread.
+#
+# Deliberately excludes every PERMANENT_FAILURE, and also the walls that are
+# about the site rather than the driver: sso_required, unsafe_permissions and
+# unsafe_verification block any agent equally, so retrying just burns quota.
+FALLBACK_REASONS: set[str] = {
+    "stuck", "no_result_line", "unknown", "page_error", "timeout",
 }
+
+
+def should_fall_back(result: str) -> bool:
+    """Whether a failed run should be retried on the fallback backend."""
+    if not result.startswith("failed:"):
+        return False
+    reason = result.split(":", 1)[1].strip().lower()
+    return reason in FALLBACK_REASONS and not is_permanent_failure(result)
