@@ -26,6 +26,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "pandas>=2.0",
+    # Serves the local web UI (`applypilot serve`). Loopback only -- see
+    # applypilot/web/server.py for why there is deliberately no --host flag.
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
     ]
 
 [project.optional-dependencies]
@@ -47,7 +51,12 @@ build-backend = "hatchling.build"
 packages = ["src/applypilot"]
 
 [tool.hatch.build]
-artifacts = ["src/applypilot/config/*.yaml"]
+artifacts = [
+    "src/applypilot/config/*.yaml",
+    # The built frontend ships with the package so a fresh clone can run
+    # `applypilot serve` without Node installed.
+    "src/applypilot/web/static/**",
+]
 
 [tool.ruff]
 target-version = "py311"

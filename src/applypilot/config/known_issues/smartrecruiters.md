@@ -1,0 +1,1 @@
+- SmartRecruiters anti-bot system blocks the oneclick-ui application URL (used by all "I'm interested"/Apply buttons) with a 403 "Access is temporarily restricted" at the IP level. This is NOT a solvable CAPTCHA -- it is IP-based bot detection, so CapSolver and the manual fallback are both irrelevant here. No alternative application entry point was found on this platform.

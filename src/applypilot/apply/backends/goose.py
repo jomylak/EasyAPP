@@ -31,6 +31,7 @@ Requires ``goose`` on PATH and ``OPENROUTER_API_KEY`` in ``~/.applypilot/.env``.
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -178,7 +179,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     worker_dir = reset_worker_dir(worker_id)
 
     update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 # The employer, falling back to the source board only when
+                 # scoring has not filled it in yet -- `site` is the board
+                 # ("Intern List - SWE"), never the company.
+                 company=job.get("company") or job.get("site", ""),
+                 url=job.get("url", ""), score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
@@ -206,6 +211,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     timed_out = threading.Event()
 
     try:
+        # New process group on Unix so _kill_process_tree (os.killpg) tears
+        # down goose and its MCP-server children without also killing
+        # whatever process spawned this one -- goose was inheriting our own
+        # process group, so timing out a run could SIGKILL its own caller.
+        popen_kwargs: dict = {}
+        if platform.system() != "Windows":
+            popen_kwargs["preexec_fn"] = os.setsid
+
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -216,6 +229,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             errors="replace",
             env=env,
             cwd=str(worker_dir),
+            **popen_kwargs,
         )
         with _goose_lock:
             _goose_procs[worker_id] = proc
@@ -358,13 +372,26 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # Persist self-reported widget fixes, only from a run that actually
         # succeeded -- a QUIRK line on a failed run is an unverified guess.
         # See `goose_writes_quirks` in config for why this is a setting.
+        #
+        # Found via regex, not line-by-line startswith: `output` is built by
+        # "".join(text_parts) across separate goose messages, so a marker that
+        # opens its own message lands glued to the end of the prior message's
+        # last sentence with no newline between them -- a plain
+        # `.strip().startswith("QUIRK:")` silently misses it whenever that
+        # happens (confirmed missing a real ISSUE: line this way).
         if ("RESULT:APPLIED" in output and job_ats
                 and config.load_settings().get(
                     "goose_writes_quirks", config.DEFAULT_SETTINGS["goose_writes_quirks"])):
-            for out_line in output.split("\n"):
-                out_line = out_line.strip()
-                if out_line.startswith("QUIRK:"):
-                    config.append_known_quirk(job_ats, out_line[len("QUIRK:"):].strip())
+            for m in re.finditer(r"QUIRK:\s*(.+?)(?:\n|$)", output):
+                config.append_known_quirk(job_ats, m.group(1).strip())
+
+        # Persist self-reported failure modes -- these carry a much lower bar
+        # than quirks (see append_known_issue): a wrong "watch out for X" only
+        # wastes a little of the next run's attention, so any model's report
+        # is trusted, not just the trusted quirk writers.
+        if "RESULT:APPLIED" not in output and job_ats:
+            for m in re.finditer(r"ISSUE:\s*(.+?)(?:\n|$)", output):
+                config.append_known_issue(job_ats, m.group(1).strip())
 
         if stats:
             with _goose_lock:

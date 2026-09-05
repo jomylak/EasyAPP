@@ -36,6 +36,7 @@ from applypilot.apply.chrome import (
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, render_full, get_totals,
+    begin_run, end_run,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,140 +62,253 @@ if platform.system() != "Windows":
 # Database operations
 # ---------------------------------------------------------------------------
 
+# Columns every acquire_job branch returns. Kept in one place because the
+# branches differ only in how they pick a row, never in what the caller gets.
+_JOB_COLUMNS = """url, title, site, company, application_url,
+                  tailored_resume_path, fit_score, location, full_description,
+                  cover_letter_path, keywords, apply_status AS prior_status,
+                  applied_at AS prior_applied_at"""
+
+# How many unusable rows (manual ATS, blocked site) one acquire_job call will
+# set aside before giving up. Bounded so a selection made entirely of unusable
+# rows ends the worker instead of spinning against the database.
+_MAX_DEFERRALS = 50
+
+
+def _like_to_substring(pattern: str) -> str:
+    """Turn a SQL LIKE pattern from sites.yaml into a plain substring.
+
+    The patterns are all of the form %fragment%, and they are matched in SQL
+    for the ranked branch. The queued branch has to make the same judgement in
+    Python, and this keeps the two answering from the same config rather than
+    from a second hand-maintained list.
+    """
+    return pattern.strip().strip("%").lower()
+
+
+def _is_blocked(site: str | None, url: str | None,
+                blocked_sites: list, blocked_patterns: list) -> bool:
+    """Whether a row is one the apply agent is configured never to touch."""
+    if site and site in blocked_sites:
+        return True
+    lowered = (url or "").lower()
+    return any(frag and frag in lowered
+               for frag in map(_like_to_substring, blocked_patterns))
+
+
+def _select_target(conn, target_url: str):
+    """Pick one specific job by URL, for `applypilot apply --url`."""
+    like = f"%{target_url.split('?')[0].rstrip('/')}%"
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs
+        WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+          AND tailored_resume_path IS NOT NULL
+          AND (apply_status IS NULL OR apply_status != 'in_progress')
+        LIMIT 1
+    """, (target_url, target_url, like, like)).fetchone()
+
+
+def _select_queued(conn, queue_batch: str, deferred: set):
+    """Pick the next job from a batch the user selected in the web UI.
+
+    Deliberately applies none of the ranked branch's gates -- not the fit
+    threshold, not the pay floor, not eligibility, not age decay. A human
+    looked at these rows and chose them, so their selection *is* the ranking,
+    and re-filtering it here would silently drop jobs they explicitly picked
+    and leave the batch permanently short of finishing.
+    """
+    params = [queue_batch]
+    skip_clause = ""
+    if deferred:
+        skip_clause = f"AND url NOT IN ({','.join('?' * len(deferred))})"
+        params.extend(sorted(deferred))
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs
+        WHERE queue_batch = ?
+          AND apply_status = 'queued'
+          {skip_clause}
+        ORDER BY queue_position, url
+        LIMIT 1
+    """, params).fetchone()
+
+
+def _select_ranked(conn, min_score: int, skip: set,
+                   blocked_sites: list, blocked_patterns: list):
+    """Pick the highest-ranked job the pipeline thinks is worth applying to."""
+    _settings = config.load_settings()
+    # Build parameterized filters to avoid SQL injection
+    from applypilot.database import fit_gate_sql
+    fit_gate, params = fit_gate_sql(min_score)
+    seen_clause = ""
+    if skip:
+        placeholders = ",".join("?" * len(skip))
+        seen_clause = f"AND url NOT IN ({placeholders})"
+        params.extend(sorted(skip))
+    site_clause = ""
+    if blocked_sites:
+        placeholders = ",".join("?" * len(blocked_sites))
+        site_clause = f"AND site NOT IN ({placeholders})"
+        params.extend(blocked_sites)
+    url_clauses = ""
+    if blocked_patterns:
+        url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
+        params.extend(blocked_patterns)
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs
+        WHERE tailored_resume_path IS NOT NULL
+          AND (apply_status IS NULL OR apply_status = 'failed')
+          -- Pay below the candidate's floor is decided at scoring time
+          -- (free) rather than burning an apply run to discover it.
+          -- NULL/'unknown' still applies: most postings state no pay.
+          AND (pay_below_floor IS NULL OR pay_below_floor != 'yes')
+          -- Hard eligibility (degree level, class year, non-US,
+          -- clearance) decided at scoring time. NULL passes so jobs
+          -- scored before this gate existed aren't silently dropped,
+          -- and 'unclear' passes because a wrong reject costs a real
+          -- opportunity while a wrong accept costs one apply run.
+          AND (eligible IS NULL OR eligible != 'no')
+          AND (apply_attempts IS NULL OR apply_attempts < ?)
+          AND {fit_gate}
+          {seen_clause}
+          {site_clause}
+          {url_clauses}
+        -- Terminal internships -- ones that don't require returning
+        -- to school, functionally a new-grad bridge role -- are rare
+        -- (a few dozen out of thousands) and have already cleared
+        -- every gate above (pay floor, eligibility) by the time we
+        -- get here, so there's no reason to hold one back waiting
+        -- for something hypothetically better: sort on the flag
+        -- FIRST, ahead of the score blend entirely, so one always
+        -- wins when it exists.
+        --
+        -- Below that: rank on a weighted blend of skill match and
+        -- desirability, then decay by age, then a small blanket edge
+        -- for new_grad roles generally -- internships consistently
+        -- outnumber new_grad roles in the high-score tiers here (see
+        -- `applypilot status`), so a plain highest-score-wins order
+        -- would apply to a lot more internships than new-grad roles
+        -- by volume alone, not because they're actually better
+        -- matches. Jobs scored before desirability existed fall back
+        -- to their fit_score so they still order sanely.
+        ORDER BY
+          (CASE WHEN is_terminal_internship = 'yes' THEN 1 ELSE 0 END) DESC,
+          (fit_score * ? + COALESCE(desirability_score, fit_score) * ?)
+          - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ?
+          + (CASE WHEN job_type = 'new_grad' THEN 0.5 ELSE 0 END) DESC,
+          COALESCE(posted_date, discovered_at) DESC,
+          url
+        LIMIT 1
+    """, [config.DEFAULTS["max_apply_attempts"]] + params
+         + [_settings.get("fit_weight", 0.5),
+            _settings.get("desirability_weight", 0.5),
+            config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0,
-                exclude_urls: set[str] | None = None) -> dict | None:
+                exclude_urls: set[str] | None = None,
+                queue_batch: str | None = None) -> dict | None:
     """Atomically acquire the next job to apply to.
 
+    Three ways to choose a row, one way to claim it. The claim is a
+    BEGIN IMMEDIATE transaction that flips apply_status to 'in_progress' and
+    stamps agent_id, which is the only thing keeping parallel workers off each
+    other's jobs.
+
     Args:
-        target_url: Apply to a specific URL instead of picking from queue.
-        min_score: Minimum fit_score threshold.
+        target_url: Apply to a specific URL instead of picking from a queue.
+        min_score: Minimum fit_score threshold. Ranked mode only.
         worker_id: Worker claiming this job (for tracking).
         exclude_urls: URLs already attempted in this session. Needed because a
             dry run deliberately leaves the job's status untouched, so without
             this the same top-scoring job is handed back every iteration.
+        queue_batch: Drain this user-selected batch in the order the user put
+            it in, ignoring the ranked mode's gates entirely.
 
     Returns:
-        Job dict or None if the queue is empty.
+        Job dict, or None if there is nothing left to claim.
     """
     conn = get_connection()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
+    blocked_sites, blocked_patterns = _load_blocked()
 
-        if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path, keywords,
-                       apply_status AS prior_status, applied_at AS prior_applied_at
-                FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status != 'in_progress')
-                LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
-        else:
-            blocked_sites, blocked_patterns = _load_blocked()
-            _settings = config.load_settings()
-            # Build parameterized filters to avoid SQL injection
-            from applypilot.database import fit_gate_sql
-            fit_gate, params = fit_gate_sql(min_score)
-            seen_clause = ""
-            if exclude_urls:
-                placeholders = ",".join("?" * len(exclude_urls))
-                seen_clause = f"AND url NOT IN ({placeholders})"
-                params.extend(sorted(exclude_urls))
-            site_clause = ""
-            if blocked_sites:
-                placeholders = ",".join("?" * len(blocked_sites))
-                site_clause = f"AND site NOT IN ({placeholders})"
-                params.extend(blocked_sites)
-            url_clauses = ""
-            if blocked_patterns:
-                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
-                params.extend(blocked_patterns)
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path, keywords,
-                       apply_status AS prior_status, applied_at AS prior_applied_at
-                FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  -- Pay below the candidate's floor is decided at scoring time
-                  -- (free) rather than burning an apply run to discover it.
-                  -- NULL/'unknown' still applies: most postings state no pay.
-                  AND (pay_below_floor IS NULL OR pay_below_floor != 'yes')
-                  -- Hard eligibility (degree level, class year, non-US,
-                  -- clearance) decided at scoring time. NULL passes so jobs
-                  -- scored before this gate existed aren't silently dropped,
-                  -- and 'unclear' passes because a wrong reject costs a real
-                  -- opportunity while a wrong accept costs one apply run.
-                  AND (eligible IS NULL OR eligible != 'no')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND {fit_gate}
-                  {seen_clause}
-                  {site_clause}
-                  {url_clauses}
-                -- Terminal internships -- ones that don't require returning
-                -- to school, functionally a new-grad bridge role -- are rare
-                -- (a few dozen out of thousands) and have already cleared
-                -- every gate above (pay floor, eligibility) by the time we
-                -- get here, so there's no reason to hold one back waiting
-                -- for something hypothetically better: sort on the flag
-                -- FIRST, ahead of the score blend entirely, so one always
-                -- wins when it exists.
-                --
-                -- Below that: rank on a weighted blend of skill match and
-                -- desirability, then decay by age, then a small blanket edge
-                -- for new_grad roles generally -- internships consistently
-                -- outnumber new_grad roles in the high-score tiers here (see
-                -- `applypilot status`), so a plain highest-score-wins order
-                -- would apply to a lot more internships than new-grad roles
-                -- by volume alone, not because they're actually better
-                -- matches. Jobs scored before desirability existed fall back
-                -- to their fit_score so they still order sanely.
-                ORDER BY
-                  (CASE WHEN is_terminal_internship = 'yes' THEN 1 ELSE 0 END) DESC,
-                  (fit_score * ? + COALESCE(desirability_score, fit_score) * ?)
-                  - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ?
-                  + (CASE WHEN job_type = 'new_grad' THEN 0.5 ELSE 0 END) DESC,
-                  COALESCE(posted_date, discovered_at) DESC,
-                  url
-                LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params
-                 + [_settings.get("fit_weight", 0.5),
-                    _settings.get("desirability_weight", 0.5),
-                    config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
+    # Rows this call has set aside after recording a terminal outcome for them.
+    # They are excluded from the next iteration's SELECT so the loop advances
+    # instead of re-picking the row it just wrote off. Returning None on the
+    # first unusable row -- which is what this used to do for a manual-ATS
+    # site -- reads to worker_loop as "queue empty" and ends the entire run,
+    # so a single unusable row partway down a batch would strand every job
+    # behind it.
+    deferred: set[str] = set()
 
-        if not row:
-            conn.rollback()
-            return None
+    for _ in range(_MAX_DEFERRALS):
+        try:
+            conn.execute("BEGIN IMMEDIATE")
 
-        # Skip manual ATS sites (unsolvable CAPTCHAs)
-        from applypilot.config import is_manual_ats
-        apply_url = row["application_url"] or row["url"]
-        if is_manual_ats(apply_url):
-            conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
-                (row["url"],),
-            )
+            if target_url:
+                row = _select_target(conn, target_url)
+            elif queue_batch:
+                row = _select_queued(conn, queue_batch, deferred)
+            else:
+                row = _select_ranked(conn, min_score,
+                                     set(exclude_urls or ()) | deferred,
+                                     blocked_sites, blocked_patterns)
+
+            if not row:
+                conn.rollback()
+                return None
+
+            apply_url = row["application_url"] or row["url"]
+            now = datetime.now(timezone.utc).isoformat()
+
+            # Two ways a row can turn out unusable once it is in hand. Both get
+            # a terminal status rather than a silent skip, so a user-selected
+            # batch always drains and the dashboard can say why a job never
+            # ran. The ranked branch filters blocked sites in SQL already, so
+            # that check only ever fires for a queued or targeted row.
+            from applypilot.config import is_manual_ats
+            if is_manual_ats(apply_url):
+                outcome = ("manual", "manual ATS")
+            elif _is_blocked(row["site"], row["url"],
+                             blocked_sites, blocked_patterns):
+                outcome = ("failed", "site_blocked")
+            else:
+                outcome = None
+
+            if outcome:
+                status, reason = outcome
+                conn.execute(
+                    "UPDATE jobs SET apply_status = ?, apply_error = ?, "
+                    "agent_id = NULL, last_attempted_at = ? WHERE url = ?",
+                    (status, reason, now, row["url"]),
+                )
+                conn.commit()
+                logger.info("Skipping %s (%s): %s", reason, status, row["url"][:80])
+                if target_url:
+                    # An explicit --url asked for this one row and it is not
+                    # applyable. Falling through would re-select it forever.
+                    return None
+                deferred.add(row["url"])
+                continue
+
+            conn.execute("""
+                UPDATE jobs SET apply_status = 'in_progress',
+                               agent_id = ?,
+                               last_attempted_at = ?
+                WHERE url = ?
+            """, (f"worker-{worker_id}", now, row["url"]))
             conn.commit()
-            logger.info("Skipping manual ATS: %s", row["url"][:80])
-            return None
 
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("""
-            UPDATE jobs SET apply_status = 'in_progress',
-                           agent_id = ?,
-                           last_attempted_at = ?
-            WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
-        conn.commit()
+            return dict(row)
+        except Exception:
+            conn.rollback()
+            raise
 
-        return dict(row)
-    except Exception:
-        conn.rollback()
-        raise
+    logger.warning("Gave up after %d unusable rows in a row (worker %d).",
+                   _MAX_DEFERRALS, worker_id)
+    return None
 
 
 def _flip_grad_year(variant: str) -> str | None:
@@ -502,7 +616,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 min_score: int = 7, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
                 backend: str = "goose",
-                fallback_backend: str | None = None) -> tuple[int, int]:
+                fallback_backend: str | None = None,
+                queue_batch: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -516,6 +631,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         backend: Primary apply backend name -- 'goose' or 'claude'.
         fallback_backend: Backend to retry a job on when the primary one gives
             up for a driver-side reason. None disables the retry.
+        queue_batch: Drain this user-selected batch instead of the ranked
+            queue. See acquire_job.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -536,7 +653,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id, exclude_urls=attempted)
+                          worker_id=worker_id, exclude_urls=attempted,
+                          queue_batch=queue_batch)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -666,7 +784,8 @@ def main(limit: int = 1, target_url: str | None = None,
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          backend: str = "goose",
-         fallback_backend: str | None = None) -> None:
+         fallback_backend: str | None = None,
+         queue_batch: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -683,10 +802,18 @@ def main(limit: int = 1, target_url: str | None = None,
             OpenRouter model) or 'claude' (Claude Code CLI).
         fallback_backend: Backend to retry a job on when the primary one gives
             up for a driver-side reason. None disables the retry.
+        queue_batch: Apply only to the jobs the user selected under this batch
+            id, in the order they were selected. Set by the web UI; ignores
+            min_score and every other ranked-queue gate.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
+
+    # Mirror live progress to disk only when something is watching. A plain
+    # terminal run writes no file and behaves exactly as it always has.
+    if queue_batch:
+        begin_run(batch=queue_batch, backend=backend, dry_run=dry_run)
 
     config.ensure_dirs()
     console = Console()
@@ -775,6 +902,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     backend=backend,
                     fallback_backend=fallback_backend,
+                    queue_batch=queue_batch,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -799,7 +927,8 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             backend=backend,
-                    fallback_backend=fallback_backend,
+                            fallback_backend=fallback_backend,
+                            queue_batch=queue_batch,
                         ): i
                         for i in range(workers)
                     }
@@ -832,3 +961,7 @@ def main(limit: int = 1, target_url: str | None = None,
     finally:
         _stop_event.set()
         kill_all_chrome()
+        # Stamp the run finished however it ended -- completed, Ctrl+C, or an
+        # exception on the way out. A watcher that only ever saw "running"
+        # cannot tell a crash from a long job.
+        end_run()

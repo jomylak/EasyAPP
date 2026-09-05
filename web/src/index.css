@@ -1,0 +1,892 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------
+ * Design tokens, ported from the approved mock
+ * (`day-table.html`, milestone 0). The app is always dark -- it depicts
+ * a dark product, not a document that follows the OS theme.
+ * ------------------------------------------------------------------- */
+:root {
+  --a-ground: #0d1014;
+  --a-surface: #151a20;
+  --a-raised: #1b222a;
+  --a-hover: #1f2831;
+  --a-line: #262f39;
+  --a-line-soft: #1c232b;
+  --a-text: #e6eaef;
+  --a-text-2: #9aa5b1;
+  --a-text-3: #6c7783;
+  --a-sel: #4b90d0;
+  --a-sel-bg: #132131;
+  --a-good: #3f9d6b;
+  --a-bad: #cc5b52;
+  /* Reuses the prestige ramp's warm high end rather than inventing a new hue
+     -- "in progress"/"queued" is a waiting state, not a third judgment
+     alongside good/bad, so it borrows an existing accent instead of adding
+     one to the palette. */
+  --a-warn: #e6b268;
+  /* fit = cool, prestige = warm -- different temperatures for different
+     questions, so a glance down the two columns tells its own story. */
+  --fit-lo: #31465c;
+  --fit-hi: #7fbce8;
+  --pre-lo: #4a3a22;
+  --pre-hi: #e6b268;
+
+  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--a-ground);
+  color: var(--a-text);
+  font-family: var(--sans);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  font-family: var(--sans);
+  color: var(--a-text);
+  min-height: 100vh;
+  overflow-x: auto;
+}
+
+/* ---- app bar ----------------------------------------------------------- */
+.app-bar {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding: 0 16px;
+  height: 44px;
+  border-bottom: 1px solid var(--a-line);
+  background: var(--a-surface);
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+.brand {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--a-text);
+  padding-right: 6px;
+}
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+}
+.tab {
+  font-size: 13px;
+  color: var(--a-text-3);
+  padding: 5px 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-family: inherit;
+}
+.tab:hover {
+  color: var(--a-text-2);
+  background: var(--a-hover);
+}
+.tab.on {
+  color: var(--a-text);
+  background: var(--a-raised);
+}
+.launch {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.selcount {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-2);
+}
+.cost {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-3);
+}
+.cost b {
+  color: var(--a-text);
+  font-weight: 500;
+}
+.btn {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 5px 13px;
+  border: 1px solid var(--a-sel);
+  background: var(--a-sel);
+  color: #06121d;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.btn:disabled {
+  background: transparent;
+  color: var(--a-text-3);
+  border-color: var(--a-line);
+  cursor: not-allowed;
+}
+
+/* ---- global filter bar -------------------------------------------------- */
+.gfilter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--a-line);
+  background: var(--a-ground);
+  flex-wrap: wrap;
+}
+.gfilter .lbl {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+  margin-right: 2px;
+}
+.pill {
+  font-size: 12px;
+  color: var(--a-text-2);
+  padding: 3px 9px;
+  border: 1px solid var(--a-line);
+  border-radius: 3px;
+  background: var(--a-surface);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pill.on {
+  border-color: var(--a-sel);
+  color: #a9d0f0;
+  background: var(--a-sel-bg);
+}
+.pill.static {
+  cursor: default;
+}
+
+/* ---- windowed layout: buffer on both sides, like a centered card view ---- */
+.daylist {
+  padding: 22px clamp(16px, 5vw, 64px) 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.day-panel {
+  border: 1px solid var(--a-line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--a-ground);
+}
+
+/* ---- cross-day "don't miss this" panels, above the per-day list --------- */
+.attention-section {
+  padding: 20px clamp(16px, 5vw, 64px) 4px;
+}
+.attention-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.attention-grid {
+  display: grid;
+  /* Side by side when there's room for two real tables, stacked otherwise --
+     the same breakpoint decides itself rather than a fixed media query. */
+  grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+  gap: 18px;
+}
+/* These panels run about half the width of a day table, so the same
+   percentage widths leave Pay too narrow to read -- give it more of the
+   narrower container, taken from Location. */
+.attention-grid thead th.col-location { width: 11%; }
+.attention-grid thead th.col-pay { width: 20%; }
+
+/* ---- day divider --------------------------------------------------------- */
+.dayhead {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 16px 9px;
+  background: var(--a-ground);
+  flex-wrap: wrap;
+}
+.dayname {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--a-text);
+}
+.daycount {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-3);
+}
+.chips {
+  display: flex;
+  gap: 5px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.chip {
+  font-size: 11.5px;
+  font-family: var(--sans);
+  color: var(--a-text-2);
+  padding: 3px 10px;
+  border: 1px solid var(--a-line);
+  background: var(--a-surface);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.chip:hover {
+  border-color: var(--a-text-3);
+  color: var(--a-text);
+}
+.chip.on {
+  background: var(--a-sel-bg);
+  border-color: var(--a-sel);
+  color: #a9d0f0;
+}
+.chip .c {
+  font-family: var(--mono);
+  opacity: 0.65;
+  margin-left: 5px;
+}
+
+/* ---- table --------------------------------------------------------------- */
+/* Each day is its own scroll region -- the box grows with its row count up to
+   a cap (set inline per day from row count), then this scrolls instead of the
+   page growing. That keeps the day panel a fixed "window" you scroll inside,
+   with the page-level scroll (through the side buffer) moving between days. */
+.tablewrap {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.tablewrap::-webkit-scrollbar {
+  width: 8px;
+}
+.tablewrap::-webkit-scrollbar-thumb {
+  background: var(--a-line);
+  border-radius: 4px;
+}
+.tablewrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+  /* Fixed layout, with every column width declared below. Auto layout sizes
+     columns to their content, and real company names run long -- "IBM (IBM
+     Consulting FutureNow Center / Technology & Red Hat practice)" -- so with
+     `white-space: nowrap` the Company column expands to fit the longest name
+     on the page, crushing Title to an ellipsis and pushing the score columns
+     off the right edge. Column widths must not depend on which rows happen to
+     be showing. */
+  table-layout: fixed;
+}
+thead th.col-idx { width: 38px; }
+thead th.col-company { width: 22%; }
+thead th.col-title { width: 33%; }
+thead th.col-location { width: 16%; }
+thead th.col-pay { width: 13%; }
+thead th.col-prestige,
+thead th.col-fit,
+thead th.col-desirability { width: 52px; }
+/* Applications table's own columns (DayTable's company/title/idx widths are
+   shared as-is above). */
+thead th.col-status { width: 110px; }
+thead th.col-cost { width: 70px; }
+thead th.col-backend { width: 90px; }
+thead th.col-when { width: 130px; }
+thead th.col-action { width: 90px; }
+thead th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--a-line);
+  border-top: 1px solid var(--a-line);
+  background: var(--a-surface);
+  white-space: nowrap;
+}
+thead th.num {
+  text-align: right;
+}
+thead th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+thead th.sortable:hover {
+  color: var(--a-text-2);
+}
+tbody td {
+  padding: 0 10px;
+  height: 34px;
+  border-bottom: 1px solid var(--a-line-soft);
+  vertical-align: middle;
+  color: var(--a-text-2);
+}
+tbody tr.row {
+  cursor: pointer;
+}
+tbody tr.row:hover td {
+  background: var(--a-hover);
+}
+tbody tr.row.sel td {
+  background: var(--a-sel-bg);
+}
+/* Company and Title both truncate: under a fixed layout either one can
+   overflow its track, and clipped text with no ellipsis reads as a bug. */
+tbody td.co {
+  color: var(--a-text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+td.ti {
+  color: var(--a-text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+td.loc,
+td.pay {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+td.pay {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+td.num {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  width: 44px;
+}
+.cbcell {
+  width: 30px;
+  padding-left: 14px;
+}
+/* Running position within this day's own sorted/filtered list -- a landmark
+   for how far you've scrolled and how many are left, not a data column. */
+td.idx {
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  font-variant-numeric: tabular-nums;
+  padding-right: 12px;
+}
+input[type="checkbox"] {
+  accent-color: var(--a-sel);
+  width: 13px;
+  height: 13px;
+  cursor: pointer;
+  margin: 0;
+  display: block;
+}
+.tag {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border: 1px solid var(--a-line);
+  color: var(--a-text-3);
+  border-radius: 2px;
+}
+
+/* ---- numeric filters -- a threshold you type, not a fixed bucket -------- */
+.numf {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--a-text-3);
+  border: 1px solid var(--a-line);
+  background: var(--a-surface);
+  border-radius: 3px;
+  padding: 2px 7px;
+}
+.numf label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.numf input {
+  width: 40px;
+  /* Room for the native spinner so it doesn't sit flush against the digit --
+     the browser draws the spin buttons inside the input's own box, so this
+     has to be padding on the input, not a gap on the wrapper. */
+  padding: 0 5px 0 0;
+  background: transparent;
+  border: none;
+  color: var(--a-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.numf input::-webkit-inner-spin-button,
+.numf input::-webkit-outer-spin-button {
+  margin-left: 6px;
+}
+.numf input:focus {
+  outline: none;
+  color: var(--a-sel);
+}
+.numf.active {
+  border-color: var(--a-sel);
+  background: var(--a-sel-bg);
+}
+.numf.active label {
+  color: #a9d0f0;
+}
+.numf .unit {
+  font-family: var(--mono);
+  font-size: 10px;
+  opacity: 0.6;
+}
+.srch {
+  background: var(--a-surface);
+  border: 1px solid var(--a-line);
+  border-radius: 3px;
+  color: var(--a-text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 3px 9px;
+  width: 150px;
+}
+.srch:focus {
+  outline: none;
+  border-color: var(--a-sel);
+}
+.srch::placeholder {
+  color: var(--a-text-3);
+}
+.select-field {
+  background: var(--a-surface);
+  border: 1px solid var(--a-line);
+  border-radius: 3px;
+  color: var(--a-text-2);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 3px 7px;
+}
+
+/* ---- expansion -- animates open and shut rather than snapping ---------- */
+/* `tbody td` sets height:34px for the data rows; without overriding it here
+   a collapsed expansion still reserves a full row and reads as a dark band
+   between every job. */
+tr.exp > td {
+  padding: 0;
+  height: 0;
+  border-bottom: none;
+  background: var(--a-surface);
+}
+tr.exp .slide {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+tr.exp.open .slide {
+  grid-template-rows: 1fr;
+}
+tr.exp .slide > div {
+  overflow: hidden;
+  min-height: 0;
+}
+tr.exp.open > td {
+  border-bottom: 1px solid var(--a-line);
+}
+@media (prefers-reduced-motion: reduce) {
+  tr.exp .slide {
+    transition: none;
+  }
+}
+.expbox {
+  padding: 16px 18px 20px 54px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 26px;
+}
+@media (max-width: 720px) {
+  .expbox {
+    grid-template-columns: 1fr;
+    padding-left: 20px;
+  }
+}
+.jd {
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--a-text-2);
+  max-height: 200px;
+  overflow-y: auto;
+  padding-right: 12px;
+  border-left: 2px solid var(--a-line);
+  padding-left: 14px;
+  /* the table is deliberately wide; running prose is not */
+  max-width: 78ch;
+  white-space: pre-wrap;
+}
+.jd::-webkit-scrollbar {
+  width: 7px;
+}
+.jd::-webkit-scrollbar-thumb {
+  background: var(--a-line);
+  border-radius: 4px;
+}
+.reason {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--a-text-3);
+  border-left: 2px solid var(--a-sel);
+  padding-left: 14px;
+  margin: 0;
+  max-width: 78ch;
+  white-space: pre-wrap;
+}
+.expbox h4 {
+  margin: 0 0 7px;
+  font-size: 12px;
+  font-family: var(--mono);
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+  font-weight: 500;
+}
+.expbox p {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--a-text-2);
+  max-width: none;
+}
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 5px 14px;
+  font-size: 12px;
+}
+.kv dt {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+  padding-top: 2px;
+}
+.kv dd {
+  margin: 0;
+  color: var(--a-text-2);
+}
+.kw {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+/* ---- footer -------------------------------------------------------------- */
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--a-line);
+  background: var(--a-surface);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  flex-wrap: wrap;
+}
+.grip {
+  height: 9px;
+  background: var(--a-surface);
+  border-top: 1px solid var(--a-line);
+  cursor: ns-resize;
+  position: relative;
+}
+.grip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 3px;
+  width: 34px;
+  height: 2px;
+  margin-left: -17px;
+  border-top: 1px solid var(--a-text-3);
+  border-bottom: 1px solid var(--a-text-3);
+  opacity: 0.42;
+}
+
+/* ---- dashboard tab -------------------------------------------------------- */
+.dash {
+  padding: 22px clamp(16px, 5vw, 64px) 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+.dash-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+.donut-row {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  padding: 16px;
+}
+.tile {
+  border: 1px solid var(--a-line);
+  border-radius: 8px;
+  background: var(--a-ground);
+  padding: 14px 16px;
+}
+.tile .tile-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+}
+.tile .tile-value {
+  font-family: var(--mono);
+  font-size: 26px;
+  font-weight: 600;
+  margin-top: 6px;
+  color: var(--a-text);
+  font-variant-numeric: tabular-nums;
+}
+.tile .tile-value.good { color: var(--a-good); }
+.tile .tile-value.bad { color: var(--a-bad); }
+.tile .tile-value.warn { color: var(--a-warn); }
+.tile .tile-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--a-text-3);
+}
+
+.runpanel {
+  border: 1px solid var(--a-line);
+  border-radius: 8px;
+  background: var(--a-ground);
+  overflow: hidden;
+}
+.runpanel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--a-surface);
+  border-bottom: 1px solid var(--a-line);
+}
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--a-text-3);
+  flex-shrink: 0;
+}
+.live-dot.on {
+  background: var(--a-good);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--a-good) 25%, transparent);
+}
+.runpanel-empty {
+  padding: 16px;
+  color: var(--a-text-3);
+  font-size: 13px;
+}
+.worker-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--a-line-soft);
+  font-size: 12.5px;
+}
+.worker-row:last-child { border-bottom: none; }
+.worker-id {
+  font-family: var(--mono);
+  color: var(--a-text-3);
+  width: 22px;
+}
+.worker-status {
+  width: 90px;
+  flex-shrink: 0;
+}
+.worker-job {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-text-2);
+}
+.worker-last {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--a-text-3);
+  font-size: 11.5px;
+}
+
+/* Status badges -- reused by both the live worker rows and the applications
+   table, so a status reads the same color everywhere it appears. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--a-line);
+  color: var(--a-text-2);
+  white-space: nowrap;
+}
+.badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.badge.applied { color: var(--a-good); border-color: color-mix(in srgb, var(--a-good) 40%, var(--a-line)); }
+.badge.failed { color: var(--a-bad); border-color: color-mix(in srgb, var(--a-bad) 40%, var(--a-line)); }
+.badge.queued,
+.badge.in_progress { color: var(--a-warn); border-color: color-mix(in srgb, var(--a-warn) 40%, var(--a-line)); }
+.badge.manual { color: var(--a-text-3); }
+
+.rowbtn {
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border: 1px solid var(--a-line);
+  background: var(--a-surface);
+  color: var(--a-text-2);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.rowbtn:hover { border-color: var(--a-text-3); color: var(--a-text); }
+.rowbtn:disabled { opacity: 0.4; cursor: not-allowed; }
+.rowbtn.danger:hover { border-color: var(--a-bad); color: var(--a-bad); }
+
+.ats-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(80px, 2fr) 40px 56px 90px;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--a-line-soft);
+  font-size: 12.5px;
+}
+.ats-row:last-child { border-bottom: none; }
+.ats-name {
+  color: var(--a-text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ats-backend {
+  color: var(--a-text-3);
+  font-weight: 400;
+}
+.ats-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--a-line-soft);
+  overflow: hidden;
+}
+.ats-bar-fill {
+  height: 100%;
+  background: var(--a-good);
+  border-radius: 3px;
+}
+.ats-pct {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-2);
+  text-align: right;
+}
+.ats-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  text-align: right;
+}
+.ats-cost {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  text-align: right;
+}
+
+.placeholder-tab {
+  padding: 60px 40px;
+  color: var(--a-text-2);
+  font-family: var(--sans);
+  max-width: 60ch;
+}
+.placeholder-tab h2 {
+  font-family: var(--sans);
+  color: var(--a-text);
+  font-size: 20px;
+  margin: 0 0 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+:focus-visible {
+  outline: 2px solid var(--a-sel);
+  outline-offset: 2px;
+}

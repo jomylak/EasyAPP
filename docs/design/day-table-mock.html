@@ -1,0 +1,740 @@
+<title>The Day Table</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+/* ---- tokens: document chrome (theme-aware) ---------------------------- */
+:root{
+  --bg:#f7f8f9; --panel:#ffffff; --line:#dde1e6; --line-soft:#e8ebee;
+  --ink:#14181d; --ink-2:#4a5560; --ink-3:#78838f;
+  --accent:#2f6fae; --accent-soft:#e4eef7;
+  --good:#2f7d55; --bad:#a8443c; --warm:#9a6a1f;
+  --serif:"IBM Plex Serif",Georgia,"Times New Roman",serif;
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --maxw:1080px;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0d1014; --panel:#151a20; --line:#28313b; --line-soft:#1e252d;
+    --ink:#e6eaef; --ink-2:#a3aeba; --ink-3:#79848f;
+    --accent:#6aa5dd; --accent-soft:#17222e;
+    --good:#4fa878; --bad:#d1685f; --warm:#d1a054;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0d1014; --panel:#151a20; --line:#28313b; --line-soft:#1e252d;
+  --ink:#e6eaef; --ink-2:#a3aeba; --ink-3:#79848f;
+  --accent:#6aa5dd; --accent-soft:#17222e;
+  --good:#4fa878; --bad:#d1685f; --warm:#d1a054;
+}
+
+/* ---- tokens: the product mock (always dark -- it depicts a dark app) --- */
+.app{
+  --a-ground:#0d1014; --a-surface:#151a20; --a-raised:#1b222a; --a-hover:#1f2831;
+  --a-line:#262f39; --a-line-soft:#1c232b;
+  --a-text:#e6eaef; --a-text-2:#9aa5b1; --a-text-3:#6c7783;
+  --a-sel:#4b90d0; --a-sel-bg:#132131;
+  --a-good:#3f9d6b; --a-bad:#cc5b52;
+  /* fit = cool, prestige = warm. the two scores mean different things,
+     so they are encoded in different temperatures. */
+  --fit-lo:#31465c; --fit-hi:#7fbce8;
+  --pre-lo:#4a3a22; --pre-hi:#e6b268;
+}
+
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+  font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+
+/* ---- masthead --------------------------------------------------------- */
+header.mast{border-bottom:1px solid var(--line);padding:56px 0 30px;margin-bottom:44px}
+.eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);margin:0 0 18px}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(34px,5.4vw,54px);
+  line-height:1.06;letter-spacing:-.02em;margin:0 0 18px;text-wrap:balance}
+.dek{font-family:var(--serif);font-size:19px;line-height:1.55;color:var(--ink-2);
+  max-width:60ch;margin:0;font-style:italic}
+.meta{display:flex;flex-wrap:wrap;gap:22px;margin-top:26px;
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+.meta b{color:var(--ink-2);font-weight:500}
+
+section{margin-bottom:56px}
+h2{font-family:var(--serif);font-size:27px;font-weight:600;letter-spacing:-.012em;
+  margin:0 0 6px;text-wrap:balance}
+h3{font-family:var(--sans);font-size:13px;font-weight:600;letter-spacing:.04em;
+  text-transform:uppercase;color:var(--ink-3);margin:34px 0 12px}
+.lede{color:var(--ink-2);max-width:66ch;margin:0 0 26px}
+p{max-width:66ch}
+a{color:var(--accent)}
+
+/* ---- the scale figures ------------------------------------------------ */
+.scale{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:1px;background:var(--line);border:1px solid var(--line);margin:26px 0}
+.scale div{background:var(--panel);padding:18px 20px}
+.scale .n{font-family:var(--mono);font-size:29px;font-weight:500;
+  letter-spacing:-.02em;display:block;line-height:1.1}
+.scale .l{font-size:12px;color:var(--ink-3);margin-top:6px;display:block;line-height:1.4}
+
+/* ---- reference strip -------------------------------------------------- */
+.refs{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:8px}
+@media(max-width:760px){.refs{grid-template-columns:1fr}}
+figure{margin:0;border:1px solid var(--line);background:var(--panel);
+  display:flex;flex-direction:column}
+figure img{display:block;width:100%;height:auto;border-bottom:1px solid var(--line)}
+figcaption{padding:14px 16px;font-size:13.5px;color:var(--ink-2);flex:1}
+figcaption > b:first-child{display:block;font-family:var(--mono);font-size:11px;
+  letter-spacing:.09em;text-transform:uppercase;color:var(--ink);margin-bottom:5px;
+  font-weight:600}
+figcaption b{color:var(--ink);font-weight:600}
+.verdict{display:inline-block;font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.07em;text-transform:uppercase;padding:2px 7px;margin-top:9px;
+  border:1px solid currentColor}
+.v-take{color:var(--good)} .v-leave{color:var(--bad)} .v-part{color:var(--warm)}
+
+/* ---- the mock --------------------------------------------------------- */
+.bleed{background:var(--a-ground);border:1px solid var(--line);margin:30px 0;
+  width:min(1340px,calc(100vw - 40px));margin-left:50%;transform:translateX(-50%)}
+.app{font-family:var(--sans);color:var(--a-text);overflow-x:auto}
+.app-bar{display:flex;align-items:center;gap:22px;padding:0 16px;height:44px;
+  border-bottom:1px solid var(--a-line);background:var(--a-surface)}
+.brand{font-family:var(--mono);font-size:12.5px;font-weight:600;letter-spacing:-.01em;
+  color:var(--a-text);padding-right:6px}
+.tabs{display:flex;gap:2px;flex:1}
+.tab{font-size:13px;color:var(--a-text-3);padding:5px 11px;border-radius:3px;
+  cursor:pointer;border:none;background:none;font-family:inherit}
+.tab:hover{color:var(--a-text-2);background:var(--a-hover)}
+.tab.on{color:var(--a-text);background:var(--a-raised)}
+.launch{display:flex;align-items:center;gap:12px}
+.selcount{font-family:var(--mono);font-size:11.5px;color:var(--a-text-2)}
+.cost{font-family:var(--mono);font-size:11.5px;color:var(--a-text-3)}
+.cost b{color:var(--a-text);font-weight:500}
+.btn{font-family:var(--sans);font-size:12.5px;font-weight:600;padding:5px 13px;
+  border:1px solid var(--a-sel);background:var(--a-sel);color:#06121d;
+  border-radius:3px;cursor:pointer}
+.btn:disabled{background:transparent;color:var(--a-text-3);
+  border-color:var(--a-line);cursor:not-allowed}
+
+.gfilter{display:flex;align-items:center;gap:8px;padding:9px 16px;
+  border-bottom:1px solid var(--a-line);background:var(--a-ground);flex-wrap:wrap}
+.gfilter .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--a-text-3);margin-right:2px}
+.pill{font-size:12px;color:var(--a-text-2);padding:3px 9px;border:1px solid var(--a-line);
+  border-radius:3px;background:var(--a-surface);white-space:nowrap}
+
+/* day divider */
+.dayhead{display:flex;align-items:center;gap:14px;padding:16px 16px 9px;
+  background:var(--a-ground);flex-wrap:wrap}
+.dayname{font-family:var(--mono);font-size:12.5px;font-weight:600;letter-spacing:.02em;
+  color:var(--a-text)}
+.daycount{font-family:var(--mono);font-size:11.5px;color:var(--a-text-3)}
+.chips{display:flex;gap:5px;margin-left:auto;flex-wrap:wrap}
+.chip{font-size:11.5px;font-family:var(--sans);color:var(--a-text-2);padding:3px 10px;
+  border:1px solid var(--a-line);background:var(--a-surface);border-radius:3px;
+  cursor:pointer}
+.chip:hover{border-color:var(--a-text-3);color:var(--a-text)}
+.chip.on{background:var(--a-sel-bg);border-color:var(--a-sel);color:#a9d0f0}
+.chip .c{font-family:var(--mono);opacity:.65;margin-left:5px}
+
+table{border-collapse:collapse;width:100%;font-size:13px}
+thead th{text-align:left;font-weight:500;font-size:11px;letter-spacing:.075em;
+  text-transform:uppercase;color:var(--a-text-3);padding:7px 10px;
+  border-bottom:1px solid var(--a-line);border-top:1px solid var(--a-line);
+  background:var(--a-surface);white-space:nowrap;position:sticky;top:0}
+thead th.num{text-align:right}
+tbody td{padding:0 10px;height:34px;border-bottom:1px solid var(--a-line-soft);
+  vertical-align:middle;color:var(--a-text-2)}
+tbody tr.row{cursor:pointer}
+tbody tr.row:hover td{background:var(--a-hover)}
+tbody tr.row.sel td{background:var(--a-sel-bg)}
+.app tbody td.co{color:var(--a-text);font-weight:600;white-space:nowrap}
+td.ti{color:var(--a-text-2);max-width:1px;width:38%;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+td.loc,td.pay{font-size:12.5px;white-space:nowrap}
+td.pay{font-family:var(--mono);font-size:11.5px;font-variant-numeric:tabular-nums}
+td.num{text-align:right;font-family:var(--mono);font-size:12px;
+  font-variant-numeric:tabular-nums;width:44px}
+.cbcell{width:30px;padding-left:14px}
+input[type=checkbox]{accent-color:var(--a-sel);width:13px;height:13px;
+  cursor:pointer;margin:0;display:block}
+.tag{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;
+  padding:1px 5px;border:1px solid var(--a-line);color:var(--a-text-3);border-radius:2px}
+
+/* numeric filters -- a threshold you type, not a fixed bucket */
+.numf{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;
+  color:var(--a-text-3);border:1px solid var(--a-line);background:var(--a-surface);
+  border-radius:3px;padding:2px 7px}
+.numf label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;cursor:pointer}
+.numf input{width:34px;background:transparent;border:none;color:var(--a-text);
+  font-family:var(--mono);font-size:12px;font-variant-numeric:tabular-nums;
+  padding:0;text-align:right}
+.numf input:focus{outline:none;color:var(--a-sel)}
+.numf.active{border-color:var(--a-sel);background:var(--a-sel-bg)}
+.numf.active label{color:#a9d0f0}
+.numf .unit{font-family:var(--mono);font-size:10px;opacity:.6}
+.srch{background:var(--a-surface);border:1px solid var(--a-line);border-radius:3px;
+  color:var(--a-text);font-family:var(--sans);font-size:12px;padding:3px 9px;width:150px}
+.srch:focus{outline:none;border-color:var(--a-sel)}
+.srch::placeholder{color:var(--a-text-3)}
+
+/* expansion -- animates open and shut rather than snapping */
+/* `tbody td` sets height:34px for the data rows; without overriding it here
+   a collapsed expansion still reserves a full row and reads as a dark band
+   between every job. */
+tr.exp > td{padding:0;height:0;border-bottom:none;background:var(--a-surface)}
+tr.exp .slide{display:grid;grid-template-rows:0fr;
+  transition:grid-template-rows .22s cubic-bezier(.4,0,.2,1)}
+tr.exp.open .slide{grid-template-rows:1fr}
+tr.exp .slide > div{overflow:hidden;min-height:0}
+tr.exp.open > td{border-bottom:1px solid var(--a-line)}
+@media(prefers-reduced-motion:reduce){tr.exp .slide{transition:none}}
+.expbox{padding:16px 18px 20px 54px;display:grid;
+  grid-template-columns:minmax(0,1fr) 220px;gap:26px}
+@media(max-width:720px){.expbox{grid-template-columns:1fr;padding-left:20px}}
+.jd{font-size:12.5px;line-height:1.65;color:var(--a-text-2);
+  max-height:200px;overflow-y:auto;padding-right:12px;
+  border-left:2px solid var(--a-line);padding-left:14px;
+  /* the table is deliberately wide; running prose is not */
+  max-width:78ch}
+.jd::-webkit-scrollbar{width:7px}
+.jd::-webkit-scrollbar-thumb{background:var(--a-line);border-radius:4px}
+.reason{font-size:12.5px;line-height:1.6;color:var(--a-text-3);
+  border-left:2px solid var(--a-sel);padding-left:14px;margin:0;max-width:78ch}
+.expbox h4{margin:0 0 7px;font-size:12px;font-family:var(--mono);letter-spacing:.09em;
+  text-transform:uppercase;color:var(--a-text-3);font-weight:500}
+.expbox p{margin:0 0 14px;font-size:13px;line-height:1.62;color:var(--a-text-2);max-width:none}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12px}
+.kv dt{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--a-text-3);padding-top:2px}
+.kv dd{margin:0;color:var(--a-text-2)}
+.kw{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+
+.foot{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:9px 16px;border-top:1px solid var(--a-line);background:var(--a-surface);
+  font-family:var(--mono);font-size:11px;color:var(--a-text-3);flex-wrap:wrap}
+.pager{display:flex;gap:5px;align-items:center}
+.pg{border:1px solid var(--a-line);background:var(--a-ground);color:var(--a-text-2);
+  font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:3px;cursor:pointer}
+.grip{height:9px;background:var(--a-surface);border-top:1px solid var(--a-line);
+  cursor:ns-resize;position:relative}
+.grip::after{content:"";position:absolute;left:50%;top:3px;width:34px;height:2px;
+  margin-left:-17px;border-top:1px solid var(--a-text-3);border-bottom:1px solid var(--a-text-3);
+  opacity:.42}
+
+.caption{font-family:var(--mono);font-size:11px;color:var(--ink-3);
+  margin-top:10px;line-height:1.5;max-width:70ch}
+
+/* ---- spec table ------------------------------------------------------- */
+.spec{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:8px}
+.spec th{text-align:left;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--ink-3);font-weight:500;padding:8px 12px;
+  border-bottom:1px solid var(--line)}
+.spec td{padding:10px 12px;border-bottom:1px solid var(--line-soft);
+  vertical-align:top;color:var(--ink-2)}
+.spec td:first-child{color:var(--ink);font-weight:500;white-space:nowrap}
+.spec code,code{font-family:var(--mono);font-size:12px;background:var(--accent-soft);
+  padding:1px 5px;border-radius:2px;color:var(--ink)}
+.swatches{display:flex;flex-wrap:wrap;gap:0;margin:8px 0 0;border:1px solid var(--line)}
+.sw{flex:1 1 96px;min-width:96px;padding:14px 10px 10px;
+  font-family:var(--mono);font-size:9.5px;line-height:1.5;
+  border-right:1px solid rgba(128,128,128,.22)}
+.sw:last-child{border-right:none}
+.sw span{display:block;opacity:.72}
+
+.ask{border:1px solid var(--line);border-left:3px solid var(--accent);
+  background:var(--panel);padding:20px 22px;margin-top:8px}
+.ask h3{margin-top:0}
+.ask ol{margin:0;padding-left:20px}
+.ask li{margin-bottom:11px;color:var(--ink-2);max-width:64ch}
+.ask li b{color:var(--ink)}
+
+footer{border-top:1px solid var(--line);padding:26px 0 60px;margin-top:20px;
+  font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+
+<div class="wrap">
+<header class="mast">
+  <p class="eyebrow">ApplyPilot &middot; frontend direction</p>
+  <h1>The Day&nbsp;Table</h1>
+  <p class="dek">Four hundred postings land every day. The interface has one job:
+     let a person walk a day, pick the ten worth paying for, and never open a
+     second page to decide.</p>
+  <div class="meta">
+    <span><b>Stack</b> React &middot; Vite &middot; Tailwind &middot; TanStack Table</span>
+    <span><b>Milestone</b> 0 &mdash; direction</span>
+    <span><b>Data below</b> live, from applypilot.db</span>
+  </div>
+</header>
+
+<section>
+  <h2>What the numbers actually say</h2>
+  <p class="lede">Straight from the database this morning. This is why the current
+    &ldquo;score everything, apply to the top of the queue&rdquo; model breaks.</p>
+  <div class="scale">
+    <div><span class="n">408</span><span class="l">postings on Sep&nbsp;3 alone</span></div>
+    <div><span class="n">676</span><span class="l">on Sep&nbsp;2 &mdash; the busiest day</span></div>
+    <div><span class="n">65</span><span class="l">of Sep&nbsp;3 clear desirability&nbsp;&ge;6 <em>and</em> fit&nbsp;&ge;8</span></div>
+    <div><span class="n">413</span><span class="l">jobs at prestige&nbsp;10 across the DB</span></div>
+    <div><span class="n">$1.16</span><span class="l">measured cost per Claude application</span></div>
+  </div>
+  <p>Sixty-five strong matches in one day is still too many to apply to, but it is
+    a completely reasonable number to <em>read</em>. That gap &mdash; between what a
+    filter can narrow to and what a person can judge &mdash; is the whole design
+    problem, and it is why every day gets its own table rather than one global list
+    with a date column.</p>
+</section>
+
+<section>
+  <h2>References</h2>
+  <p class="lede">Captured this morning. What each one gets right, and what it costs us.</p>
+<p class="caption" style="margin-top:18px"><b>Note:</b> the four reference
+    screenshots (Intern-list, shadcn/ui, Linear) were removed when this file was
+    committed &mdash; they were competitor captures supporting a decision that has
+    since been made. The working mock below is the part that matters: it is the
+    build spec for <code>web/src/</code>.</p>
+  <div class="refs">
+    <figure>
+      <img src="" data-note="reference screenshot removed to keep this file small" alt="Intern-list.com job table: numbered rows, Apply buttons, cut-off columns requiring horizontal scroll">
+      <figcaption><b>Intern-list &middot; the baseline</b>
+        Right instincts: pure density, pay and company visible at a glance, no chrome.
+        But 3,540 records in one flat list, columns cut off behind a horizontal
+        scrollbar, and every decision requires leaving for Jobright.
+        <span class="verdict v-part">keep density, fix the rest</span></figcaption>
+    </figure>
+    <figure>
+      <img src="" data-note="reference screenshot removed to keep this file small" alt="shadcn/ui dark data table: checkbox column, badges, sortable headers, muted row separators">
+      <figcaption><b>shadcn/ui &middot; dark DataTable</b>
+        Almost exactly our row: checkbox, tag, truncated title, status, sortable
+        headers. Rows run ~53px though &mdash; generous for a task list, wasteful when
+        you are walking four hundred. We take the anatomy and tighten to 34px.
+        <span class="verdict v-take">adopt, at higher density</span></figcaption>
+    </figure>
+    <figure>
+      <img src="" data-note="reference screenshot removed to keep this file small" alt="Linear app interface: near-black background, muted sidebar, thin separators">
+      <figcaption><b>Linear &middot; the chrome</b>
+        Near-black ground, hairline separators, text that recedes to grey until it
+        matters. Nothing shouts. This is the restraint model for everything
+        <em>around</em> the table.
+        <span class="verdict v-take">adopt the restraint</span></figcaption>
+    </figure>
+    <figure>
+      <img src="" data-note="reference screenshot removed to keep this file small" alt="Intern-list header showing 8,009 new openings today and 52,129 total openings">
+      <figcaption><b>Intern-list &middot; the counter</b>
+        Their own header admits the problem: <b>8,009 new openings today</b>. A list
+        that grows faster than anyone reads it is not a list, it is a firehose. Our
+        header answers a different question &mdash; not how many exist, but how many
+        you have picked and what they will cost.
+        <span class="verdict v-leave">reject the framing</span></figcaption>
+    </figure>
+  </div>
+</section>
+
+<section>
+  <h2>The proposal</h2>
+  <p class="lede">Working mock &mdash; real rows and real scraped descriptions from
+    Sep&nbsp;3. Tick boxes and the launch bar updates. Type any threshold into the
+    filter boxes. Click a row to expand it; the top one is open so you can see what
+    that looks like at rest.</p>
+
+  <div class="bleed">
+  <div class="app" id="app">
+    <div class="app-bar">
+      <span class="brand">applypilot</span>
+      <div class="tabs">
+        <button class="tab on">Browse</button>
+        <button class="tab">Dashboard</button>
+        <button class="tab">Settings</button>
+      </div>
+      <div class="launch">
+        <span class="selcount" id="selcount">0 selected</span>
+        <span class="cost" id="cost">est. <b>&mdash;</b></span>
+        <button class="btn" id="launchbtn" disabled>Launch</button>
+      </div>
+    </div>
+
+    <div class="gfilter">
+      <span class="lbl">All days</span>
+      <span class="pill">US only</span>
+      <span class="pill">Eligible</span>
+      <span class="pill">Not yet applied</span>
+      <span class="pill">Intern List + NewGrad</span>
+      <span class="pill">+ filter</span>
+    </div>
+
+    <div class="dayhead">
+      <span class="dayname">Thu &middot; Sep 3</span>
+      <span class="daycount" id="daycount">408 postings</span>
+      <div class="chips">
+        <button class="chip on" data-view="prestige">Top Prestige<span class="c">46</span></button>
+        <button class="chip" data-view="fit">Best Fit<span class="c">65</span></button>
+        <button class="chip" data-view="all">All<span class="c">408</span></button>
+      </div>
+    </div>
+
+    <div class="gfilter" style="border-bottom:none;padding-bottom:4px">
+      <span class="lbl">Sep 3 only</span>
+      <span class="numf"><label for="f-pres">Pres &ge;</label>
+        <input id="f-pres" type="number" min="0" max="10" step="1" value="0"></span>
+      <span class="numf"><label for="f-fit">Fit &ge;</label>
+        <input id="f-fit" type="number" min="0" max="10" step="1" value="0"></span>
+      <span class="numf"><label for="f-des">Des &ge;</label>
+        <input id="f-des" type="number" min="0" max="10" step="0.5" value="0"></span>
+      <span class="numf"><label for="f-pay">Pay &ge;</label>
+        <input id="f-pay" type="number" min="0" step="5" value="0"><span class="unit">$/hr</span></span>
+      <input class="srch" id="f-q" type="search" placeholder="title, company, keyword">
+      <button class="chip" id="f-clear">Clear</button>
+    </div>
+
+    <table>
+      <thead><tr>
+        <th class="cbcell"><input type="checkbox" id="all" aria-label="Select all shown"></th>
+        <th>Company</th><th>Title</th><th>Location</th><th>Pay</th>
+        <th class="num">Pres</th><th class="num">Fit</th><th class="num">Des</th>
+      </tr></thead>
+      <tbody id="body"></tbody>
+    </table>
+
+    <div class="foot">
+      <span id="showing">showing 8 of 8</span>
+      <div class="pager">
+        <button class="pg">&larr;</button><span>page 1 / 1</span><button class="pg">&rarr;</button>
+        <span style="margin-left:10px">rows 30 &middot; drag to resize &darr;</span>
+      </div>
+    </div>
+    <div class="grip" title="Drag to show more or fewer rows for this day"></div>
+
+    <div class="dayhead" style="border-top:1px solid var(--a-line)">
+      <span class="dayname">Wed &middot; Sep 2</span>
+      <span class="daycount">676 postings &middot; sorted by Fit, 20 rows</span>
+      <div class="chips">
+        <button class="chip">Top Prestige<span class="c">12</span></button>
+        <button class="chip on">Best Fit<span class="c">98</span></button>
+        <button class="chip">All<span class="c">676</span></button>
+      </div>
+    </div>
+  </div>
+  </div>
+  <p class="caption">Sep&nbsp;3 is showing Top Prestige while Sep&nbsp;2 sits on Best Fit,
+    sorted differently, at a different row count. Each day owns its own state &mdash;
+    that is the point of the component, and it is why this is not one table with a
+    date column. The chips are not a separate mechanism: pressing one fills in the
+    same threshold boxes, so you can start from a preset and then adjust it.</p>
+</section>
+
+<section>
+  <h2>Two scores, two temperatures</h2>
+  <p class="lede">The database already separates <code>fit_score</code>,
+    <code>desirability_score</code>, and <code>company_prestige</code>. They answer
+    different questions, so they should not look alike.</p>
+  <p><b>Prestige runs warm</b> &mdash; it is about how much a name shines, and you
+    scan it to make sure a Microsoft posting never slips past. <b>Fit runs cool</b>
+    &mdash; it is a sober match calculation, and it earns no glow. Desirability, being
+    a blend, stays plain grey text. One glance down the two rightmost columns tells
+    you which kind of day it was, and no legend is required to read it.</p>
+  <div class="swatches" id="sw"></div>
+  <p class="caption">Prestige 2&rarr;10 in warm, fit 2&rarr;10 in cool. Both ramps
+    hold their contrast against the near-black ground; neither is the accent.</p>
+</section>
+
+<section>
+  <h2>The system</h2>
+  <table class="spec">
+    <thead><tr><th>Element</th><th>Decision</th><th>Why</th></tr></thead>
+    <tbody>
+    <tr><td>Row height</td><td>34px</td>
+      <td>shadcn ships 53px. At 34px a 900px viewport holds ~24 rows, so a day is two
+        scrolls instead of five. Below 30px the checkbox target gets unfair.</td></tr>
+    <tr><td>Ground</td><td><code>#0d1014</code></td>
+      <td>Near-black with a cool bias rather than neutral grey &mdash; it sits under
+        both score ramps without tinting either.</td></tr>
+    <tr><td>Accent</td><td><code>#4b90d0</code>, selection only</td>
+      <td>The one interaction that matters is ticking a box. The accent is spent
+        entirely on selected state and the Launch button; nothing else competes.</td></tr>
+    <tr><td>Type</td><td>IBM Plex Sans / Mono / Serif</td>
+      <td>Mono on every number, pay range and count so columns align on the digit.
+        Serif only in this document, never in the app.</td></tr>
+    <tr><td>Separators</td><td>1px, <code>#1c232b</code></td>
+      <td>Visible enough to track a row across eight columns, quiet enough that 30
+        of them do not read as a grid of boxes.</td></tr>
+    <tr><td>Filters</td><td>Typed thresholds</td>
+      <td>Any number, per column, per day &mdash; not fixed buckets. A day where
+        nothing clears fit&nbsp;8 should be answerable by typing 7, without waiting
+        for someone to add a "&ge;&nbsp;7" button.</td></tr>
+    <tr><td>Expansion</td><td>In place, 220ms slide</td>
+      <td>The specific Intern-list annoyance being fixed. Full description first,
+        then the model's reasoning, then eligibility and the chosen resume &mdash;
+        without losing your scroll position. Animated via
+        <code>grid-template-rows: 0fr &rarr; 1fr</code>, which animates to content
+        height without hard-coding one; disabled under
+        <code>prefers-reduced-motion</code>.</td></tr>
+    <tr><td>Cost</td><td>$0.04/application</td>
+      <td>Held at the configured default until enough runs accumulate to measure
+        it. There are three in the database, all on Claude, so any per-job figure
+        today is a guess and the bar says "default" rather than printing a
+        confident number.</td></tr>
+    <tr><td>Descriptions</td><td>Sanitise before render</td>
+      <td>Some rows store escaped markup rather than prose &mdash; Adobe's arrives
+        as <code>&amp;lt;div&amp;gt;&amp;lt;p&amp;gt;&hellip;</code>. The panel has to
+        unescape and strip tags, not print them, and never inject them as HTML.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <div class="ask">
+    <h3>What I need from you</h3>
+    <ol>
+      <li><b>The direction itself.</b> Dense dark table, warm prestige and cool fit,
+        accent spent only on selection. Yes, or tell me what to move.</li>
+      <li><b>Row height.</b> 34px above. If you want it tighter I can go to 30px;
+        much below that and ticking boxes accurately gets annoying.</li>
+      <li><b>The description panel.</b> It scrolls at 200px so one long posting
+        cannot push the next twenty rows off screen. Say if you would rather it
+        ran full length and you scrolled the page instead.</li>
+      <li><b>The columns.</b> Company, Title, Location, Pay, Prestige, Fit,
+        Desirability. Missing anything you would triage on &mdash; ATS, source board,
+        posting age, job type?</li>
+    </ol>
+    <p style="margin:16px 0 0;color:var(--ink-3);font-size:13px">Answer these and the
+      next step is the full three-tab canvas, then the React build. Backend work
+      (Milestone&nbsp;1) does not depend on any of this and starts now.</p>
+  </div>
+</section>
+
+<footer>
+  ApplyPilot &middot; Milestone 0 &middot; references captured 2026-09-05 &middot;
+  table rows are live data from <code>~/.applypilot/applypilot.db</code>
+</footer>
+</div>
+
+<script>
+// Real rows from 2026-09-03. Descriptions are the actual scraped text.
+const D = {
+ msft:"Microsoft is seeking a Software Engineering Intern to join CoreAI and contribute to AI and machine learning projects. The role involves designing, developing, and testing software solutions, applying responsible AI practices, learning emerging technologies, and collaborating with technical and product stakeholders. Responsibilities \u2014 Applies engineering principles and AI techniques to solve complex problems through sound and creative engineering. Works with appropriate stakeholders to determine user requirements for a feature. Understands and applies Microsoft's responsible AI standards to the systems being built.",
+ amzn:"Amazon is a leading technology company known for its innovative approach to solving customer problems. They are seeking a Software Development Engineer to design, develop, and operate scalable solutions in a collaborative team environment, directly impacting millions of customers worldwide. Responsibilities \u2014 Collaborate and communicate effectively with experienced cross-disciplinary Amazonians to design, build, and operate innovative products and services that delight our customers, while participating in technical discussions to drive solutions forward.",
+ spacex:"SpaceX develops technologies intended to enable human life on Mars and expand access to space-based services. The Flight Reliability software team builds mission-critical applications that support launch vehicle production, flight operations, and Starlink growth. This role involves owning software engineering and product development while creating reliable applications, prototypes, and solutions for complex user problems. Responsibilities \u2014 Develop highly reliable software solutions that are used across SpaceX. Create new applications that improve how SpaceX builds and flies vehicles.",
+ li:"LinkedIn is the world's largest professional network, creating economic opportunity for members of the global workforce through products that enable connections, opportunities, skills, and insights. The Software Engineer \u2014 Web Infrastructure will build and maintain core web technologies, own front-end development for products, collaborate cross-functionally, and deliver secure, performant, accessible user experiences. Responsibilities \u2014 You will own the front-end development for one or more of our products and collaborate with visual and interaction designers.",
+ ibm:"IBM is a technology and research company whose AI Foundations Research team develops responsible, open innovations in artificial intelligence. The AI Software Engineer Intern will identify research challenges, design and validate prototype solutions, develop scalable infrastructure, and transform novel algorithms into high-performance, reusable code within distributed frameworks. Responsibilities \u2014 As an AI Software Engineer Intern, you will engage in the full research lifecycle to pioneer new advancements in artificial intelligence.",
+ adobe:"Adobe is seeking dedicated and curious Software Engineer interns to help design, build, and evolve the systems that power our products and platforms. You will work alongside experienced engineers on real features that ship, contribute to code review, and take ownership of a scoped project across the length of the internship.",
+ hadrian:"Hadrian is building autonomous factories to reindustrialize America. By combining AI, advanced software, robotics, and full-stack manufacturing, we help aerospace and defense companies build rockets, satellites, aircraft, ships, and other mission-critical systems up to 10x faster and at significantly lower cost. Following our $1.37B Series D at a $7.87B valuation, Hadrian is rapidly expanding our manufacturing footprint across welding, casting, forging, electronics, and additive manufacturing.",
+ aws:"Annapurna Labs designs the silicon behind AWS Graviton processors. The Graviton Software team builds the compilers, kernel support, and performance tooling that let workloads run efficiently on Arm at datacenter scale. Responsibilities \u2014 Work close to the hardware on toolchains, libraries and the Linux kernel; profile and optimise real customer workloads; contribute upstream where it makes sense."
+};
+
+const ROWS = {
+  prestige: [
+    {co:"Microsoft",ti:"Software Engineer: Intern Opportunities for University Students \u2014 CoreAI",loc:"Mountain View, CA",pay:"$6k\u2013$11k/mo",hr:69,p:10,f:10,d:8.8,t:"intern",ats:"\u2014",res:"swe_2027",desc:D.msft,
+     kw:["C++","Distributed Systems","AI Infrastructure"],
+     why:"Strong match on systems and AI-infrastructure keywords; CoreAI is a platform team, which lines up with the backend track rather than research. No returning-student requirement stated."},
+    {co:"Amazon",ti:"Robotics \u2014 Software Development Engineer",loc:"Arlington, VA; Austin, TX; Seattle, WA",pay:"$110,500\u2013$160,000/yr",hr:53,p:10,f:10,d:8.2,t:"new grad",ats:"\u2014",res:"swe_2027",desc:D.amzn,
+     kw:["Java","Robotics","Distributed Systems"],
+     why:"New-grad SDE with a stated salary band well above floor and seven US locations including two preferred metros."},
+    {co:"SpaceX",ti:"Software Engineer (Flight Reliability)",loc:"Redmond, WA",pay:"$125,000\u2013$165,000/yr",hr:60,p:10,f:10,d:8.8,t:"new grad",ats:"Greenhouse",res:"swe_2027",desc:D.spacex,
+     kw:["C++","Python","Embedded","Reliability"],
+     why:"Greenhouse is one of the cleanest ATSes for the apply agent \u2014 historically low turn count. Flight reliability leans systems, not research."},
+    {co:"Microsoft",ti:"Applied Science: Internship Opportunities \u2014 Redmond",loc:"Redmond, WA",pay:"$5,690\u2013$11,210/mo",hr:65,p:10,f:10,d:8.8,t:"intern",ats:"\u2014",res:"aiml_2027",desc:D.msft,
+     kw:["Machine Learning","Python","Research"],
+     why:"Applied Science routes to the AI/ML resume track rather than SWE \u2014 matched on 'Applied Science' and 'Machine Learning' in the title and keywords."},
+    {co:"LinkedIn",ti:"Software Engineer \u2014 Web Infrastructure",loc:"Mountain View, CA",pay:"$104,000\u2013$171,000/yr",hr:50,p:10,f:8,d:8.8,t:"new grad",ats:"SmartRecruiters",res:"swe_2027",desc:D.li,
+     kw:["Java","Scala","Web Infrastructure"],
+     why:"Fit held at 8 rather than 10: the posting leans heavily on Scala and large-scale web infra, which the resume covers less directly than backend service work."},
+    {co:"Amazon",ti:"Software Development Engineer Intern, ROBOTICS \u2014 2027",loc:"Austin, TX; Nashville, TN; Seattle, WA",pay:"$109,395/yr",hr:52,p:10,f:10,d:8.2,t:"intern",ats:"\u2014",res:"swe_2027",desc:D.amzn,
+     kw:["Java","C++","Robotics"],
+     why:"Same team as the new-grad listing above, internship track. Both are worth taking \u2014 the grad date qualifies for either."},
+    {co:"Amazon",ti:"Software Dev Engineer, Publisher Ad Server",loc:"Seattle, WA",pay:"$143,700\u2013$194,400/yr",hr:69,p:10,f:8,d:8.2,t:"new grad",ats:"\u2014",res:"swe_2027",desc:D.amzn,
+     kw:["Java","Ad Tech","High Throughput"],
+     why:"Highest stated band in this day's set. Fit is 8 \u2014 ad-serving domain experience is not on the resume, though the systems work transfers."},
+    {co:"AWS \u2014 Annapurna Labs",ti:"Software Dev Engineer I, Graviton Software",loc:"Austin, TX",pay:"$129,000/yr",hr:62,p:10,f:7,d:8.2,t:"new grad",ats:"\u2014",res:"swe_2027",desc:D.aws,
+     kw:["C","Linux","Compilers","Silicon"],
+     why:"Fit 7: Graviton work is close to silicon \u2014 compilers and kernel \u2014 which is further from the resume than application backend. Kept for prestige, not match."}
+  ],
+  fit: [
+    {co:"IBM",ti:"AI Foundations \u2014 Software Engineer \u2014 Research Internship 2027",loc:"Yorktown Heights, NY; San Jose, CA",pay:"$83,160\u2013$166,320/yr",hr:40,p:9,f:10,d:9.6,t:"intern",ats:"\u2014",res:"aiml_2027",desc:D.ibm,
+     kw:["Python","PyTorch","LLM","Research"],
+     why:"Highest desirability on the day: Yorktown is commutable from Queens, no relocation, and the band is unusually high for an internship."},
+    {co:"Adobe",ti:"2027 Intern \u2014 Software Engineer",loc:"San Jose, CA; New York, NY; Austin, TX",pay:"$38\u2013$51/hr",hr:38,p:9,f:10,d:9.6,t:"intern",ats:"\u2014",res:"swe_2027",desc:D.adobe,
+     kw:["JavaScript","C++","Full Stack"],
+     why:"New York is one of seven listed locations, which pulls desirability to 9.6 \u2014 location is weighted heavily and NYC is the top preference."},
+    {co:"Microsoft",ti:"Software Engineer: Intern Opportunities \u2014 CoreAI",loc:"Mountain View, CA",pay:"$6k\u2013$11k/mo",hr:69,p:10,f:10,d:8.8,t:"intern",ats:"\u2014",res:"swe_2027",desc:D.msft,
+     kw:["C++","Distributed Systems","AI Infrastructure"],
+     why:"Strong match on systems and AI-infrastructure keywords; CoreAI is a platform team, not a research one."},
+    {co:"SpaceX",ti:"Software Engineer (Flight Reliability)",loc:"Redmond, WA",pay:"$125,000\u2013$165,000/yr",hr:60,p:10,f:10,d:8.8,t:"new grad",ats:"Greenhouse",res:"swe_2027",desc:D.spacex,
+     kw:["C++","Python","Embedded","Reliability"],
+     why:"Greenhouse is one of the cleanest ATSes for the apply agent \u2014 historically low turn count."},
+    {co:"Hadrian",ti:"Software Engineer Intern",loc:"Los Angeles, CA",pay:"$46.15\u2013$50.71/hr",hr:46,p:8,f:10,d:8.5,t:"intern",ats:"Ashby",res:"swe_2027",desc:D.hadrian,
+     kw:["Python","Manufacturing","Automation"],
+     why:"Prestige 8 rather than 10 \u2014 a strong startup, not a household name. Fit is perfect and the hourly rate is among the highest in the set."},
+    {co:"Microsoft",ti:"Applied Science: Internship Opportunities \u2014 Redmond",loc:"Redmond, WA",pay:"$5,690\u2013$11,210/mo",hr:65,p:10,f:10,d:8.8,t:"intern",ats:"\u2014",res:"aiml_2027",desc:D.msft,
+     kw:["Machine Learning","Python","Research"],
+     why:"Applied Science routes to the AI/ML resume track rather than SWE."}
+  ]
+};
+ROWS.all = ROWS.prestige;
+
+// Held at the configured default until enough real runs accumulate to measure
+// it; the estimator switches to the observed median on its own.
+const COST_PER = 0.04, N_SAMPLES = 0;
+
+const sel = new Set();
+let view = "prestige";
+const open = new Set();
+const F = {p:0, f:0, d:0, pay:0, q:""};
+
+const mix=(a,b,t)=>{const h=s=>[1,3,5].map(i=>parseInt(s.slice(i,i+2),16));
+  const [r1,g1,b1]=h(a),[r2,g2,b2]=h(b);
+  return `rgb(${Math.round(r1+(r2-r1)*t)},${Math.round(g1+(g2-g1)*t)},${Math.round(b1+(b2-b1)*t)})`};
+const cs=getComputedStyle(document.getElementById("app"));
+const g=n=>cs.getPropertyValue(n).trim();
+const preColor=v=>mix(g("--pre-lo"),g("--pre-hi"),Math.max(0,Math.min(1,(v-2)/8)));
+const fitColor=v=>mix(g("--fit-lo"),g("--fit-hi"),Math.max(0,Math.min(1,(v-2)/8)));
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const key=r=>r.co+"|"+r.ti;
+
+function visible(){
+  return ROWS[view].filter(r =>
+    r.p >= F.p && r.f >= F.f && r.d >= F.d && r.hr >= F.pay &&
+    (!F.q || (r.co+" "+r.ti+" "+r.kw.join(" ")).toLowerCase().includes(F.q.toLowerCase()))
+  );
+}
+
+function render(){
+  const rows = visible(), tb = document.getElementById("body");
+  tb.innerHTML = "";
+
+  rows.forEach(r=>{
+    const id = key(r), on = sel.has(id), isOpen = open.has(id);
+    const tr = document.createElement("tr");
+    tr.className = "row" + (on ? " sel" : "");
+    tr.innerHTML = `
+      <td class="cbcell"><input type="checkbox" ${on?"checked":""} aria-label="Select ${esc(r.co)}"></td>
+      <td class="co">${esc(r.co)}</td>
+      <td class="ti" title="${esc(r.ti)}">${esc(r.ti)}</td>
+      <td class="loc">${esc(r.loc)}</td>
+      <td class="pay">${esc(r.pay)}</td>
+      <td class="num" style="color:${preColor(r.p)}">${r.p}</td>
+      <td class="num" style="color:${fitColor(r.f)}">${r.f}</td>
+      <td class="num">${r.d.toFixed(1)}</td>`;
+    tr.querySelector("input").addEventListener("click",e=>{
+      e.stopPropagation(); on ? sel.delete(id) : sel.add(id); render();
+    });
+    tr.addEventListener("click",()=>{
+      // Toggle a class on a row that is always in the DOM, so it animates
+      // shut as well as open -- re-rendering it away would just snap.
+      open.has(id) ? open.delete(id) : open.add(id);
+      const ex = document.getElementById("exp-"+encodeURIComponent(id));
+      if (ex) ex.classList.toggle("open", open.has(id));
+    });
+    tb.appendChild(tr);
+
+    const ex = document.createElement("tr");
+    ex.className = "exp" + (isOpen ? " open" : "");
+    ex.id = "exp-" + encodeURIComponent(id);
+    ex.innerHTML = `<td colspan="8"><div class="slide"><div><div class="expbox">
+      <div>
+        <h4>Job description</h4>
+        <div class="jd">${esc(r.desc)}</div>
+        <h4 style="margin-top:16px">Why this score</h4>
+        <p class="reason">${esc(r.why)}</p>
+        <h4 style="margin-top:16px">Keywords found</h4>
+        <div class="kw">${r.kw.map(k=>`<span class="tag">${esc(k)}</span>`).join("")}</div>
+      </div>
+      <div>
+        <dl class="kv">
+          <dt>Type</dt><dd>${esc(r.t)}</dd>
+          <dt>ATS</dt><dd>${esc(r.ats)}</dd>
+          <dt>Resume</dt><dd>${esc(r.res)}</dd>
+          <dt>Eligible</dt><dd style="color:var(--a-good)">yes</dd>
+          <dt>Pay floor</dt><dd style="color:var(--a-good)">clears</dd>
+          <dt>Est. cost</dt><dd>$${COST_PER.toFixed(2)}</dd>
+        </dl>
+        <a href="#" onclick="return false" style="display:inline-block;margin-top:14px;
+           font-size:12px;color:var(--a-sel)">Open original posting &rarr;</a>
+      </div></div></div></div></td>`;
+    tb.appendChild(ex);
+  });
+
+  const all = ROWS[view].length;
+  document.getElementById("showing").textContent =
+    rows.length === all ? `showing ${all} of ${all}` : `showing ${rows.length} of ${all} (filtered)`;
+  document.getElementById("all").checked = rows.length > 0 && rows.every(r=>sel.has(key(r)));
+
+  const n = sel.size;
+  document.getElementById("selcount").textContent = n === 1 ? "1 selected" : `${n} selected`;
+  document.getElementById("cost").innerHTML = n
+    ? `est. <b>$${(n*COST_PER).toFixed(2)}</b> <span title="No completed runs on this backend yet -- this is the configured default, not a measurement">&middot; default</span>`
+    : `est. <b>&mdash;</b>`;
+  const btn = document.getElementById("launchbtn");
+  btn.disabled = n === 0;
+  btn.textContent = n ? `Launch ${n}` : "Launch";
+
+  document.querySelectorAll(".numf").forEach(el=>{
+    const i = el.querySelector("input");
+    el.classList.toggle("active", i && parseFloat(i.value) > 0);
+  });
+}
+
+// numeric thresholds -- any number, not a fixed bucket
+const bind = (id, field) => {
+  const el = document.getElementById(id);
+  el.addEventListener("input", () => { F[field] = parseFloat(el.value) || 0; render(); });
+};
+bind("f-pres","p"); bind("f-fit","f"); bind("f-des","d"); bind("f-pay","pay");
+document.getElementById("f-q").addEventListener("input", e => { F.q = e.target.value; render(); });
+document.getElementById("f-clear").addEventListener("click", () => {
+  Object.assign(F, {p:0,f:0,d:0,pay:0,q:""});
+  ["f-pres","f-fit","f-des","f-pay"].forEach(i=>document.getElementById(i).value=0);
+  document.getElementById("f-q").value = "";
+  render();
+});
+
+document.getElementById("all").addEventListener("change", e => {
+  visible().forEach(r => e.target.checked ? sel.add(key(r)) : sel.delete(key(r)));
+  render();
+});
+
+// Chips are presets over the same filter state, not a separate mechanism --
+// pressing one fills the boxes in, and you can adjust from there.
+const PRESETS = {
+  prestige: {p:9, f:0,   d:0, pay:0, label:"408 postings \u00b7 46 at prestige 9+"},
+  fit:      {p:0, f:8,   d:6, pay:0, label:"408 postings \u00b7 65 clear the bar"},
+  all:      {p:0, f:0,   d:0, pay:0, label:"408 postings"}
+};
+document.querySelectorAll(".chip[data-view]").forEach(c=>{
+  c.addEventListener("click",()=>{
+    document.querySelectorAll(".chip[data-view]").forEach(x=>x.classList.remove("on"));
+    c.classList.add("on");
+    view = c.dataset.view;
+    open.clear();
+    const pre = PRESETS[view];
+    Object.assign(F, {p:pre.p, f:pre.f, d:pre.d, pay:pre.pay});
+    document.getElementById("f-pres").value = pre.p;
+    document.getElementById("f-fit").value  = pre.f;
+    document.getElementById("f-des").value  = pre.d;
+    document.getElementById("f-pay").value  = pre.pay;
+    document.getElementById("daycount").textContent = pre.label;
+    render();
+  });
+});
+
+document.getElementById("launchbtn").addEventListener("click", e => {
+  e.target.textContent = `Queued ${sel.size}`;
+  setTimeout(render, 1400);
+});
+
+const sw = document.getElementById("sw");
+[["Prestige",preColor],["Fit",fitColor]].forEach(([lbl,fn])=>{
+  [2,4,6,8,10].forEach(v=>{
+    const d = document.createElement("div");
+    d.className = "sw";
+    d.style.background = "#0d1014"; d.style.color = fn(v);
+    d.innerHTML = `<b style="font-size:19px">${v}</b><span style="color:#79848f">${lbl}</span>`;
+    sw.appendChild(d);
+  });
+});
+
+// Open the top row so the page shows what expansion looks like at rest.
+open.add(key(ROWS.prestige[0]));
+render();
+</script>

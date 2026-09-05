@@ -47,10 +47,11 @@ JOB_URL="$1"
 MODEL="$2"
 TEST_INDEX="$3"
 LANE="${4:-0}"
+HEADLESS="${5:-false}"
 PORT=$((9222 + LANE))
 
 if [ -z "$JOB_URL" ] || [ -z "$MODEL" ]; then
-  echo "Usage: $0 <job_url> <openrouter_model> [test_index 1-8] [lane, default 0]"
+  echo "Usage: $0 <job_url> <openrouter_model> [test_index 1-8] [lane, default 0] [headless true|false, default false]"
   echo "Example models: deepseek/deepseek-v4-flash-0731, z-ai/glm-5.3-flash, minimax/minimax-m3:free, xiaomi/mimo-v2.5, deepseek/deepseek-v4-flash-vision-exp"
   echo "Run two at once by giving them different lanes, e.g. ... 1 0   and   ... 2 1"
   exit 1
@@ -81,7 +82,7 @@ import sys; sys.path.insert(0, '$REPO_DIR/src')
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 
-txt_path, pdf_path, grad_date = config.get_resume_variant_paths('default')
+txt_path, pdf_path, grad_date, start_date = config.get_resume_variant_paths('default')
 resume_text = txt_path.read_text(encoding='utf-8') if txt_path.exists() else ''
 
 job = {
@@ -106,13 +107,19 @@ if test_index:
     if '@' not in real_email:
         sys.exit('profile.json has no personal.email -- cannot build a test alias.')
     local_part, domain = real_email.split('@', 1)
+    # Gmail-style dot-insensitivity also holds on any Google Workspace-hosted
+    # domain (e.g. a .edu that routes mail through Google) -- confirmed
+    # working for account creation AND password reset on this profile's
+    # domain, so this is a soft warning rather than a hard gate.
     if domain.lower() not in ('gmail.com', 'googlemail.com'):
-        sys.exit('The dotted-alias trick is Gmail-only; profile email is ' + domain + '.')
+        print('NOTE: profile email is on ' + domain + ', not gmail.com -- the '
+              'dot-insensitive alias trick only works if this domain is '
+              'Google-hosted mail. Proceeding on the assumption it is.')
     n = int(test_index)
     n = max(1, min(n, len(local_part) - 1))
     dotted = local_part[:n] + '.' + local_part[n:]
     email_override = dotted + '@' + domain
-    password_override = 'Password123!'
+    password_override = 'JanuszO1234!'
     print('Test account:', email_override)
 
 p = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, dry_run=True,
@@ -125,7 +132,7 @@ print('Prompt written to $PROMPT_FILE (', len(p), 'chars)')
 python3 -c "
 import sys; sys.path.insert(0, '$REPO_DIR/src')
 from applypilot.apply import chrome
-p = chrome.launch_chrome(worker_id=$LANE, port=$PORT, headless=False)
+p = chrome.launch_chrome(worker_id=$LANE, port=$PORT, headless=$([ "$HEADLESS" = "true" ] && echo True || echo False))
 print('chrome up on lane $LANE, port $PORT, pid', p.pid)
 " 2>&1 | grep -v NumExpr
 

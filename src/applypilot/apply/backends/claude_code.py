@@ -12,6 +12,7 @@ the backend abstraction was introduced. Behaviour is unchanged.
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import threading
@@ -123,7 +124,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     worker_dir = reset_worker_dir(worker_id)
 
     update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 # The employer, falling back to the source board only when
+                 # scoring has not filled it in yet -- `site` is the board
+                 # ("Intern List - SWE"), never the company.
+                 company=job.get("company") or job.get("site", ""),
+                 url=job.get("url", ""), score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
@@ -142,6 +147,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     proc = None
 
     try:
+        # New process group on Unix so _kill_process_tree (os.killpg) tears
+        # down claude and its MCP-server children without also killing
+        # whatever process spawned this one -- claude was inheriting our own
+        # process group, so timing out a run could SIGKILL its own caller.
+        popen_kwargs: dict = {}
+        if platform.system() != "Windows":
+            popen_kwargs["preexec_fn"] = os.setsid
+
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -152,6 +165,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             errors="replace",
             env=env,
             cwd=str(worker_dir),
+            **popen_kwargs,
         )
         with _claude_lock:
             _claude_procs[worker_id] = proc
@@ -290,12 +304,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         # Persist any self-reported widget fixes -- only from a trusted model,
         # and only when the run actually succeeded (a QUIRK line attached to a
-        # failed run is an unverified guess, not a confirmed fix).
+        # failed run is an unverified guess, not a confirmed fix). Found via
+        # regex rather than a strict line-start match, so a marker glued to
+        # the end of the prior sentence (no newline between them) still gets
+        # caught -- see the goose.py backend for a case where that happened.
         if "RESULT:APPLIED" in output and model in _TRUSTED_QUIRK_WRITERS and job_ats:
-            for out_line in output.split("\n"):
-                out_line = out_line.strip()
-                if out_line.startswith("QUIRK:"):
-                    config.append_known_quirk(job_ats, out_line[len("QUIRK:"):].strip())
+            for m in re.finditer(r"QUIRK:\s*(.+?)(?:\n|$)", output):
+                config.append_known_quirk(job_ats, m.group(1).strip())
+
+        # Failure modes carry a much lower bar than quirks (see
+        # append_known_issue) -- any model's report is trusted, not just the
+        # trusted quirk writers, since a wrong "watch out for X" only wastes a
+        # little of the next run's attention.
+        if "RESULT:APPLIED" not in output and job_ats:
+            for m in re.finditer(r"ISSUE:\s*(.+?)(?:\n|$)", output):
+                config.append_known_issue(job_ats, m.group(1).strip())
 
         if stats:
             with _claude_lock:

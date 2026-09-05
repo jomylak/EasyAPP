@@ -1,0 +1,1 @@
+- Job posting states "Graduation date by December 2026" as a required qualification. Candidate's resume shows May 2027 graduation. This is an explicit graduation date mismatch in the posting requirements. Also requires prior Boston Scientific AIS R&D internship experience (not held).

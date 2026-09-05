@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - 2026-09-04
 
 ### Added
+- **`applypilot serve`: a local web UI for choosing what to apply to.** With
+  AI/ML and the other tags enabled the pipeline produces several hundred
+  postings a day, which is more than the ranked queue's "apply to the top of
+  the list" model can spend responsibly. The UI groups jobs by the day they
+  were posted, gives each day its own independently filtered and sorted table,
+  and applies only to the rows you tick. Bound to `127.0.0.1` with no `--host`
+  option: it serves your resumes and drives Chrome profiles holding your
+  logged-in sessions.
+- **`applypilot apply --queued <batch>`.** Drains a user-selected batch in the
+  order it was selected, deliberately ignoring `--min-score`, the pay floor,
+  eligibility and age decay -- when a person has picked the jobs, their
+  selection is the ranking, and re-filtering it would silently drop rows they
+  explicitly chose.
+- **Cost estimation before you spend (`applypilot.costs`).** The backends
+  always reported what a run cost afterwards; nothing predicted it beforehand.
+  Estimates come from the median of comparable past runs, narrowing to the same
+  ATS once there are enough of them, and always report how many observations
+  they rest on so a guess is never presented as a measurement.
+- **Indexes on `jobs`.** The table had none beyond the URL primary key, which
+  was survivable when every reader was a CLI doing one full pass per stage and
+  is not when a browser reads a filtered, sorted slice of 5,000+ rows per day
+  section.
+
+### Fixed
+- **A single unusable job no longer strands every job behind it.**
+  `acquire_job` returned `None` when it skipped a manual-ATS posting, and
+  `worker_loop` reads `None` as "queue empty" and stops. One such posting
+  partway down a run ended the whole run early. Unusable rows are now recorded
+  with a terminal status and the drain continues past them.
+- **Stale apply locks are released.** `apply_status = 'in_progress'` is a lock
+  with no heartbeat, so a killed launcher left its claimed rows unreachable to
+  every future run. `applypilot serve` sweeps them at startup.
+- **The dashboard's Company column showed the job board, not the employer.**
+  Both backends reported `job["site"]` ("Intern List - SWE") as the company.
+  They now report the `company` column, falling back to the board only when
+  scoring has not filled it in yet.
 - **Goose apply backend, now the default.** `applypilot apply` drives the
   browser with the Goose CLI on a cheap OpenRouter model (default
   `xiaomi/mimo-v2.5`, ~$0.05/application) instead of Claude subscription

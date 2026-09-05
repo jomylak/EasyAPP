@@ -1,0 +1,1 @@
+- File upload had to bypass OS file picker via browser_run_code_unsafe setInputFiles() because the resume path was outside Playwright's sandboxed allowed roots.
