@@ -180,8 +180,43 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    # Which academic term this role runs in, read by the LLM at scoring time
+    # from the posting itself (title, dates, description) -- spring / summer
+    # / fall / winter / rolling / unclear. Feeds both the RETURNING STUDENT
+    # CHECK (a role that ends before the candidate's graduation can't
+    # conflict with an enrollment requirement) and is_remote_spring_internship.
+    "term": "TEXT",
     "requires_returning_student": "TEXT",
+    # The LLM's own read of whether the posting affirmatively welcomes an
+    # already-graduated candidate (TERMINAL EVIDENCE CHECK in the scoring
+    # prompt) -- primary signal for is_terminal_internship. The regex-based
+    # terminal_evidence()/TERMINAL_EXCLUDE_RE in scorer.py stays on as a
+    # safety-net veto, not the primary detector: regex kept missing real
+    # cases (co-ops, "must have attained a degree", garbled phrasing) that
+    # needed actual reading comprehension, and re-patching one regex pattern
+    # per newly-discovered case doesn't scale. NULL for jobs scored before
+    # this field existed -- compute_terminal_internships() falls back to the
+    # regex alone for those until they're re-scored.
+    "terminal_evidence_llm": "TEXT",
     "is_terminal_internship": "TEXT",
+    # A Spring-term internship that's fully remote is, for a candidate who
+    # graduates in May, just as safe to auto-send as a confirmed terminal
+    # summer internship -- the term ends at or before graduation, so there's
+    # no returning-student conflict to begin with, and remote means no
+    # relocation/on-campus conflict either. Same fit/desirability bar as
+    # is_terminal_internship (compute_remote_spring_internships()); the two
+    # flags are combined with OR, never added, when ranking the apply queue,
+    # so a role that happens to satisfy both isn't double-boosted.
+    "is_remote_spring_internship": "TEXT",
+    # A softer sibling of is_terminal_internship for postings that never say
+    # anything either way about post-grad eligibility -- no explicit welcome
+    # phrase (which would already make is_terminal_internship 'yes') and no
+    # explicit return-to-school requirement (which would exclude them
+    # entirely). Otherwise-strong postings this silent about it are, by base
+    # rate, far more often "doesn't matter" than "will auto-reject you" --
+    # see compute_likely_terminal_internships(). Informational only: unlike
+    # is_terminal_internship, this does NOT jump the apply queue.
+    "is_terminal_internship_likely": "TEXT",
     # ATS keywords from the job description that match or could match the
     # candidate, extracted at scoring time (same Gemini call, no extra cost).
     # Was previously folded into score_reasoning as an unstructured first
@@ -208,6 +243,12 @@ _ALL_COLUMNS: dict[str, str] = {
     # Computed from company_prestige + location + salary with no LLM call, so
     # re-tuning the weights is free and never needs a re-score.
     "desirability_score": "REAL",
+    # 'tier1' | 'adjacent' | NULL. Recomputed from the company name against
+    # config.TIER1_COMPANIES / TIER1_ADJACENT (see
+    # scoring.scorer.compute_company_tiers). Stored rather than derived in
+    # SQL because name matching needs normalization -- a LIKE 'block%'
+    # pattern would happily match "Blockchain Widgets Inc".
+    "company_tier": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -297,6 +338,8 @@ _ALL_INDEXES: dict[str, str] = {
     "idx_jobs_scored": "(scored_at)",
     "idx_jobs_site": "(site)",
     "idx_jobs_pay": "(pay_max_hourly)",
+    # Big-tech postings are pinned above the ranking in every browse view.
+    "idx_jobs_day_tier": f"({_DAY_EXPR}, company_tier)",
 }
 
 
@@ -479,6 +522,21 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
     # into the score distribution, since it's an orthogonal flag, not a tier.
     stats["terminal_internships"] = conn.execute(
         "SELECT COUNT(*) FROM jobs WHERE is_terminal_internship = 'yes'"
+    ).fetchone()[0]
+
+    # Postings that clear the same fit/desirability bar as a confirmed
+    # terminal internship but never say anything about post-grad eligibility
+    # either way -- see compute_likely_terminal_internships(). Informational
+    # only; unlike terminal_internships this does not jump the apply queue.
+    stats["likely_terminal_internships"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE is_terminal_internship_likely = 'yes'"
+    ).fetchone()[0]
+
+    # Same top-priority tier as terminal_internships, via a different route
+    # (see is_remote_spring_internship's column comment) -- surfaced
+    # separately since it's a different signal, not folded into the count.
+    stats["remote_spring_internships"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE is_remote_spring_internship = 'yes'"
     ).fetchone()[0]
 
     # Tailoring stage

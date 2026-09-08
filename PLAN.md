@@ -368,9 +368,15 @@ You are continuing an in-flight project. Before doing anything:
 
 Ground rules learned the hard way on this project:
 
-- **Never call `POST /api/launch`, and never run `applypilot apply` without
-  `--dry-run`.** Both submit real job applications to real employers and spend
-  real money. This is the one irreversible thing in the codebase.
+- **`POST /api/launch` is wired into the Launch button as of 2026-09-06** --
+  see the milestone note below. It is still the one call in this codebase
+  that submits real applications and spends real money whenever `dry_run` is
+  false. When testing this path yourself (not the user doing a real run),
+  always pass `dry_run: true` (the UI has a checkbox for this next to
+  Launch), and prefer stopping the run via `/api/stop-all` right after
+  confirming it's live rather than letting a dry run play out in full --
+  a dry run still incurs the LLM-call cost of a real one, it just skips the
+  final Submit click.
 - **Verify in a browser, not by reasoning.** Two of the three worst bugs here
   (a 34px dark band under every row, a Title column crushed to four
   characters) were invisible in the code and obvious in a screenshot.
@@ -395,7 +401,7 @@ Update this table as work lands. `status` is one of: `todo`, `in progress`,
 | 1 | Backend seams — schema, indexes, queued mode, `_publish()`, `costs.py`, `serve` + API | done | 2026-09-05. 183 tests pass; API verified against the live DB |
 | 2 | Browse tab (React) | done | 2026-09-05. Verified in-browser against the live DB. 206 tests pass |
 | 3 | Dashboard tab | done | 2026-09-05. Tiles, SSE live-run panel, applications table with Remove/Stop/Retry. Verified in-browser against the live DB |
-| 4 | Settings tab | todo | |
+| 4 | Settings tab | done | 2026-09-05. Backend/cost, limits (incl. new daily caps), resume variants, API keys. 221 tests pass; verified in-browser against the live DB and settings.json |
 
 ### Milestone 1 checklist
 
@@ -432,9 +438,9 @@ API endpoints, all verified with curl against the live database:
 `/api/applications`, `/api/resume`, `/api/queue`, `/api/queue/estimate`,
 `/api/unqueue`, `/api/launch`, `/api/stop`, `/api/stop-all`, `/api/events`.
 
-**Not yet exercised end to end:** `/api/launch` spawns a real apply run that
-submits real forms, so it has only been verified as far as the subprocess
-invocation. Drive it once with `dry_run: true` before trusting it.
+`/api/launch` was later exercised end to end (dry-run) and wired into the
+Browse tab's Launch button -- see the "Launch button wired to /api/launch"
+milestone note further down.
 
 ### Browse tab build spec
 
@@ -511,10 +517,11 @@ Des off the right edge. Fixed with `table-layout: fixed` plus an explicit
 width per column and ellipsis on every truncatable cell. **Column widths must
 not depend on which rows happen to be showing.**
 
-Deliberate remaining work: the Launch button queues a batch and then tells the
-user to run `applypilot apply --queued <batch>` by hand. Wiring it to
-`POST /api/launch` is left undone because that endpoint submits real
-applications and has never been run end to end.
+At the time this milestone shipped, the Launch button only queued a batch and
+told the user to run `applypilot apply --queued <batch>` by hand -- wiring it
+to `POST /api/launch` was left undone because that endpoint submits real
+applications and had never been run end to end. Since fixed; see the
+"Launch button wired to /api/launch" note further down.
 
 ### Post-Milestone-2 polish (2026-09-05)
 
@@ -734,16 +741,19 @@ the standing ground rule.
 
 ### Two bugs found in review, fixed (2026-09-05)
 
-- **Priority panels stretched together on drag.** `.attention-grid`'s default
-  `align-items: stretch` made the un-dragged sibling `.day-panel` match the
-  dragged one's CSS-grid row height, but that sibling's own `.tablewrap`
-  kept its own unchanged `max-height` -- so it grew a grey empty strip
-  instead of actually filling with more rows. Each panel already owns
-  independent `boxHeight` state on purpose ([[applypilot-web-ui-direction]]);
-  the fix is `align-items: start` on `.attention-grid` so the grid stops
-  forcing sibling heights to match at all. Verified in Chrome: dragging Top
-  Prestige down grew it to 17 real rows while Best Fit stayed at its own
-  natural height with no grey band.
+- **Priority panels are supposed to resize together -- only the rows weren't
+  following.** Each `AttentionPanel` owned its own `boxHeight` state, so
+  CSS Grid's `align-items: stretch` made the un-dragged sibling's *outer* box
+  match the dragged one's row height, but its own `.tablewrap` kept its own
+  unchanged `max-height` -- so it grew a grey empty strip instead of loading
+  more rows to fill it. Fix: lifted `boxHeight` out of `AttentionPanel` into
+  `BrowseTab` (`attentionBoxHeight` / `setAttentionBoxHeight`) and pass it to
+  both panels as a prop with a shared setter, so dragging either grip resizes
+  both, and each independently fetches its own rows to actually fill the
+  shared height (their `maybeLoadMore` effect already keyed off `boxHeight`,
+  so no other change was needed there). Verified in Chrome: dragging either
+  grip grows both panels to the identical height, each filled with 80 real
+  rows, no grey band.
 - **Retry inflated "Avg cost / attempt" before anything ran again.** That
   tile divided `spend` (SUM of `apply_cost_usd` over *every* row regardless
   of current status) by `applied + failed`. Retry flips a failed row's
@@ -755,6 +765,105 @@ the standing ground rule.
   by that instead. No new cost data source needed -- `apply_cost_usd` was
   already the real, launcher-recorded number; the bug was the denominator,
   not missing cost visibility.
+
+### Milestone 4 notes (Settings tab, 2026-09-05)
+
+Deliberately does **not** duplicate the Dashboard's per-ATS pass/fail
+breakdown or success-rate donut -- decided with the user that those are
+outcome diagnostics belonging next to the live run panel and applications
+table they already sit beside ([[applypilot-web-ui-direction]]). This tab is
+for actual configuration: backend/cost, limits, resume variants, API keys.
+
+- **Two settings knobs (`max_apply_attempts`, `goose_timeout`, `apply_timeout`,
+  `goose_max_turns`, `goose_max_tool_repetitions`) were hardcoded in
+  `config.DEFAULTS` and read directly at their call sites** (`launcher.py`,
+  `apply/backends/goose.py`, `apply/backends/claude_code.py`) --
+  settings.json had no effect on them at all before this. Each call site now
+  reads `settings.get(key) or config.DEFAULTS[key]`, so `None`/absent falls
+  back to the existing measured-good default and the Settings tab can
+  actually change them. `claude_code.py`'s `run_job` didn't load settings at
+  all previously; added `settings = config.load_settings()` at its top.
+- **New feature, not previously existing anywhere**: daily spend/application
+  caps. `launcher._daily_cap_reason()` reads today's slice of the `jobs`
+  table itself (`SUM(apply_cost_usd)`, `COUNT` of `applied`/`failed` rows
+  attempted today) -- no new counter table, since `mark_result()` already is
+  the durable record. Checked once per `acquire_job()` call; hitting a cap
+  returns `None`, which `worker_loop` already treats as "queue empty," so a
+  run drains to a stop rather than being killed -- a job already
+  `in_progress` finishes, since its cost is already spent regardless.
+- **New endpoints**: `GET`/`POST /api/settings` (shallow merge, one level
+  deeper for `resume_variants`/`cost_defaults` so editing one variant or one
+  backend's default cost doesn't drop the others -- though a partial
+  variant object still replaces that variant's *own* other fields, matching
+  `config.load_settings()`'s existing merge semantics; the frontend always
+  sends the whole variant object for this reason) and `GET`/`POST
+  /api/env-keys` for `~/.applypilot/.env`. The env endpoints are
+  deliberately asymmetric: GET reports only booleans (never values, read
+  from the file directly rather than `os.environ` so a key added after the
+  server started still shows correctly without a restart), and POST only
+  sets keys -- a blank field always means "leave unchanged," never "clear,"
+  because a masked input can't otherwise distinguish the two.
+- Tested by calling the FastAPI route functions directly (they're plain
+  functions under the decorator) against `config.SETTINGS_PATH`/`ENV_PATH`
+  monkeypatched into `tmp_path` -- no ASGI/TestClient/lifespan machinery
+  needed, and no risk of a test touching the real `~/.applypilot` files.
+- Verified live against the real `settings.json` and `.env` in Chrome: all
+  four sections render actual data (existing API keys correctly reported as
+  set/not-set without ever echoing a value), a save round-tripped through
+  the real file, and the test value was reverted afterward rather than left
+  behind as a real limit the user didn't ask for.
+
+### ATS filter: single dropdown to checklist (2026-09-06)
+
+The global filter bar's "Any ATS" control was a single-choice `<select>`; the
+user wanted "Workday or Greenhouse, not Lever" as one filter, which a plain
+`<select multiple>` technically supports but reads as broken (needs ctrl/cmd
++click, which nobody discovers on their own).
+
+- `GlobalFilters.ats` changed from `string | null` to `string[]` (empty =
+  no filter). New `components/AtsFilterDropdown.tsx`: a button showing "Any
+  ATS" / one name / "N ATS", opening a checkbox popover on click, closing on
+  an outside click, with a "Clear" row. Reused by nothing else -- the
+  per-day filter bars don't have their own ATS filter, only the global one
+  does.
+- Backend: `/api/jobs?ats=` is now comma-separated (`Workday,Greenhouse`)
+  rather than a single value -- simpler than a repeated-key list param for
+  what's just an OR over a handful of strings both ends already agree on.
+  `queries._filter_clauses` builds `ats IN (?,...)` instead of `ats = ?`.
+  `f["ats"]` is now always a list by contract (server.py splits the query
+  param before calling `list_jobs`); a test that previously called
+  `list_jobs({"ats": "Ashby"})` directly was updated to pass `["Ashby"]`.
+- Verified live: checking Ashby + Greenhouse narrowed both Priority panels
+  and the day-table total to exactly the jobs on those two ATSes (166, down
+  from 1401).
+
+### Launch button wired to /api/launch (2026-09-06)
+
+Milestone 2 deliberately left this undone (`POST /api/launch` submits real
+applications and spends real money, and had never been run end to end). It's
+now wired, with a "dry run" checkbox in `LaunchBar` next to Launch
+(`components/LaunchBar.tsx`, state lifted to `App.tsx`'s `dryRun`).
+
+- `App.tsx`'s `handleLaunch` now does the full two-step: `POST /api/queue`
+  (unchanged), then `POST /api/launch` with `{workers: 1, dry_run: dryRun}`
+  if anything was actually queued. On success it clears the selection and
+  switches to the Dashboard tab, where the live run panel (already built in
+  Milestone 3) picks it up over SSE. On failure -- e.g. a run is already in
+  progress, which the server already 409s on -- the note says so and points
+  out that anything already queued is still queued and can be relaunched.
+- Verified end to end twice: once via direct `curl` (queue → launch →
+  confirmed `pid` in `/api/stats` and `live: true` → `/api/stop-all` →
+  confirmed the process exited and the job's `apply_status` reverted to
+  `NULL`, not stranded `in_progress`), and once by driving the actual
+  button in Chrome with the dry-run checkbox on, confirming it auto-switched
+  to the Dashboard tab and showed the live worker panel with a "DRY RUN"
+  badge, then stopping it the same way. Both test jobs picked had no
+  tailored resume, so the worker errored out before making any LLM call --
+  zero cost either time, and nothing was left in a stuck state in the DB.
+- **A dry run is not free**: it drives the whole agent loop right up to the
+  final Submit click, so it costs the same LLM-call money a real run would.
+  Worth remembering before dry-running a large batch just to "check it
+  works" -- one job is enough to prove the wiring.
 
 ### Decisions log
 
@@ -793,3 +902,147 @@ Record any decision a future session should not re-litigate.
 - **2026-09-05** — The **React build runs on Sonnet**, against the published
   mock as spec. The backend seams and their tests are already done, so the
   frontend work is well-specified enough not to need the larger model.
+
+---
+
+## Ranking rework: pay, prestige, and the big-tech pin — 2026-09-06
+
+Everything below was driven by one question -- "are the dashboards actually
+helping me apply to what I want" -- and the answer was no, for three reasons
+that were all invisible from the UI.
+
+### The strategy this now encodes
+
+Senior graduating **May 2027**. A 60/40 split: 60% of applications to
+new-grad roles (**$90k+**, New York strongly preferred), 40% to Spring/Summer
+2027 internships (**$30/hr+**, location flexible when the pay or relocation
+is good). **Every FAANG / big-tech posting gets applied to regardless of fit.**
+Skills fit is deliberately demoted -- most postings match most of the
+candidate's skills, so it carries almost no discriminating signal.
+
+### 1. Pay contributed nothing to a New York posting (bug)
+
+`compute_desirability` summed `pay_weight` into `location_weight`, and
+`_location_desirability` returned a flat `10.0` for the preferred city --
+discarding pay entirely. Verified in the live DB before the fix: holding
+`company_prestige = 7`, NYC, new-grad, **every** posting scored
+`desirability = 8.8` from $40/hr to $120/hr. At prestige 9, all 23 postings
+scored `9.6` from $50/hr to $170/hr.
+
+Pay, prestige and location are three independent weighted components now,
+weighted **per lane** (`new_grad_weights` / `internship_weights` in
+settings.json) because the priorities genuinely differ: staying in New York is
+worth nearly as much as money for a full-time role, and much less for one
+semester with relocation paid.
+
+- `_pay_tier_score(salary, is_internship)` replaces the old 4-step function
+  with a continuous piecewise-linear curve on real anchors -- $90k/$120k/$150k/$180k
+  annual, $30/$45/$60/$75 hourly. The old bands returned the same number
+  across a $60k spread.
+- **Unstated pay scores a neutral 5.0, never 0.** 128 of the 470 eligible
+  high-prestige internships state no salary; a zero would bury exactly the
+  postings worth seeing.
+- `_location_desirability` no longer takes a salary argument at all.
+
+After the fix, at prestige 7 in NYC: 6.12 → 8.95 as pay rises. At prestige 9:
+7.17 → 9.65.
+
+### 2. Fit buried the best employers (bug)
+
+`fit_weight: 0.7` vs `desirability_weight: 0.3`. Live averages for eligible
+postings: Meta internships fit **3.4**, NVIDIA 4.5, Netflix 4.5, Anthropic
+new-grad **2.0**, Apple new-grad 4.0 -- all at prestige 10, and **zero
+applications had ever been sent to any of them** (6 applications total across
+5,110 scored jobs).
+
+New `company_tier` column (`'tier1' | 'adjacent' | NULL`), computed by
+`scorer.compute_company_tiers()` from `config.TIER1_COMPANIES` /
+`TIER1_ADJACENT` plus an automatic `company_prestige >= 9` rule so an unlisted
+company still surfaces. **Stored, not derived in SQL**: name matching needs
+normalisation, and a `LIKE 'block%'` pattern would happily match "Blockchain
+Widgets Inc". Audited on the live data -- 703 tier1 rows across 35 company
+name spellings, no false positives.
+
+The tier is a **hard pin above the ranking**, not another weighted term a low
+fit could outvote. New `top` sort (now `DEFAULT_SORT`):
+tier → desirability → fit as a pure tiebreaker. `include_tier=true` exempts a
+tiered posting from every `min_*` bar, which is how a prestige-10 posting with
+fit 3 and no stated salary still appears in a filtered view.
+
+Visually, big-tech company names carry an animated gold sweep
+(`.tier1-company` / `.tier-adjacent` in `index.css`, `@supports`-guarded with
+a solid-gold fallback, motion-reduced honoured) -- in a dense table nothing
+else on the row says "apply to this one anyway".
+
+### 3. The grad-date resume idea is scrapped
+
+There is now exactly one resume and one graduation date. Deleted:
+`resume_variants` + `default_resume_variant` from config and settings.json,
+`get_resume_variant_paths`, `_pick_resume_variant`, the SettingsTab variant
+grid, `ResumeVariant`, `tests/test_resume_variants.py`. Replaced by top-level
+`graduation_date` / `earliest_start_date` settings and
+`config.get_resume_paths()` / `get_grad_and_start_dates()`.
+
+`scoring/router.py` is **kept** -- track routing (swe/aiml/data) is
+grad-year-independent and still labels a posting in the expanded row. The
+`resume_variant` DB column is kept as legacy data (no migration) but is never
+written again.
+
+### 4. The sibling-company eligibility nuke (bug)
+
+`_clear_terminal_flags_on_grad_date_mismatch` set `eligible='no'` on **every**
+not-yet-applied internship at the same company after one form mismatch. Right
+for Verkada's five near-identical postings; wrong for Amazon's 29 distinct
+internships, and in direct conflict with the big-tech requirement above.
+
+Guarded: a tier-listed employer, or one with more than
+`_SIBLING_SWEEP_MAX` (8) sibling internships, gets its siblings marked
+`'unclear'` with a note -- still visible, still applyable, flagged for review
+-- rather than disqualified. Only softens rows currently `'yes'`, so a real
+disqualifier the scorer found separately is never undone. The originating
+job's own flags are cleared either way.
+
+### 5. 87% of the corpus predated the TERM / TERMINAL_EVIDENCE checks
+
+4,428 rows (scored 09-03 and 09-04) had `scored_at` set but `term` and
+`terminal_evidence_llm` NULL -- those prompt sections didn't exist yet. So the
+Spring/Summer gate was falling back to reading titles, and **only 23 rows in
+the whole DB were flagged as terminal internships** -- the mechanism that makes
+a Summer 2027 role reachable at all after graduating had barely fired.
+
+New `applypilot rescore-stale` targets exactly those rows
+(`scored_at IS NOT NULL AND term IS NULL`), and `applypilot recompute` re-runs
+every derived field with no LLM calls at all.
+
+**Provider note:** the `.env` override points at `z-ai/glm-5.3-flash` via
+OpenRouter, which measures ~15s per scoring call (~19 hours for this backlog).
+Gemini answers the same prompt in well under a second, so the backfill was run
+against Gemini directly.
+
+### UI changes
+
+- Both Priority lanes sort `top` and carry **their own pay floor** ($90k/yr
+  for new grad, $30/hr for internships), with big tech exempt from both.
+- **Live 60/40 split counter** (`SplitCounter.tsx`) over everything ticked
+  across both lanes and every day table. It reports and never blocks -- a hard
+  quota would be wrong when a week genuinely is all internships. Amber past
+  ±10 points of drift.
+- New global filters: **Big tech only**, **location** (NYC / preferred metros
+  / remote -- buckets identical to `_location_desirability`'s own tiers so
+  filter and score can't disagree), **term** (Spring / Summer, narrowing
+  within the two workable seasons, never widening past them).
+- New **Big Tech** preset chip per day: tier only, no score bars at all.
+- Settings tab: the variant grid is replaced by a **Ranking** section exposing
+  both weight triples. `fit_weight`/`desirability_weight` are gone entirely.
+
+### Decisions
+
+- **Fit is a tiebreaker, never a gate.** It stays a visible, sortable column;
+  it is out of every composite.
+- **The tier is a pin, not a weight.** A weight can be outvoted; the whole
+  requirement is that it can't be.
+- **The 60/40 split is reported, not enforced.** Selection stays the human's.
+- **`company_tier` is a stored column.** Name matching needs normalisation
+  that SQL `LIKE` can't do safely.
+- **Unstated pay is neutral (5.0), not zero.** Missing information is not bad
+  news, and treating it as bad news silently buries big tech.

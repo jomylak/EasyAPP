@@ -30,6 +30,16 @@ from applypilot.config import (
 console = Console()
 
 
+def _save_env_key(key: str, value: str) -> None:
+    """Set one key in ~/.applypilot/.env, creating the file if needed."""
+    from dotenv import set_key
+
+    ensure_dirs()
+    if not ENV_PATH.exists():
+        ENV_PATH.touch()
+    set_key(str(ENV_PATH), key, value)
+
+
 # ---------------------------------------------------------------------------
 # Resume
 # ---------------------------------------------------------------------------
@@ -100,8 +110,13 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
+
+    job_password = Prompt.ask(
+        "Job site password (used for login walls during auto-apply)", password=True, default=""
+    )
+    if job_password:
+        _save_env_key("APPLYPILOT_JOB_PASSWORD", job_password)
 
     # -- Work Authorization --
     console.print("\n[bold cyan]Work Authorization[/bold cyan]")

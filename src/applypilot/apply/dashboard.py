@@ -36,6 +36,10 @@ class WorkerState:
     status: str = "starting"  # starting, applying, applied, failed, expired, captcha, idle, done
     job_title: str = ""
     company: str = ""
+    # 'tier1' | 'adjacent' | None -- see config.TIER1_COMPANIES. Lets the web
+    # UI give the same gold treatment to a live worker's company name that it
+    # gives one sitting in a table row.
+    company_tier: str | None = None
     score: int = 0
     start_time: float = 0.0
     actions: int = 0

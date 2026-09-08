@@ -24,6 +24,7 @@ const MIN_BOX_HEIGHT = 140
 const MAX_BOX_HEIGHT = 900
 
 export const SORT_LABEL: Record<SortKey, string> = {
+  top: "Top",
   prestige: "Prestige",
   fit: "Fit",
   desirability: "Desirability",
@@ -59,7 +60,23 @@ const columnHelper = createColumnHelper<JobRow>()
 export const columns = [
   columnHelper.accessor("company", {
     id: "company",
-    cell: (info) => info.getValue() || "—",
+    // Big-tech employers get the animated gold sweep. These postings are
+    // pinned above the ranking rather than weighted into it, so they need to
+    // be identifiable at a glance in a dense table -- the whole reason the
+    // tier exists is that their fit scores are often terrible (Meta's
+    // internships average 3.4) and nothing else on the row would say
+    // "apply to this one anyway".
+    cell: (info) => {
+      const name = info.getValue()
+      if (!name) return "—"
+      const tier = info.row.original.company_tier
+      if (!tier) return name
+      return (
+        <span className={tier === "tier1" ? "tier1-company" : "tier-adjacent"}>
+          {name}
+        </span>
+      )
+    },
   }),
   columnHelper.accessor("title", {
     id: "title",
@@ -95,14 +112,18 @@ interface Props {
   defaultPageSize: number
   globalFilters: GlobalFilters
   selected: Set<string>
-  onToggleSelect: (url: string) => void
-  onToggleMany: (urls: string[], checked: boolean) => void
+  onToggleSelect: (url: string, jobType: string | null) => void
+  onToggleMany: (rows: { url: string; job_type: string | null }[], checked: boolean) => void
 }
 
 interface Preset {
   label: string
   filters: DayFilters
   sort: SortKey
+  // Narrow this day to big-tech postings only. Not a DayFilters key because
+  // it's a server-side scope, not one of the numeric bars the per-day
+  // controls edit -- clearing the bars must not clear it.
+  tierOnly?: boolean
 }
 
 export function DayTable({
@@ -154,10 +175,19 @@ export function DayTable({
         filters: { ...EMPTY_DAY_FILTERS, min_fit: 8, min_desirability: 6 },
         sort: "fit",
       },
+      bigtech: {
+        label: `${day.total} postings · big tech only`,
+        // No bars at all, deliberately: closed mouths don't get fed. A
+        // prestige-10 posting with a fit of 3 is exactly what this view is
+        // for, and any min_* here would hide it.
+        filters: EMPTY_DAY_FILTERS,
+        sort: "top",
+        tierOnly: true,
+      },
       all: {
         label: `${day.total} postings`,
         filters: EMPTY_DAY_FILTERS,
-        sort: "prestige",
+        sort: "top",
       },
     }),
     [day.total, day.prestige, day.best_fit],
@@ -176,10 +206,22 @@ export function DayTable({
       q: debouncedFilters.q || globalFilters.q || undefined,
       job_type: globalFilters.job_type,
       site: globalFilters.site,
-      ats: globalFilters.ats,
-      eligible_only: globalFilters.eligible_only,
+      ats: globalFilters.ats.length ? globalFilters.ats.join(",") : undefined,
       above_pay_floor: globalFilters.above_pay_floor,
       unapplied_only: globalFilters.unapplied_only,
+      terminal_only: globalFilters.terminal_only,
+      likely_terminal_only: globalFilters.likely_terminal_only,
+      location: globalFilters.location,
+      term: globalFilters.term,
+      tier_only:
+        globalFilters.tier_only ||
+        (activeChip ? presets[activeChip]?.tierOnly : false) ||
+        false,
+      // Always on: a big-tech posting is never hidden by a threshold, in any
+      // view. Without this the "Top Prestige" preset's own min_prestige 9
+      // would still cut prestige-8 Datadog/IBM postings the tier is meant to
+      // guarantee.
+      include_tier: true,
     }
   }
 
@@ -217,8 +259,11 @@ export function DayTable({
     setNextPage(0)
     setOpenRows(new Set())
     loadPage(id, 0, true)
+    // activeChip is a dep because the Big Tech preset changes the *scope*
+    // (tier_only) without touching filters or sort -- going to it from "All"
+    // would otherwise leave every dep identical and never refetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [day.day, sort, debouncedFilters, globalFilters])
+  }, [day.day, sort, debouncedFilters, globalFilters, activeChip])
 
   // Infinite scroll: fetch the next chunk when the user nears the bottom of
   // this day's own scroll box, or when the box is taller than the content
@@ -322,6 +367,13 @@ export function DayTable({
             Best Fit<span className="c">{day.best_fit}</span>
           </button>
           <button
+            className={`chip chip-tier${activeChip === "bigtech" ? " on" : ""}`}
+            onClick={() => applyPreset("bigtech")}
+            title="FAANG and big tech, no score bars at all"
+          >
+            Big Tech
+          </button>
+          <button
             className={`chip${activeChip === "all" ? " on" : ""}`}
             onClick={() => applyPreset("all")}
           >
@@ -388,7 +440,10 @@ export function DayTable({
                   checked={allLoadedSelected}
                   onChange={(e) =>
                     onToggleMany(
-                      tableRows.map((r) => r.original.url),
+                      tableRows.map((r) => ({
+                        url: r.original.url,
+                        job_type: r.original.job_type,
+                      })),
                       e.target.checked,
                     )
                   }
@@ -460,8 +515,40 @@ export interface RowPairProps {
   original: JobRow
   isSel: boolean
   isOpen: boolean
-  onToggleSelect: (url: string) => void
+  onToggleSelect: (url: string, jobType: string | null) => void
   onToggleOpen: (url: string) => void
+}
+
+/**
+ * Grad-date-safety signal for internships, at a glance -- see
+ * compute_terminal_internships / compute_likely_terminal_internships /
+ * compute_remote_spring_internships in scoring/scorer.py for how each is
+ * derived. Confirmed and remote-spring share the apply queue's top-priority
+ * tier; likely is a manual-review signal only, never queue-boosted.
+ */
+function TerminalBadge({ row }: { row: JobRow }) {
+  if (row.is_terminal_internship === "yes") {
+    return (
+      <span className="tbadge tbadge-confirmed" title="Confirmed terminal: posting explicitly welcomes an already-graduated candidate">
+        T
+      </span>
+    )
+  }
+  if (row.is_remote_spring_internship === "yes") {
+    return (
+      <span className="tbadge tbadge-confirmed" title="Remote Spring internship: term ends before graduation, no grad-date conflict possible">
+        RS
+      </span>
+    )
+  }
+  if (row.is_terminal_internship_likely === "yes") {
+    return (
+      <span className="tbadge tbadge-likely" title="Likely terminal: strong match, but posting never says either way about post-grad eligibility -- worth a manual look">
+        L?
+      </span>
+    )
+  }
+  return null
 }
 
 export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggleOpen }: RowPairProps) {
@@ -475,12 +562,13 @@ export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggle
             checked={isSel}
             aria-label={`Select ${original.company ?? original.title ?? original.url}`}
             onClick={(e) => e.stopPropagation()}
-            onChange={() => onToggleSelect(original.url)}
+            onChange={() => onToggleSelect(original.url, original.job_type)}
           />
         </td>
         <td className="idx">{row.index + 1}</td>
         <td className="co" title={original.company ?? undefined}>{flexRender(cellsById.get("company")!.column.columnDef.cell, cellsById.get("company")!.getContext())}</td>
         <td className="ti" title={original.title ?? undefined}>
+          <TerminalBadge row={original} />
           {flexRender(cellsById.get("title")!.column.columnDef.cell, cellsById.get("title")!.getContext())}
         </td>
         <td className="loc">

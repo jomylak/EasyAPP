@@ -161,6 +161,30 @@ def _classify_job_type(site: str) -> str | None:
     return None
 
 
+# Jobright's own "intern" category feed mixes in postings that are actually
+# full new-grad roles (e.g. a title literally saying "New Grad 2027" or
+# "... Graduate ... 2027 Start") -- _classify_job_type trusts the source site
+# unconditionally, so those inherit "internship" with nothing to correct it.
+# Titles are the one signal that disagrees, so check them too rather than
+# trusting the site name alone. Deliberately conservative: any "intern"
+# wording in the title wins, since a title can legitimately say both (e.g.
+# "New Grad Internship Program").
+_TITLE_NEW_GRAD_RE = re.compile(
+    r"\bnew[\s-]?grad(?:uate)?\b"
+    r"|\bgraduate\b(?!\s+(?:student|program|school|degree))",
+    re.I,
+)
+
+
+def title_suggests_new_grad(title: str | None) -> bool:
+    """Does this job title read as a new-grad role regardless of source site?"""
+    if not title:
+        return False
+    if re.search(r"\bintern(?:ship)?\b", title, re.I):
+        return False
+    return bool(_TITLE_NEW_GRAD_RE.search(title))
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -187,12 +211,15 @@ def _store_jobs_filtered(
         if not _posted_within_days(job.get("posted_date"), days=config.DEFAULTS["discovery_posted_within_days"]):
             too_old += 1
             continue
+        row_job_type = job_type
+        if row_job_type == "internship" and title_suggests_new_grad(job.get("title")):
+            row_job_type = "new_grad"
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now, job_type,
+                 job.get("location"), site, strategy, now, row_job_type,
                  _normalize_posted_date(job.get("posted_date"))),
             )
             new += 1

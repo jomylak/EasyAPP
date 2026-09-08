@@ -77,6 +77,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    settings = config.load_settings()
+
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -128,6 +130,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                  # scoring has not filled it in yet -- `site` is the board
                  # ("Intern List - SWE"), never the company.
                  company=job.get("company") or job.get("site", ""),
+                 company_tier=job.get("company_tier"),
                  url=job.get("url", ""), score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
@@ -265,7 +268,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     text_parts.append(line)
                     lf.write(line + "\n")
 
-        proc.wait(timeout=config.DEFAULTS["apply_timeout"])
+        proc.wait(timeout=settings.get("apply_timeout") or config.DEFAULTS["apply_timeout"])
         returncode = proc.returncode
         proc = None
 

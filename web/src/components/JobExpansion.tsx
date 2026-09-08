@@ -89,7 +89,15 @@ export function JobExpansion({ row, open }: Props) {
       <div>
         <dl className="kv">
           <dt>Company</dt>
-          <dd>{row.company || "—"}</dd>
+          <dd>
+            {row.company ? (
+              <span className={row.company_tier === "tier1" ? "tier1-company" : row.company_tier ? "tier-adjacent" : undefined}>
+                {row.company}
+              </span>
+            ) : (
+              "—"
+            )}
+          </dd>
           <dt>Title</dt>
           <dd>{row.title || "—"}</dd>
           <dt>Pay</dt>
@@ -100,8 +108,12 @@ export function JobExpansion({ row, open }: Props) {
           <dd>{row.job_type || "—"}</dd>
           <dt>ATS</dt>
           <dd>{row.ats || "—"}</dd>
-          <dt>Resume</dt>
-          <dd>{detail?.resume_variant || detail?.resume_route?.track || "—"}</dd>
+          {/* One resume now, so this reports the routed *track* (swe / aiml /
+              data) as a label on the posting, not a file that gets swapped
+              in. resume_variant is legacy data on rows tailored before the
+              variant system was removed. */}
+          <dt>Track</dt>
+          <dd>{detail?.resume_route?.track || detail?.resume_variant || "—"}</dd>
           <dt>Eligible</dt>
           <dd style={{ color: row.eligible === "no" ? "var(--a-bad)" : "var(--a-good)" }}>
             {row.eligible === "no" ? "no" : row.eligible || "yes"}

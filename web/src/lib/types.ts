@@ -30,10 +30,27 @@ export interface JobRow {
   fit_score: number | null
   desirability_score: number | null
   company_prestige: number | null
+  // 'tier1' | 'adjacent' | null -- see config.TIER1_COMPANIES. Pinned above
+  // the ranking rather than weighted into it.
+  company_tier: string | null
   job_type: string | null
   ats: string | null
   eligible: string | null
   keywords: string | null
+  // spring | summer | fall | winter | rolling | unclear | null -- the LLM's
+  // own read of the posting's academic term (TERM CHECK in SCORE_PROMPT).
+  term: string | null
+  // 'yes' | 'no' | null -- explicit evidence the posting welcomes an
+  // already-graduated candidate, cleared the fit/desirability bar. Absolute
+  // top apply-queue priority, same tier as is_remote_spring_internship.
+  is_terminal_internship: string | null
+  // 'yes' | 'no' | null -- strong match, posting says nothing either way
+  // about post-grad eligibility. Worth a manual look, not queue-boosted.
+  is_terminal_internship_likely: string | null
+  // 'yes' | 'no' | null -- fully-remote Spring-term internship; needs no
+  // grad-date evidence at all since the term ends before graduation. Same
+  // top apply-queue priority tier as is_terminal_internship.
+  is_remote_spring_internship: string | null
   apply_status: string | null
   applied_at: string | null
   apply_error: string | null
@@ -96,6 +113,9 @@ export interface QueueResponse {
 }
 
 export type SortKey =
+  // Big tech pinned first, then desirability, with fit as a pure tiebreaker.
+  // The default -- fit used to lead and it buried the best postings.
+  | "top"
   | "prestige"
   | "fit"
   | "desirability"
@@ -127,10 +147,27 @@ export const EMPTY_DAY_FILTERS: DayFilters = {
 export interface GlobalFilters {
   site: string | null
   job_type: string | null
-  ats: string | null
-  eligible_only: boolean
+  // Multiple ATSes checked at once (empty = any), not a single choice --
+  // e.g. "Workday or Greenhouse, not Lever" in one filter.
+  ats: string[]
   above_pay_floor: boolean
   unapplied_only: boolean
+  // Confirmed terminal: is_terminal_internship = 'yes' -- posting explicitly
+  // welcomes an already-graduated candidate.
+  terminal_only: boolean
+  // Manual-review queue: is_terminal_internship_likely = 'yes' only -- a
+  // strong match whose posting never addresses post-grad eligibility either
+  // way, so it's worth a human look rather than an automatic queue boost.
+  likely_terminal_only: boolean
+  // Big tech only -- the "closed mouths don't get fed" view. Every FAANG /
+  // big-tech posting gets applied to regardless of how its fit scores.
+  tier_only: boolean
+  // Coarse location bucket: "nyc" | "metro" | "remote" | null. Matches
+  // scorer._location_desirability's own tiers so the filter and the score
+  // can't disagree about what counts as NYC.
+  location: string | null
+  // Internship season: "spring" | "summer" | null.
+  term: string | null
   q: string
 }
 
@@ -169,6 +206,9 @@ export interface WorkerState {
   status: string
   job_title: string
   company: string
+  // 'tier1' | 'adjacent' | null -- same field as JobRow.company_tier, so the
+  // live worker row can get the same gold treatment as a table row.
+  company_tier: string | null
   score: number
   start_time: number
   actions: number
@@ -211,12 +251,60 @@ export interface AtsStat {
   median_duration_s: number | null
 }
 
+// src/applypilot/scoring/scorer.py:compute_desirability -- the three
+// independent components of a desirability score, weighted per lane. Pay and
+// location used to be one folded term, which silently discarded pay whenever
+// the location scored well on its own.
+export interface LaneWeights {
+  pay: number
+  prestige: number
+  location: number
+}
+
+// src/applypilot/config.py:DEFAULT_SETTINGS -- the full settings.json shape.
+// Every numeric cap here is nullable: null means "use the built-in default"
+// (config.DEFAULTS) for the per-job knobs, or "no cap" for the daily ones.
+export interface Settings {
+  apply_backend: "goose" | "claude"
+  apply_fallback_backend: string | null
+  cost_defaults: Record<string, number>
+  max_daily_spend_usd: number | null
+  max_daily_applications: number | null
+  max_apply_attempts: number | null
+  apply_timeout: number | null
+  goose_timeout: number | null
+  goose_max_turns: number | null
+  goose_max_tool_repetitions: number | null
+  goose_writes_quirks: boolean
+  tailoring_enabled: boolean
+  cover_letters_enabled: boolean
+  graduation_date: string
+  earliest_start_date: string
+  new_grad_weights: LaneWeights
+  internship_weights: LaneWeights
+  [key: string]: unknown
+}
+
+export const KNOWN_ENV_KEYS = [
+  "GEMINI_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "LLM_URL",
+  "APPLYPILOT_JOB_PASSWORD",
+] as const
+export type EnvKeyName = (typeof KNOWN_ENV_KEYS)[number]
+export type EnvKeyStatus = Record<EnvKeyName, boolean>
+
 export const EMPTY_GLOBAL_FILTERS: GlobalFilters = {
   site: null,
   job_type: null,
-  ats: null,
-  eligible_only: false,
+  ats: [],
   above_pay_floor: false,
   unapplied_only: false,
+  terminal_only: false,
+  likely_terminal_only: false,
+  tier_only: false,
+  location: null,
+  term: null,
   q: "",
 }

@@ -46,7 +46,9 @@ def db(tmp_path):
 def test_days_are_newest_first_with_counts(db):
     days = queries.list_days(db)
     assert [d["day"] for d in days] == ["2026-09-03", "2026-09-02"]
-    assert days[0]["total"] == 4
+    # u4 is eligible='no' -- must not count toward a day total the job list
+    # itself won't show, same eligibility gate list_jobs() enforces.
+    assert days[0]["total"] == 3
 
 
 def test_a_job_with_no_posted_date_still_lands_on_a_day(db):
@@ -69,9 +71,11 @@ def test_chip_counts_match_the_filters_they_label(db):
 # ---------------------------------------------------------------------------
 
 def test_a_day_query_only_returns_that_day(db):
+    # u4 is eligible='no' -- eligibility is enforced unconditionally now, see
+    # test_eligibility_is_always_enforced below.
     res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
-    assert res["total"] == 4
-    assert {r["url"] for r in res["rows"]} == {"u1", "u2", "u3", "u4"}
+    assert res["total"] == 3
+    assert {r["url"] for r in res["rows"]} == {"u1", "u2", "u3"}
 
 
 @pytest.mark.parametrize("sort,first", [
@@ -90,7 +94,7 @@ def test_an_unknown_sort_falls_back_instead_of_erroring(db):
     """The sort key arrives from a query string; it must never reach SQL raw."""
     res = queries.list_jobs({"day": "2026-09-03"}, sort="; DROP TABLE jobs--", conn=db)
     assert res["sort"] == queries.DEFAULT_SORT
-    assert res["total"] == 4
+    assert res["total"] == 3
     assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 6
 
 
@@ -99,19 +103,19 @@ def test_pagination_covers_every_row_exactly_once(db):
     for page in range(4):
         res = queries.list_jobs({"day": "2026-09-03"}, page=page, page_size=2, conn=db)
         seen += [r["url"] for r in res["rows"]]
-    assert sorted(seen) == ["u1", "u2", "u3", "u4"]
+    assert sorted(seen) == ["u1", "u2", "u3"]
 
 
-def test_eligible_filter_keeps_unknowns(db):
-    """'unclear'/NULL passes: a wrong reject costs a real opportunity, and
-    plenty of rows were scored before the gate existed."""
-    res = queries.list_jobs({"day": "2026-09-02", "eligible_only": True}, conn=db)
+def test_eligibility_is_always_enforced(db):
+    """Not an opt-in flag any more -- there is no reason this table should
+    ever surface a job that can't honestly be applied to. 'unclear'/NULL
+    still passes: a wrong reject costs a real opportunity, and plenty of
+    rows were scored before the gate existed."""
+    res = queries.list_jobs({"day": "2026-09-02"}, conn=db)
     assert {r["url"] for r in res["rows"]} == {"u5", "u6"}   # both NULL, both kept
 
-
-def test_eligible_filter_drops_explicit_no(db):
-    res = queries.list_jobs({"day": "2026-09-03", "eligible_only": True}, conn=db)
-    assert "u4" not in {r["url"] for r in res["rows"]}
+    res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
+    assert "u4" not in {r["url"] for r in res["rows"]}   # explicit 'no', dropped
 
 
 @pytest.mark.parametrize("f,expected", [
@@ -120,12 +124,36 @@ def test_eligible_filter_drops_explicit_no(db):
     ({"min_prestige": 10}, {"u1", "u2"}),
     ({"min_desirability": 8.6}, {"u1"}),
     ({"job_type": "new_grad"}, {"u2"}),
-    ({"ats": "Ashby"}, {"u3", "u4"}),
+    ({"ats": ["Ashby"]}, {"u3"}),            # u4 also matches Ashby but is eligible='no'
+    ({"ats": ["Ashby", "Greenhouse"]}, {"u2", "u3"}),
     ({"q": "SpaceX"}, {"u2"}),
 ])
 def test_filters(db, f, expected):
     res = queries.list_jobs({"day": "2026-09-03", **f}, conn=db)
     assert {r["url"] for r in res["rows"]} == expected
+
+
+def test_internship_term_filter_keeps_spring_and_summer_drops_fall_winter(db):
+    """Not an opt-in flag any more -- Spring and Summer are the candidate's
+    only two workable terms, so this always applies to internships. Spring
+    used to require the title ALSO say Summer to survive; that was a bug,
+    not a feature -- a Spring-only posting is explicitly wanted now."""
+    db.execute("UPDATE jobs SET title = 'Winter 2027 Software Engineering Intern' WHERE url = 'u1'")
+    db.execute("UPDATE jobs SET title = 'Fall 2027 Data Science Intern' WHERE url = 'u3'")
+    db.execute(
+        "UPDATE jobs SET title = 'Spring 2027 Software Engineering Intern', "
+        "eligible = 'yes' WHERE url = 'u4'"
+    )
+    db.commit()
+    res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
+    urls = {r["url"] for r in res["rows"]}
+    assert "u1" not in urls and "u3" not in urls
+    assert {"u2", "u4"} <= urls   # u2 has no season keyword; u4 is Spring-only
+
+    db.execute("UPDATE jobs SET title = 'Summer 2027 Software Engineering Intern' WHERE url = 'u6'")
+    db.commit()
+    res = queries.list_jobs({"day": "2026-09-02"}, conn=db)
+    assert "u6" in {r["url"] for r in res["rows"]}
 
 
 def test_posted_within_days_uses_real_now_not_fixture_dates(db):

@@ -20,8 +20,11 @@ Two design rules do the real work here:
 
 import re
 
-# Track names -- these compose with a grad year into a resume_variants key
-# in settings.json (e.g. "aiml" + "2027" -> "aiml_2027").
+# Track names. These used to compose with a grad year into a resume_variants
+# key ("aiml" + "2027"); that whole variant system is gone -- there is one
+# resume and one graduation date now. The routing itself is kept because the
+# track it reports is still a useful label on a posting, shown in the browse
+# tab's expanded row.
 SWE = "swe"
 AIML = "aiml"
 DATA = "data"

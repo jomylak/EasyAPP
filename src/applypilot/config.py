@@ -347,6 +347,23 @@ DEFAULT_SETTINGS: dict = {
     # more expensive driver, so it is worth one attempt on the jobs Goose
     # could not finish -- but only those. Set to null to disable the retry.
     "apply_fallback_backend": "claude",
+    # Soft daily stops, checked once per acquire_job() call (launcher.py).
+    # None means no cap. Hitting either just stops new jobs from being
+    # claimed for the rest of the day -- a job already in_progress finishes
+    # rather than being killed mid-application, since the money to get it
+    # that far is already spent. Read from today's slice of the jobs table
+    # itself (apply_cost_usd, apply_status), not a separate counter.
+    "max_daily_spend_usd": None,
+    "max_daily_applications": None,
+    # Per-job ceilings, overridable here; fall back to config.DEFAULTS when
+    # unset. max_apply_attempts also gates the ranked queue (see
+    # launcher._select_ranked); apply_timeout is the Claude backend's
+    # wall-clock cap, goose_timeout the Goose backend's.
+    "max_apply_attempts": None,
+    "apply_timeout": None,
+    "goose_timeout": None,
+    "goose_max_turns": None,
+    "goose_max_tool_repetitions": None,
     # Whether a Goose run may write to the per-ATS known-quirks cache when it
     # reports RESULT:APPLIED with a QUIRK line.
     #
@@ -414,58 +431,81 @@ DEFAULT_SETTINGS: dict = {
     # that happen to sit near a pay-tier boundary. Not scaled by the stipend
     # size: just 3 of 1090 internships state a figure.
     "housing_bonus": 0.5,
+    # Same flat-bump treatment as housing_bonus: a remote internship is worth
+    # more regardless of where it's based, so this applies on top of
+    # _location_desirability's own "Remote" tier (7.0) rather than being the
+    # only thing that recognizes remote at all.
+    "remote_bonus": 0.5,
 
-    "terminal_min_fit": 9,
-    "terminal_min_desirability": 6.0,
+    # Bars for is_terminal_internship / is_terminal_internship_likely. Gated
+    # on fit_score + company_prestige directly (not desirability_score) --
+    # desirability folds in location/pay too, which muddies "is this company
+    # actually reputable" with "is this a good deal for me," and the
+    # candidate wants those judged separately here. Below-floor pay is still
+    # excluded unconditionally by pay_below_floor regardless of this bar.
+    "terminal_min_fit": 6,
+    "terminal_min_prestige": 6,
 
-    "default_resume_variant": "swe_2027",
+    # Bars for is_remote_spring_internship. Looser than the terminal bars --
+    # this route to the priority tier needs no grad-date evidence at all, so
+    # the risk of prioritizing a merely-okay match is just "worth an
+    # application," not "silently repeats a mismatch." Still gated (not 0)
+    # to keep out genuine bottom-tier noise.
+    "remote_spring_min_fit": 5,
+    "remote_spring_min_prestige": 5,
 
-    # Resume variants are keyed "{track}_{gradyear}". Track comes from
-    # scoring.router.route_resume_track (swe | aiml | data), grad year from
-    # whether the posting requires a returning student. Six entries, but only
-    # three maintained LaTeX sources -- each is compiled twice with a
-    # different \graddate.
+    # The candidate has exactly one resume printed with exactly one
+    # graduation date. There is deliberately no second "returning student"
+    # identity to fall back on -- that idea was scrapped, so a posting that
+    # demands a later graduation date is simply not applicable.
     #
-    # The two legacy entries below are kept deliberately: they point at
-    # resume files that exist today, so get_resume_variant_paths can fall
-    # back to them and keep the pipeline running until the six new PDFs are
-    # exported from Overleaf.
-    "resume_variants": {
-        "swe_2027": {
-            "pdf": "resume_swe_2027.pdf", "txt": "resume_swe_2027.txt",
-            "grad_date": "May 2027", "start_date": "August 2027",
-        },
-        "swe_2028": {
-            "pdf": "resume_swe_2028.pdf", "txt": "resume_swe_2028.txt",
-            "grad_date": "December 2027", "start_date": "February 2028",
-        },
-        "aiml_2027": {
-            "pdf": "resume_aiml_2027.pdf", "txt": "resume_aiml_2027.txt",
-            "grad_date": "May 2027", "start_date": "August 2027",
-        },
-        "aiml_2028": {
-            "pdf": "resume_aiml_2028.pdf", "txt": "resume_aiml_2028.txt",
-            "grad_date": "December 2027", "start_date": "February 2028",
-        },
-        "data_2027": {
-            "pdf": "resume_data_2027.pdf", "txt": "resume_data_2027.txt",
-            "grad_date": "May 2027", "start_date": "August 2027",
-        },
-        "data_2028": {
-            "pdf": "resume_data_2028.pdf", "txt": "resume_data_2028.txt",
-            "grad_date": "December 2027", "start_date": "February 2028",
-        },
-        # Legacy, pre-track. Fallback targets only -- never routed to.
-        "default": {
-            "pdf": "resume.pdf", "txt": "resume.txt",
-            "grad_date": "May 2027", "start_date": "August 2027",
-        },
-        "returning_2028": {
-            "pdf": "resume_2028.pdf", "txt": "resume_2028.txt",
-            "grad_date": "December 2027", "start_date": "February 2028",
-        },
-    },
+    # start_date is configured separately rather than computed from
+    # graduation_date: the gap between graduating and being available to
+    # start is not a fixed offset, so any single formula would be wrong for
+    # some terms.
+    "graduation_date": "May 2027",
+    "earliest_start_date": "August 2027",
 }
+
+
+
+# ── Company tiers ─────────────────────────────────────────────────────────
+#
+# The candidate's hard requirement is that every posting from a household-name
+# tech company gets applied to, regardless of how the skills-fit score reads.
+# Fit is near-useless as a discriminator here (most postings match most of
+# their skills) and it was actively burying these: Meta internships average
+# fit 3.4, Anthropic new-grad 2.0, Apple new-grad 4.0 -- all at prestige 10,
+# and none had ever been applied to. So tier membership is a hard pin ABOVE
+# the ranking, not another weighted term that a low fit could outvote.
+#
+# Matched case-insensitively against the `company` column, on a normalized
+# form (punctuation and legal suffixes stripped) so "Meta Platforms, Inc."
+# and "meta" both land.
+TIER1_COMPANIES = [
+    "Google", "Alphabet", "Meta", "Facebook", "Amazon", "AWS", "Apple",
+    "Netflix", "Microsoft", "NVIDIA", "OpenAI", "Anthropic", "Tesla",
+    "LinkedIn", "TikTok", "ByteDance",
+]
+
+TIER1_ADJACENT = [
+    "Stripe", "Databricks", "Uber", "Lyft", "Airbnb", "Salesforce", "Oracle",
+    "Adobe", "Snowflake", "Palantir", "Datadog", "Coinbase", "DoorDash",
+    "Instacart", "Pinterest", "Snap", "Roblox", "Figma", "Notion", "Ramp",
+    "Plaid", "Bloomberg", "Citadel", "Citadel Securities", "Jane Street",
+    "Two Sigma", "Jump Trading", "Hudson River Trading", "D. E. Shaw",
+    "Optiver", "IMC Trading", "Goldman Sachs", "JPMorgan", "JPMorgan Chase",
+    "Morgan Stanley", "IBM", "Intel", "AMD", "Qualcomm", "Cisco", "VMware",
+    "Dropbox", "Block", "Square", "Twilio", "Cloudflare", "MongoDB",
+    "HashiCorp", "Atlassian", "Waymo", "Cruise", "SpaceX", "Rivian",
+    "Scale AI", "Anduril", "Reddit", "Discord", "Spotify", "Shopify",
+    "PayPal", "eBay", "Expedia", "Zillow", "Yelp", "Robinhood", "Affirm",
+]
+
+# Any company the scorer rated this reputable counts as tier-adjacent even if
+# it isn't named above -- the list is a floor, not a ceiling, so a company
+# nobody thought to add still surfaces.
+TIER_PRESTIGE_FLOOR = 9
 
 
 def load_settings() -> dict:
@@ -485,9 +525,7 @@ def load_settings() -> dict:
         return json.loads(json.dumps(DEFAULT_SETTINGS))
 
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))
-    merged.update({k: v for k, v in user_settings.items() if k != "resume_variants"})
-    if "resume_variants" in user_settings:
-        merged["resume_variants"].update(user_settings["resume_variants"])
+    merged.update(user_settings)
     return merged
 
 
@@ -498,51 +536,37 @@ def save_settings(settings: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
-def get_resume_variant_paths(variant: str) -> tuple[Path, Path, str, str]:
-    """Resolve (txt_path, pdf_path, grad_date, start_date) for a resume variant.
+def get_resume_paths() -> tuple[Path, Path]:
+    """Resolve (txt_path, pdf_path) for the one and only resume."""
+    return RESUME_PATH, RESUME_PDF_PATH
 
-    Falls back to the default variant if the requested one isn't configured.
 
-    start_date is a per-variant configured value, not computed from grad_date
-    -- the gap between graduating and being available to start isn't a fixed
-    offset (a May grad here is available in August, +3 months, but a December
-    grad is available in February, +2 months), so guessing one formula for
-    both would get one of them wrong. Every resume variant must set its own
-    start_date explicitly in settings.json.
-    """
+def get_grad_and_start_dates() -> tuple[str, str]:
+    """The candidate's single true graduation date and earliest start date."""
     settings = load_settings()
-    variants = settings.get("resume_variants", {})
+    return (settings.get("graduation_date", "May 2027"),
+            settings.get("earliest_start_date", "August 2027"))
 
-    # Fall back along a chain that preserves the graduation year, because
-    # that is the part that must not be wrong: sending a returning-student
-    # posting a May-2027 resume misstates when the candidate is available,
-    # whereas sending an AI/ML posting the SWE resume is merely suboptimal.
-    year = variant.rsplit("_", 1)[-1] if "_" in variant else ""
-    chain = [variant]
-    if year in ("2027", "2028"):
-        chain += [f"swe_{year}", "returning_2028" if year == "2028" else "default"]
-    chain.append(settings.get("default_resume_variant", "swe_2027"))
 
-    fallback_cfg = None
-    for name in dict.fromkeys(chain):
-        cfg = variants.get(name)
-        if not cfg:
-            continue
-        if fallback_cfg is None:
-            fallback_cfg = cfg
-        txt_path, pdf_path = APP_DIR / cfg["txt"], APP_DIR / cfg["pdf"]
-        if txt_path.exists() and pdf_path.exists():
-            if name != variant:
-                log.warning("Resume variant %r has no files on disk; using %r instead.",
-                            variant, name)
-            return txt_path, pdf_path, cfg.get("grad_date", ""), cfg.get("start_date", "")
 
-    # Nothing in the chain exists on disk. Return the requested config anyway
-    # so the caller's own existence check reports the variant actually asked
-    # for rather than whatever the fallback happened to be.
-    cfg = variants.get(variant) or fallback_cfg or {"txt": "resume.txt", "pdf": "resume.pdf"}
-    return (APP_DIR / cfg["txt"], APP_DIR / cfg["pdf"],
-            cfg.get("grad_date", ""), cfg.get("start_date", ""))
+def get_tier_companies() -> tuple[list[str], list[str]]:
+    """(tier1, adjacent) company names, with settings.json overriding the
+    built-in lists when it carries `tier1_companies` / `tier1_adjacent`."""
+    settings = load_settings()
+    return (list(settings.get("tier1_companies") or TIER1_COMPANIES),
+            list(settings.get("tier1_adjacent") or TIER1_ADJACENT))
+
+
+def normalize_company(name: str | None) -> str:
+    """Lowercase a company name and strip punctuation and legal suffixes, so
+    "Meta Platforms, Inc." and "meta" compare equal."""
+    import re as _re
+    blob = _re.sub(r"[^a-z0-9 ]+", " ", (name or "").lower())
+    blob = _re.sub(
+        r"\b(inc|llc|ltd|corp|corporation|co|company|group|holdings|"
+        r"technologies|technology|labs|platforms|securities|systems)\b",
+        " ", blob)
+    return " ".join(blob.split())
 
 
 def load_env():
