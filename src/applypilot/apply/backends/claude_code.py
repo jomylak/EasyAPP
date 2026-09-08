@@ -25,6 +25,7 @@ from applypilot.apply import prompt as prompt_mod
 from applypilot.ats import detect_ats
 from applypilot.apply.chrome import reset_worker_dir, _kill_process_tree
 from applypilot.apply.dashboard import add_event, get_state, update_state
+from applypilot.scoring.router import resume_paths_for_job
 
 logger = logging.getLogger(__name__)
 
@@ -79,12 +80,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     """
     settings = config.load_settings()
 
-    # Read tailored resume text
-    resume_path = job.get("tailored_resume_path")
-    txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
-    resume_text = ""
-    if txt_path and txt_path.exists():
-        resume_text = txt_path.read_text(encoding="utf-8")
+    # Resume text -- routed live if this job never went through `run tailor`.
+    txt_path, _pdf_path = resume_paths_for_job(job)
+    resume_text = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
 
     # Build the prompt
     agent_prompt = prompt_mod.build_prompt(
