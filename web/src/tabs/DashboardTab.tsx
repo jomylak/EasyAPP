@@ -155,7 +155,14 @@ export function DashboardTab() {
                 </span>
               </span>
               <span className="worker-job" title={`${w.company} — ${w.job_title}`}>
-                {w.company || "—"} {w.job_title ? `— ${w.job_title}` : ""}
+                {w.company ? (
+                  <span className={w.company_tier === "tier1" ? "tier1-company" : w.company_tier ? "tier-adjacent" : undefined}>
+                    {w.company}
+                  </span>
+                ) : (
+                  "—"
+                )}{" "}
+                {w.job_title ? `— ${w.job_title}` : ""}
               </span>
               <span className="worker-last" title={w.last_action}>
                 {w.last_action || "—"}

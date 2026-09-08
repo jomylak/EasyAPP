@@ -181,3 +181,64 @@ def test_targeted_unusable_url_returns_none_instead_of_looping(db):
     _insert(db, "https://ibegin.tcsapps.com/x", apply_status=None,
             application_url="https://ibegin.tcsapps.com/x")
     assert launcher.acquire_job(target_url="https://ibegin.tcsapps.com/x") is None
+
+
+# ---------------------------------------------------------------------------
+# Daily caps: soft stops on acquiring new jobs, not on in-flight ones
+# ---------------------------------------------------------------------------
+
+def test_no_caps_configured_is_a_noop(db):
+    assert launcher._daily_cap_reason(db, {}) is None
+    assert launcher._daily_cap_reason(db, {"max_daily_spend_usd": None, "max_daily_applications": None}) is None
+
+
+def test_daily_spend_cap_reached(db):
+    _insert(db, "https://a.example/1", apply_status="applied", apply_cost_usd=3.0,
+            last_attempted_at="2026-09-05T10:00:00")
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    db.execute("UPDATE jobs SET last_attempted_at = ? WHERE url = 'https://a.example/1'", (today,))
+    db.commit()
+
+    reason = launcher._daily_cap_reason(db, {"max_daily_spend_usd": 2.0})
+    assert reason is not None and "spend" in reason
+    assert launcher._daily_cap_reason(db, {"max_daily_spend_usd": 5.0}) is None
+
+
+def test_daily_application_cap_reached(db):
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    _insert(db, "https://a.example/1", apply_status="applied", last_attempted_at=today)
+    _insert(db, "https://a.example/2", apply_status="failed", last_attempted_at=today)
+    db.commit()
+
+    reason = launcher._daily_cap_reason(db, {"max_daily_applications": 2})
+    assert reason is not None and "application" in reason
+    assert launcher._daily_cap_reason(db, {"max_daily_applications": 5}) is None
+
+
+def test_queued_row_does_not_count_toward_daily_cap(db):
+    """Only terminal outcomes (applied/failed) count -- a job sitting in the
+    queue hasn't spent anything and shouldn't itself trip the cap."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    _insert(db, "https://a.example/1", apply_status="queued", queued_at=today)
+    db.commit()
+    assert launcher._daily_cap_reason(db, {"max_daily_applications": 1}) is None
+
+
+def test_acquire_job_stops_once_daily_cap_hit(db, monkeypatch):
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    _insert(db, "https://a.example/already-applied", apply_status="applied", last_attempted_at=today)
+    _insert(db, "https://a.example/2", apply_status="queued")
+    db.commit()
+
+    monkeypatch.setattr(launcher.config, "load_settings", lambda: {"max_daily_applications": 1})
+    assert launcher.acquire_job(queue_batch="batch-1") is None
+
+    # Confirm it really was the cap, not an empty queue: raise the cap and the
+    # same still-queued row is claimable again.
+    monkeypatch.setattr(launcher.config, "load_settings", lambda: {"max_daily_applications": 5})
+    job = launcher.acquire_job(queue_batch="batch-1")
+    assert job["url"] == "https://a.example/2"

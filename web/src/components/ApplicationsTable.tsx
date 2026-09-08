@@ -232,7 +232,15 @@ export function ApplicationsTable({ live }: { live: boolean }) {
               return (
                 <tr key={r.url}>
                   <td className="idx">{i + 1}</td>
-                  <td className="co" title={r.company ?? undefined}>{r.company || "—"}</td>
+                  <td className="co" title={r.company ?? undefined}>
+                    {r.company ? (
+                      <span className={r.company_tier === "tier1" ? "tier1-company" : r.company_tier ? "tier-adjacent" : undefined}>
+                        {r.company}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td className="ti" title={r.title ?? undefined}>{r.title || "—"}</td>
                   <td>
                     <span className={`badge ${status}`}>{STATUS_LABEL[status] ?? status}</span>

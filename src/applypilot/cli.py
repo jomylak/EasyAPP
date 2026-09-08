@@ -495,6 +495,20 @@ def _build_status_renderables(stats: dict) -> list:
             f"guaranteed top apply priority):[/bold green] {stats['terminal_internships']}"
         )
 
+    if stats.get("likely_terminal_internships"):
+        renderables.append(
+            f"[yellow]Likely-terminal internships (strong match, but posting "
+            f"never says either way -- worth applying with your real grad date, "
+            f"not queue-boosted):[/yellow] {stats['likely_terminal_internships']}"
+        )
+
+    if stats.get("remote_spring_internships"):
+        renderables.append(
+            f"[bold green]Remote spring internships (term ends before "
+            f"graduation, fully remote -- same top-priority tier as terminal "
+            f"internships):[/bold green] {stats['remote_spring_internships']}"
+        )
+
     # By site
     if stats["by_site"]:
         site_table = Table(title="Jobs by Source", show_header=True, header_style="bold magenta")
@@ -507,6 +521,53 @@ def _build_status_renderables(stats: dict) -> list:
         renderables.append(site_table)
 
     return renderables
+
+
+@app.command(name="rescore-stale")
+def rescore_stale(
+    limit: int = typer.Option(0, "--limit", "-n",
+                              help="Cap how many jobs to re-score (0 = all)."),
+) -> None:
+    """Re-score jobs that predate the TERM and TERMINAL EVIDENCE checks.
+
+    Those rows are identifiable exactly -- they have a scored_at but a NULL
+    `term` -- and they are the great majority of the corpus. Until they are
+    re-scored, the Spring/Summer internship gate falls back to reading the
+    title, and the terminal-internship path (what makes a Summer role
+    reachable at all once you've graduated) can barely fire.
+
+    Runs the full recompute chain afterwards, so eligibility, desirability
+    and the company tiers all land in the same pass.
+    """
+    _bootstrap()
+    from applypilot.scoring.scorer import run_scoring
+
+    result = run_scoring(limit=limit, stale_only=True)
+    typer.echo(f"Re-scored {result['scored']} jobs "
+               f"({result['errors']} errors) in {result['elapsed']:.0f}s")
+    if result.get("errors"):
+        raise typer.Exit(code=1)
+
+
+@app.command(name="recompute")
+def recompute() -> None:
+    """Recompute every derived field -- no LLM calls, so this is free.
+
+    Desirability, company tiers, eligibility tighteners and the terminal /
+    remote-spring flags are all pure arithmetic and SQL over columns that are
+    already stored, which is the whole reason re-tuning weights or editing
+    the big-tech company list never costs a re-score.
+    """
+    _bootstrap()
+    from applypilot.scoring import scorer
+
+    typer.echo(f"desirability:  {scorer.compute_desirability()}")
+    typer.echo(f"company tiers: {scorer.compute_company_tiers()}")
+    typer.echo(f"grad-date elig: {scorer.recompute_eligibility_for_grad_date()}")
+    typer.echo(f"term elig:      {scorer.recompute_eligibility_for_unwanted_term()}")
+    typer.echo(f"terminal:       {scorer.compute_terminal_internships()}")
+    typer.echo(f"likely terminal:{scorer.compute_likely_terminal_internships()}")
+    typer.echo(f"remote spring:  {scorer.compute_remote_spring_internships()}")
 
 
 @app.command()

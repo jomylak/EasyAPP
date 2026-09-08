@@ -126,6 +126,16 @@ body {
   color: var(--a-text);
   font-weight: 500;
 }
+.dryrun-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  cursor: pointer;
+  white-space: nowrap;
+}
 .btn {
   font-family: var(--sans);
   font-size: 12.5px;
@@ -505,6 +515,74 @@ input[type="checkbox"] {
   padding: 3px 7px;
 }
 
+/* ---- ATS filter: a checklist behind a button, not a native multi-select - */
+.ats-dropdown {
+  position: relative;
+  display: inline-block;
+}
+.ats-dropdown-btn {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.ats-dropdown-btn.active {
+  border-color: var(--a-sel);
+  color: var(--a-text);
+}
+.ats-caret {
+  font-size: 9px;
+  color: var(--a-text-3);
+}
+.ats-dropdown-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  min-width: 190px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--a-ground);
+  border: 1px solid var(--a-line);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+}
+.ats-dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  font-size: 12px;
+  color: var(--a-text-2);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ats-dropdown-item:hover {
+  background: var(--a-surface);
+  color: var(--a-text);
+}
+.ats-dropdown-empty {
+  padding: 8px 6px;
+  font-size: 11.5px;
+  color: var(--a-text-3);
+}
+.ats-dropdown-clear {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 6px;
+  font-size: 11.5px;
+  color: var(--a-text-3);
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--a-line);
+  cursor: pointer;
+  text-align: left;
+}
+.ats-dropdown-clear:hover {
+  color: var(--a-text);
+}
+
 /* ---- expansion -- animates open and shut rather than snapping ---------- */
 /* `tbody td` sets height:34px for the data rows; without overriding it here
    a collapsed expansion still reserves a full row and reads as a dark band
@@ -801,6 +879,33 @@ tr.exp.open > td {
 .badge.in_progress { color: var(--a-warn); border-color: color-mix(in srgb, var(--a-warn) 40%, var(--a-line)); }
 .badge.manual { color: var(--a-text-3); }
 
+/* Grad-date-safety signal shown inline before the title in the browse table
+   -- see TerminalBadge in DayTable.tsx. Confirmed/remote-spring share a
+   color (both are top apply-queue priority); likely uses the warn color
+   since it's a manual-review signal, not a queue boost. */
+.tbadge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-right: 5px;
+  vertical-align: middle;
+  border: 1px solid transparent;
+}
+.tbadge-confirmed {
+  color: var(--a-good);
+  border-color: color-mix(in srgb, var(--a-good) 40%, var(--a-line));
+  background: color-mix(in srgb, var(--a-good) 10%, transparent);
+}
+.tbadge-likely {
+  color: var(--a-warn);
+  border-color: color-mix(in srgb, var(--a-warn) 40%, var(--a-line));
+  background: color-mix(in srgb, var(--a-warn) 10%, transparent);
+}
+
 .rowbtn {
   font-family: var(--sans);
   font-size: 11px;
@@ -880,6 +985,87 @@ tr.exp.open > td {
   margin: 0 0 10px;
 }
 
+/* ---- Settings tab -------------------------------------------------------- */
+.settings-section {
+  padding: 14px 16px 16px;
+}
+.settings-section .dayhead {
+  margin-bottom: 4px;
+}
+.settings-hint {
+  font-size: 11px;
+  color: var(--a-text-3);
+  margin: -2px 0 12px;
+  max-width: 62ch;
+}
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--a-line) 50%, transparent);
+}
+.setting-row:last-of-type {
+  border-bottom: none;
+}
+.setting-row label {
+  width: 220px;
+  flex: none;
+  font-size: 12px;
+  color: var(--a-text-2);
+}
+.setting-row .setting-input {
+  width: 160px;
+}
+.setting-row .setting-note {
+  font-size: 10.5px;
+  color: var(--a-text-3);
+}
+.setting-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.setting-saved {
+  font-size: 11px;
+  color: var(--a-good);
+}
+.variant-grid {
+  display: grid;
+  grid-template-columns: 110px repeat(4, 1fr);
+  gap: 8px 10px;
+  align-items: center;
+  font-size: 12px;
+}
+.variant-grid .vg-head {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--a-text-3);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--a-line);
+}
+.variant-grid .vg-name {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text);
+}
+.env-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 0;
+}
+.env-row label {
+  width: 180px;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-2);
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     animation: none !important;
@@ -889,4 +1075,110 @@ tr.exp.open > td {
 :focus-visible {
   outline: 2px solid var(--a-sel);
   outline-offset: 2px;
+}
+
+/* ── Big-tech company treatment ────────────────────────────────────────────
+   A prestige-10 posting from Meta or Google routinely scores a fit of 3, so
+   nothing else on its row reads as "this is the one to apply to". These two
+   classes are the visual half of the tier pin: an animated gold sweep across
+   the company name, brighter and faster for tier 1 than for adjacent.
+   background-clip: text needs a transparent color to show through, so the
+   @supports guard keeps a plain gold fill wherever that isn't available
+   rather than rendering an invisible name. */
+@keyframes tier-shine {
+  to { background-position: 200% center; }
+}
+
+.tier1-company,
+.tier-adjacent {
+  color: #d9a441;
+  font-weight: 650;
+}
+
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
+  .tier1-company,
+  .tier-adjacent {
+    background-image: linear-gradient(
+      100deg,
+      #b8860b 0%, #ffd76e 20%, #fff6c9 35%,
+      #ffd76e 50%, #b8860b 70%, #ffd76e 100%
+    );
+    background-size: 200% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: tier-shine 3.5s linear infinite;
+  }
+
+  .tier-adjacent {
+    background-image: linear-gradient(
+      100deg,
+      #8a6a1f 0%, #d9b86a 22%, #f0e2b8 38%,
+      #d9b86a 52%, #8a6a1f 72%, #d9b86a 100%
+    );
+    font-weight: 600;
+    animation-duration: 6s;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tier1-company,
+  .tier-adjacent { animation: none; }
+}
+
+.chip.chip-tier.on {
+  border-color: #b8860b;
+  color: #ffd76e;
+}
+
+/* ── 60/40 selection counter ───────────────────────────────────────────────
+   The whole enforcement mechanism for the new-grad/internship split: it
+   reports, it never blocks. Amber once the ratio drifts more than 10 points
+   off target, which is the point at which a week's selection has actually
+   skewed rather than just rounded. */
+.split-counter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--a-text-3);
+  margin-left: auto;
+}
+
+.split-counter .split-bar {
+  position: relative;
+  width: 120px;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--a-bg-3, #2a2a2a);
+}
+
+.split-counter .split-bar i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  display: block;
+  background: var(--a-ok, #4ea672);
+  transition: width 120ms linear;
+}
+
+.split-counter.off .split-bar i { background: var(--a-warn, #d9a441); }
+.split-counter.off .split-pct { color: var(--a-warn, #d9a441); }
+
+.split-counter .split-target {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: var(--a-text-3, #888);
+  opacity: 0.9;
+}
+
+.settings-subhead {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--a-text-3);
+  margin-top: 6px;
 }

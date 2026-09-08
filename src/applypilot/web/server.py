@@ -142,20 +142,45 @@ def api_jobs(
     site: str | None = None,
     ats: str | None = None,
     q: str | None = None,
-    eligible_only: bool = False,
     above_pay_floor: bool = False,
     unapplied_only: bool = False,
+    terminal_only: bool = False,
+    likely_terminal_only: bool = False,
     posted_within_days: int | None = None,
+    tier_only: bool = False,
+    include_tier: bool = False,
+    location: str | None = None,
+    term: str | None = None,
 ) -> dict:
-    """One page of one day's table. Every day asks for its own independently."""
+    """One page of one day's table. Every day asks for its own independently.
+
+    `ats` is comma-separated (e.g. "Workday,Greenhouse") -- the Browse tab's
+    ATS filter is a checklist, not a single choice, and a comma-joined query
+    param is simpler than a repeated-key list param on both ends for
+    something that's just an OR over a handful of strings.
+
+    Eligibility and the Spring/Summer-only internship term are enforced
+    unconditionally inside queries._filter_clauses, not as opt-in flags here
+    -- there's no reason this table should ever surface a job you can't
+    honestly take or a term you can't work.
+
+    `tier_only` narrows to big-tech postings; `include_tier` instead exempts
+    them from the min_* bars, so a prestige-10 posting with a fit of 3 still
+    shows up in a filtered view. `location` is one of nyc | metro | remote.
+    """
     return queries.list_jobs(
         {
             "day": day, "min_fit": min_fit, "min_desirability": min_desirability,
             "min_prestige": min_prestige, "min_pay": min_pay,
             "job_type": job_type, "site": site,
-            "ats": ats, "q": q, "eligible_only": eligible_only,
+            "ats": [a for a in ats.split(",") if a] if ats else None,
+            "q": q,
             "above_pay_floor": above_pay_floor, "unapplied_only": unapplied_only,
+            "terminal_only": terminal_only,
+            "likely_terminal_only": likely_terminal_only,
             "posted_within_days": posted_within_days,
+            "tier_only": tier_only, "include_tier": include_tier,
+            "location": location, "term": term,
         },
         sort=sort, page=page, page_size=page_size,
     )
@@ -418,6 +443,80 @@ def api_stop_all() -> dict:
     _run_proc = None
     released = reconcile_stale_locks()
     return {"stopped": stopped, "released": released}
+
+
+# --- settings ----------------------------------------------------------
+
+# Env vars editable from the Settings tab -- the ones the pipeline actually
+# checks for at startup (config.py's has_llm / OPENROUTER_API_KEY checks),
+# not an open-ended list. Kept short and explicit so a typo'd key from the
+# UI can't silently write junk into .env.
+_KNOWN_ENV_KEYS = ("GEMINI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "LLM_URL", "APPLYPILOT_JOB_PASSWORD")
+
+
+@app.get("/api/settings")
+def api_get_settings() -> dict:
+    return config.load_settings()
+
+
+# Settings keys merged one level deep rather than replaced wholesale.
+_NESTED_MERGE_KEYS = ("cost_defaults", "new_grad_weights", "internship_weights")
+
+
+@app.post("/api/settings")
+def api_update_settings(payload: dict = Body(...)) -> dict:
+    """Merge the given keys into settings.json and save.
+
+    A shallow merge, except `cost_defaults`, `new_grad_weights` and
+    `internship_weights`, which are merged one level deeper: editing one
+    backend's default cost or one weight doesn't silently drop the other
+    entries in that dict.
+    """
+    current = config.load_settings()
+    for key, value in payload.items():
+        if key in _NESTED_MERGE_KEYS and isinstance(value, dict):
+            current.setdefault(key, {}).update(value)
+        else:
+            current[key] = value
+    config.save_settings(current)
+    return current
+
+
+@app.get("/api/env-keys")
+def api_get_env_keys() -> dict:
+    """Which known API keys are set -- never the values themselves.
+
+    Read from the .env file directly rather than os.environ: os.environ was
+    populated once at process start, so a key added after the server started
+    wouldn't show as set until a restart if this read os.environ instead.
+    """
+    from dotenv import dotenv_values
+    values = dotenv_values(config.ENV_PATH) if config.ENV_PATH.exists() else {}
+    return {k: bool((values.get(k) or "").strip()) for k in _KNOWN_ENV_KEYS}
+
+
+@app.post("/api/env-keys")
+def api_set_env_keys(payload: dict = Body(...)) -> dict:
+    """Write one or more API keys to ~/.applypilot/.env.
+
+    An empty/missing value for a key means "leave it alone" -- there is no
+    way to clear a key from this endpoint, only to set one, since the whole
+    point of masked inputs on the frontend is that a blank box never means
+    "I want to erase what's there."
+    """
+    from dotenv import set_key
+    config.ensure_dirs()
+    if not config.ENV_PATH.exists():
+        config.ENV_PATH.touch()
+    updated = []
+    for key, value in payload.items():
+        if key not in _KNOWN_ENV_KEYS:
+            raise HTTPException(400, f"Unknown key: {key}")
+        if not (value or "").strip():
+            continue
+        set_key(str(config.ENV_PATH), key, value.strip())
+        updated.append(key)
+    return {"updated": updated}
 
 
 @app.get("/api/events")

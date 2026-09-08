@@ -106,15 +106,72 @@ floor to internships/co-ops and the annual floor to full-time roles. Convert bet
 the two at 2080 hours/year when only one is stated. Never lower the fit SCORE because
 of pay -- report it separately so the pipeline can decide.
 
+TERM CHECK:
+Identify which academic term this role runs in from its title, dates, or description
+(e.g. "Summer 2027" runs roughly May/June-August, "Fall" August-December, "Winter"
+December-January, "Spring" January-April/May, "rolling" or "year-round" for co-ops
+without a fixed single term). This matters for the RETURNING STUDENT CHECK below --
+report your best reading even from indirect evidence (a stated start date, "12-week
+internship starting in June", etc). Answer "unclear" only when there is truly nothing
+to go on.
+
+This year check applies ONLY to "spring": if a specific year is stated for a Spring
+term and it is NOT 2027 -- e.g. a stray "Spring 2026" or "Spring 2028" posting --
+answer "unclear" instead of "spring", since the pipeline treats Spring 2027
+specifically as a safe, no-conflict term (the candidate's final semester before
+graduating) and a different year doesn't get that same guarantee. Do NOT apply this
+year check to "fall" or "winter" -- report those normally regardless of what year is
+stated. A Fall/Winter term is excluded downstream for reasons that don't depend on
+the year: 2026 is already in the past relative to the candidate's search, and 2027
+onward is after they expect to already hold a new-grad job, so every fall/winter
+should read as "fall"/"winter", never softened to "unclear" by its year.
+
 RETURNING STUDENT CHECK:
-Answer yes in either of these cases:
-1. The posting explicitly requires continued enrollment after the internship ends (e.g. "must be currently enrolled and returning to school following the internship", "rising senior" for a non-final-semester role) -- do not infer this from a generic "student" or "currently pursuing degree" requirement that a graduating senior would also satisfy.
-2. The posting states a graduation-date window or "not graduating before [date]" requirement that excludes the candidate's earlier graduation date below but is satisfied by the later one. Read the posting's window literally and compare both candidate dates against it -- this is a common phrasing (e.g. "expected graduation date between December 2027 and June 2028", "must graduate on or after December 2027") that is functionally the same requirement as case 1, just expressed as a date range instead of the word "returning".
-Answer no only when the candidate's earlier graduation date already satisfies whatever window the posting states, or the posting states no graduation timing requirement at all.
+The candidate has exactly one true graduation date (given below) and exactly one
+resume, printed with that date -- there is no second identity to fall back on. But the
+candidate IS a normal, currently-enrolled student up until that date -- a requirement
+to be enrolled for the duration of a role that ends at or before the candidate's
+graduation is trivially true for them, not a conflict. Answer yes in either of these
+cases:
+1. The posting explicitly requires continued enrollment PAST the candidate's
+   graduation date -- i.e. the role's term (from the TERM CHECK above) runs at or
+   after the candidate's graduation, AND the posting requires remaining enrolled
+   during or after it (e.g. "must be currently enrolled and returning to school
+   following the internship", "rising senior" for a non-final-semester role). A role
+   whose entire term falls before the candidate's graduation trivially satisfies any
+   such enrollment requirement, so answer no for those regardless of this wording --
+   do not infer a conflict from a generic "student" or "currently pursuing degree"
+   phrase either; a graduating senior satisfies that too.
+2. The posting states a graduation-date window or "not graduating before [date]"
+   requirement that the candidate's actual graduation date below does not satisfy.
+   Read the posting's window literally. This one is independent of the role's term --
+   it is about when the candidate graduates, not when the role happens.
+Answer no when the role's term ends at or before the candidate's graduation, when the
+candidate's actual graduation date already satisfies whatever window the posting
+states, or when the posting states no graduation timing requirement at all.
+This is a real eligibility signal, not just a queue-priority input: a "yes"
+here means the candidate cannot honestly satisfy this posting, and it is
+excluded downstream regardless of how ELIGIBLE below is answered.
+
+TERMINAL EVIDENCE CHECK:
+Independent of the two checks above: does this posting itself, in its own words,
+affirmatively welcome a candidate who has ALREADY graduated (or will graduate before
+the role starts), with nothing requiring further enrollment? Read for substance, not
+one fixed phrase -- "recently graduated", "graduating seniors welcome", "must have
+attained a Bachelor's degree (not currently enrolled)", "within one year of
+graduation", and similar all count; so does language you have to read past awkward
+phrasing or a run-on sentence to understand correctly. A posting whose ONLY
+requirement is a bare "pursuing a degree in X" states no opinion either way -- answer
+no for that; that silence is a separate, softer signal the pipeline handles on its
+own, not something to force a yes on here. A role structured as an ongoing co-op
+(alternating terms with school, "must have N years of school completed before this
+begins") is a NO here even if it never uses exclusionary wording -- its whole design
+presumes the candidate returns to school between terms.
 
 ELIGIBILITY CHECK:
 Separately from fit, decide whether the candidate is even allowed to apply. This is a
-hard gate, not a preference -- answer "no" ONLY for an explicit, stated disqualifier:
+hard gate, not a preference -- answer "no" for an explicit, stated disqualifier. The
+common ones, named so you don't have to guess at the bar:
 - The role requires a Master's or PhD (in progress or completed).
 - The role is restricted to freshmen, sophomores, or first-/second-year students.
 - The role is based outside the United States.
@@ -126,23 +183,47 @@ hard gate, not a preference -- answer "no" ONLY for an explicit, stated disquali
   posting will accept: "3-6 years" requires three, but "2-10 years" requires two and is
   therefore fine.
 
+That list is not exhaustive -- ANY other explicit, MUST-level requirement the posting
+states that the candidate's resume gives no reason to think they meet is also a
+disqualifier. Read for substance: membership in a specific religious or civic
+organization ("only members of [Church/organization] who are worthy of a temple
+recommend qualify"), current or former military/veteran status, a professional license
+the candidate doesn't hold, mandatory union membership, and similar all count -- these
+are deliberately not listed above one by one, because a posting inventing a new one
+tomorrow shouldn't need a prompt update to be caught. A "preferred"/"nice to have"
+version of any of these is NOT a disqualifier -- only a stated requirement.
+
+For this category specifically -- an unusual, narrow status the posting requires --
+treat the resume's silence as "no", not "unclear". This is the opposite default from
+everywhere else in this check, deliberately: the resume not mentioning a graduation
+date detail is the POSTING's ambiguity, and silence there is genuinely uninformative.
+But the resume not mentioning membership in a specific church, a veteran status, or a
+niche license is a fact ABOUT THE CANDIDATE that they would have stated if true --
+most candidates aren't members of any one particular such group, so silence is real
+evidence of "no", not a coin flip. Only fall back to "unclear" when the posting's own
+requirement is itself vague (e.g. it's actually unclear whether the clause is a hard
+requirement or a values statement), not when the resume simply doesn't address it.
+
 Things that are NOT disqualifiers -- never answer "no" for any of these:
 - The candidate is a US citizen, authorized to work without sponsorship. A citizenship
   or work-authorization requirement on its own is fine. Do NOT infer immigration or
   visa status from the candidate's university, name, or anything else on the resume:
   the citizenship stated here is the fact, and nothing else on the resume overrides it.
-- ANY graduation-date or class-year requirement, and any target year or season in the
-  posting. The pipeline maintains multiple resume variants with different graduation
-  dates and automatically switches to whichever one a posting requires, so a stated
-  graduation window is always satisfiable and is never a reason to reject. This is
-  separate from the freshman/sophomore restriction above, which IS a disqualifier
-  because it is about year in program, not graduation timing.
+- A graduation-date, target-year, or season requirement that the candidate's actual
+  graduation date (given in the RETURNING STUDENT CHECK below) already satisfies.
+  This is separate from the freshman/sophomore restriction above, which IS a
+  disqualifier because it is about year in program, not graduation timing. A
+  requirement the candidate's actual graduation date does NOT satisfy is real --
+  but it is captured by the RETURNING STUDENT CHECK below, not here, so leave
+  ELIGIBLE alone for it; that check drives its own downstream eligibility gate.
 - The role being an internship rather than a new-grad/entry-level role, or vice versa.
   The candidate is eligible for both.
 
-When the posting is ambiguous, answer "unclear" rather than "no". "unclear" is treated
-as eligible: a wrong "no" silently costs a real opportunity, while a wrong "yes" only
-risks a single application.
+When the POSTING's own requirement is ambiguous, answer "unclear" rather than "no" --
+"unclear" is treated as eligible: a wrong "no" silently costs a real opportunity, while
+a wrong "yes" only risks a single application. This default flips for the narrow-status
+disqualifiers just above, where it's the resume's silence that matters, not the
+posting's clarity -- see that section for why.
 
 COMPANY, LOCATION AND PRESTIGE:
 Name the hiring company and the job's location from the posting. When a COMPANY
@@ -160,11 +241,14 @@ never affects the fit SCORE.
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
+TERM: [spring, summer, fall, winter, rolling, or unclear -- see TERM CHECK]
 REQUIRES_RETURNING_STUDENT: [yes or no]
+TERMINAL_EVIDENCE: [yes or no -- see TERMINAL EVIDENCE CHECK]
 PAY: [the stated pay exactly as written, or "not stated"]
 BELOW_FLOOR: [yes, no, or unknown -- "unknown" whenever no pay is stated]
 COMPANY: [the hiring company's name, or "unknown"]
-JOB_LOCATION: [city and state as stated in the posting, "Remote" if remote, or "unknown"]
+JOB_LOCATION: [city and state as stated in the posting; "Remote" ONLY if fully remote with
+  no onsite/hybrid component; "Hybrid" if hybrid; "unknown" if not stated]
 PRESTIGE: [1-10]
 ELIGIBLE: [yes, no, or unclear]
 ELIGIBILITY_REASON: [one short phrase naming the disqualifier; leave empty when eligible]
@@ -177,6 +261,12 @@ REASONING: [2-3 sentences explaining the score]"""
 PREFERRED_METROS = [
     "New York City", "San Francisco Bay Area", "Seattle", "Austin", "Boston",
 ]
+
+# Per-lane desirability weights. Kept here as the fallback for the settings
+# keys of the same name so the module works against a settings.json written
+# before these existed.
+DEFAULT_NEW_GRAD_WEIGHTS = {"pay": 0.35, "prestige": 0.35, "location": 0.30}
+DEFAULT_INTERNSHIP_WEIGHTS = {"pay": 0.45, "prestige": 0.35, "location": 0.20}
 
 # Hours used to convert a quoted annual or monthly figure to an hourly one.
 _HOURS_PER_YEAR = 2080.0
@@ -236,20 +326,37 @@ def parse_pay_range(salary: str | None) -> tuple[float, float] | None:
 
     if hi < lo:
         lo, hi = hi, lo
-    if lo < _MIN_SANE_HOURLY or hi > _MAX_SANE_HOURLY:
+    # Sanity-check the TOP of the range only. Every caller (pay_below_floor,
+    # _pay_tier_score) compares against `hi`, not `lo` -- a range's minimum
+    # being $0 ("unpaid" at the bottom tier, or an unstated floor) is real,
+    # if bad, information, not something to discard. Rejecting on `lo` used
+    # to throw the whole range away for a posting like "$0-$22/hr", which
+    # left BELOW_FLOOR-worthy pay reading as neutral/unknown for
+    # desirability purposes even though pay_below_floor (the LLM's own read
+    # of the same text) correctly caught it.
+    if hi < _MIN_SANE_HOURLY or hi > _MAX_SANE_HOURLY:
         return None
+    lo = max(lo, 0.0)
 
     return lo, hi
 
 
-def pay_below_floor(salary: str | None, hourly_floor: float) -> str:
-    """Whether a posted range tops out below the candidate's hourly floor.
+def _representative_hourly(parsed: tuple[float, float]) -> float:
+    """Collapse a (min, max) pay range to one number for floor/tier comparisons.
 
-    The test is on the range's MAXIMUM, not its minimum. Twelve of the jobs
-    currently on the board are posted at "$23-$43/hr": the bottom of that band
-    is under a $30 floor but the top clears it comfortably, and rejecting on
-    the minimum would throw all of them away. Only a range whose ceiling is
-    below the floor -- "$23-$27/hr" -- genuinely cannot pay enough.
+    75% of the way from min to max, not the max itself -- a posted range is
+    routinely a best-case ceiling few candidates actually land on, so "$20-40/hr"
+    reads as ~$35, not $40. Not the midpoint either: postings undersell the
+    bottom more than they oversell the top, so weighting toward the top end
+    (without just taking it outright) is the better single-number estimate.
+    """
+    lo, hi = parsed
+    return lo + 0.75 * (hi - lo)
+
+
+def pay_below_floor(salary: str | None, hourly_floor: float) -> str:
+    """Whether a posted range's representative pay clears the candidate's
+    hourly floor -- see _representative_hourly for why it's not just the max.
 
     Returns "yes", "no", or "unknown".
     """
@@ -263,7 +370,7 @@ def pay_below_floor(salary: str | None, hourly_floor: float) -> str:
     parsed = parse_pay_range(salary)
     if parsed is None or not hourly_floor:
         return "unknown"
-    return "yes" if parsed[1] < hourly_floor else "no"
+    return "yes" if _representative_hourly(parsed) < hourly_floor else "no"
 
 
 def _parse_score_response(response: str) -> dict:
@@ -278,7 +385,9 @@ def _parse_score_response(response: str) -> dict:
     score = 0
     keywords = ""
     reasoning = response
+    term = "unclear"
     requires_returning_student = "no"
+    terminal_evidence_llm = "no"
     pay_text = ""
     below_floor = "unknown"
     company = ""
@@ -297,9 +406,15 @@ def _parse_score_response(response: str) -> dict:
                 score = 0
         elif line.startswith("KEYWORDS:"):
             keywords = line.replace("KEYWORDS:", "").strip()
+        elif line.startswith("TERM:"):
+            val = line.replace("TERM:", "").strip().lower()
+            term = val if val in ("spring", "summer", "fall", "winter", "rolling") else "unclear"
         elif line.startswith("REQUIRES_RETURNING_STUDENT:"):
             val = line.replace("REQUIRES_RETURNING_STUDENT:", "").strip().lower()
             requires_returning_student = "yes" if val.startswith("yes") else "no"
+        elif line.startswith("TERMINAL_EVIDENCE:"):
+            val = line.replace("TERMINAL_EVIDENCE:", "").strip().lower()
+            terminal_evidence_llm = "yes" if val.startswith("yes") else "no"
         elif line.startswith("PAY:"):
             pay_text = line.replace("PAY:", "").strip()
         elif line.startswith("BELOW_FLOOR:"):
@@ -332,7 +447,9 @@ def _parse_score_response(response: str) -> dict:
 
     return {
         "score": score, "keywords": keywords, "reasoning": reasoning,
+        "term": term,
         "requires_returning_student": requires_returning_student,
+        "terminal_evidence_llm": terminal_evidence_llm,
         "pay_text": pay_text, "pay_below_floor": below_floor,
         "company": company, "job_location": job_location,
         "company_prestige": prestige,
@@ -421,23 +538,18 @@ def score_job(resume_text: str, job: dict) -> dict:
         f"resume's university, coursework, or name."
     ) if permit else ""
 
-    # Concrete dates for the RETURNING STUDENT CHECK above, pulled from the
-    # actual configured resume variants rather than hardcoded -- keeps the
-    # prompt correct if the variants (or their dates) ever change.
-    from applypilot.config import load_settings as _load_settings
-    variants = _load_settings().get("resume_variants", {})
-    default_grad = variants.get("default", {}).get("grad_date", "")
-    later_grad = next(
-        (v.get("grad_date") for k, v in variants.items() if k != "default" and v.get("grad_date")),
-        "",
-    )
+    # The one true graduation date for the RETURNING STUDENT CHECK above,
+    # pulled from settings rather than hardcoded, so the prompt stays correct
+    # if the date ever changes. There is exactly one graduation date and one
+    # resume -- there is deliberately no second "returning student" identity
+    # any more -- see recompute_eligibility_for_grad_date().
+    from applypilot.config import get_grad_and_start_dates as _grad_dates
+    default_grad, _ = _grad_dates()
     grad_date_note = (
-        f"\n\nCANDIDATE GRADUATION DATE OPTIONS (for the RETURNING STUDENT CHECK "
-        f"above): the candidate can present as graduating in {default_grad} "
-        f"(default) or as a returning student graduating {later_grad} -- use "
-        f"these two dates, in this order, when checking whether either satisfies "
-        f"a posting's stated graduation window."
-    ) if default_grad and later_grad else ""
+        f"\n\nCANDIDATE GRADUATION DATE (for the RETURNING STUDENT CHECK above): "
+        f"{default_grad}. This is the candidate's only true graduation date -- "
+        f"compare the posting's stated window against this single date."
+    ) if default_grad else ""
 
     messages = [
         {"role": "system", "content": SCORE_PROMPT + pay_note + auth_note + location_note + grad_date_note},
@@ -557,44 +669,71 @@ def offers_housing(description: str | None) -> bool:
     return bool(_HOUSING_OFFER.search(description))
 
 
-def _pay_tier_score(salary: str | None, floor: float) -> float:
-    """Score 2/4/6/8 by how far a posted range's top clears the candidate's
-    floor, or 5.0 (neutral) if unparseable or no floor is configured.
+# Pay anchors, in hourly terms, mapping compensation to a 1-10 score. These
+# are the candidate's own stated numbers, not arbitrary bands: $90k is the
+# new-grad target (a real return-offer benchmark), $180k is "outstanding";
+# $30/hr is the internship floor and $75/hr is top-of-market for an intern.
+# Interpolated linearly between anchors so a $5k difference always moves the
+# score -- the old 4-step function returned the same number across a $60k
+# spread, which made pay invisible in the ranking.
+_PAY_ANCHORS_ANNUAL = [(90_000, 2.0), (120_000, 5.0), (150_000, 7.5), (180_000, 10.0)]
+_PAY_ANCHORS_HOURLY = [(30.0, 2.0), (45.0, 5.0), (60.0, 7.5), (75.0, 10.0)]
 
-    Ratio bands were calibrated directly against the candidate's own two real
-    anchor points rather than picked arbitrarily: their configured floor is
-    $80k, a real return-offer target (NYL, ~$90k) should land as "medium",
-    and their own configured salary_range_max ($120k) -- which they used as
-    the example of "great, I'd go anywhere" pay -- sits right at the top
-    band's threshold. Only used for the "everywhere else" location bucket
-    (see _location_desirability): pay never modulates an already-good
-    location, it only ever rescues a middling one.
+
+def _interpolate(x: float, anchors: list[tuple[float, float]]) -> float:
+    """Piecewise-linear interpolation over (input, score) anchor points,
+    clamped to the first and last score outside the anchored range."""
+    if x <= anchors[0][0]:
+        # Below the floor still gets a gradient rather than a flat 1.0, so
+        # a $85k offer and a $40k offer are not treated as equally bad.
+        lo_x, lo_s = anchors[0]
+        return max(1.0, lo_s * (x / lo_x)) if lo_x else 1.0
+    for (x0, s0), (x1, s1) in zip(anchors, anchors[1:]):
+        if x <= x1:
+            return s0 + (s1 - s0) * (x - x0) / (x1 - x0)
+    return anchors[-1][1]
+
+
+def _pay_tier_score(salary: str | None, is_internship: bool) -> float:
+    """Rate a posting's pay 1-10 on its own axis, independent of location.
+
+    Returns 5.0 (neutral) when no pay is stated. That is deliberate and it
+    matters: 128 of the 470 eligible high-prestige internships carry no pay
+    data at all, and scoring those 0 would silently bury exactly the
+    postings the candidate most wants to see. An unstated salary is missing
+    information, not bad news.
+
+    Internships are judged on the hourly anchors and full-time roles on the
+    annual ones -- a $45/hr internship is excellent while a $45/hr
+    ($94k) full-time offer is merely acceptable, so one shared curve would
+    misjudge one of the two lanes.
     """
     parsed = parse_pay_range(salary)
-    if parsed is None or not floor:
+    if parsed is None:
         return 5.0
-    ratio = parsed[1] / floor
-    if ratio < 1.10:
-        return 2.0
-    if ratio < 1.25:
-        return 4.0
-    if ratio < 1.45:
-        return 6.0
-    return 8.0
+    hourly = _representative_hourly(parsed)
+    if hourly <= 0:
+        return 5.0
+    if is_internship:
+        return round(min(10.0, _interpolate(hourly, _PAY_ANCHORS_HOURLY)), 2)
+    return round(min(10.0, _interpolate(hourly * _HOURS_PER_YEAR, _PAY_ANCHORS_ANNUAL)), 2)
 
 
-def _location_desirability(
-    location: str | None, preferred_city: str, salary: str | None, floor: float,
-) -> float:
-    """Rate a job's location 1-10 for this candidate.
+def _location_desirability(location: str | None, preferred_city: str) -> float:
+    """Rate a job's location 1-10 for this candidate. Pure location.
 
-    The candidate lives in Queens, so a role in New York City means no
-    relocation at all -- it ranks above the other preferred metros rather than
-    merely among them. Remote/a preferred metro is next. Pay never drags
-    either of those down. Everywhere else in the US, though, is where pay
-    actually matters: good pay should rescue an otherwise-so-so location,
-    and bad pay somewhere undesirable should read as genuinely bad, not
-    neutral -- see _pay_tier_score.
+    Pay used to be folded in here, which produced a real bug: because the
+    preferred city returned a flat 10.0, a NYC posting's pay was discarded
+    entirely, and every NYC new-grad role at the same prestige scored an
+    identical desirability from $83k to $354k. Pay is its own weighted
+    component now (see _pay_tier_score); this function only answers "how
+    good is this place to be".
+
+    The candidate lives in Queens, so New York City means no relocation at
+    all. Remote and the other preferred metros are next -- they cost either
+    nothing or a known, tolerable amount of upheaval. Everywhere else in the
+    US is a real move, so it starts low and relies on pay (now a genuinely
+    separate term) to carry it.
     """
     blob = (location or "").lower()
     if not blob:
@@ -610,7 +749,7 @@ def _location_desirability(
         head = " ".join(metro.split()[:2]).lower()
         if head in blob:
             return 7.0
-    return _pay_tier_score(salary, floor)
+    return 4.0
 
 
 # Phrases that EXPLICITLY admit someone who has finished, or is finishing,
@@ -627,7 +766,11 @@ TERMINAL_ACCEPT_RE = re.compile(
     r"(recently graduat\w+"
     r"|recently completed (?:an?|your|their|a )?\s*(?:associate|bachelor|master|undergraduate|graduate|college|degree|diploma)"
     r"|(?:or|and) (?:have )?(?:recently )?(?:graduated|completed your degree)"
-    r"|graduating seniors?"
+    # Negative lookbehind: "non-graduating senior" (Ingredion's phrasing --
+    # sophomore/junior/non-graduating senior, explicitly excluding someone
+    # who has already graduated) is the opposite of this pattern's intent,
+    # and without the lookbehind the bare substring match fires anyway.
+    r"|(?<!non-)(?<!non )graduating seniors?"
     r"|(?:open|available) to graduating"
     r"|within (?:six|6|three|3|nine|9|twelve|12) months of (?:your |their )?graduation"
     r"|final semester"
@@ -672,7 +815,16 @@ TERMINAL_EXCLUDE_RE = re.compile(
     r"|must continue enrollment"
     r"|graduat\w+[^.]{0,40}(?:and beyond|or later)"
     r"|(?:graduation date of|graduating in|will graduate in)[^.]{0,25}"
-    r"(?:dec|fall|winter|aug|sept?|oct|nov)\w*\s*20\d\d)", re.I)
+    r"(?:dec|fall|winter|aug|sept?|oct|nov)\w*\s*20\d\d"
+    # The Palantir case the second audit caught: "Must be planning on
+    # graduating in 2028. This should be your final internship before
+    # graduating" -- a bare future graduation year with no month/season
+    # token, so the pattern above doesn't fire, and "final internship
+    # before graduating" says outright that the candidate hasn't
+    # graduated yet. Both mean the same thing the "and beyond"/"or later"
+    # alternatives above mean, just phrased without those words.
+    r"|planning (?:on |to )?graduat\w+[^.]{0,30}\b20\d\d\b"
+    r"|final internship before graduat\w+)", re.I)
 
 
 def terminal_evidence(description: str | None) -> str:
@@ -699,25 +851,173 @@ def terminal_evidence(description: str | None) -> str:
     return "yes" if TERMINAL_ACCEPT_RE.search(description) else "no"
 
 
+def recompute_eligibility_for_grad_date(conn=None) -> int:
+    """Fold requires_returning_student == 'yes' into the eligibility gate.
+
+    The scoring prompt used to treat any graduation-date requirement as
+    "always satisfiable" because the pipeline could print a second resume
+    with a later, honestly-held graduation date and switch to it. That
+    identity was retired -- there is now exactly one true graduation date
+    and one resume -- so a posting requiring continued enrollment past that
+    date is no longer satisfiable at all, honestly. `eligible` is the column
+    every consumer (acquire_job's SQL gate, the web UI's browse filter)
+    already checks, so this folds the signal in there rather than adding a
+    second eligibility column nothing else would read.
+
+    Derived from stored columns, no LLM call -- safe to re-run any time
+    requires_returning_student values change (a re-score, or a fix to the
+    prompt/regex that produces it) without waiting for a fresh scoring pass.
+
+    Only ever tightens eligibility (never loosens it back to 'yes'/'unclear')
+    -- if a later run wants to relax this it should re-score, not have this
+    function guess at reverting a reason it didn't originally write.
+
+    Returns the number of rows changed.
+    """
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT url, eligibility_reason FROM jobs "
+        "WHERE requires_returning_student = 'yes' "
+        "AND (eligible IS NULL OR eligible != 'no')"
+    ).fetchall()
+
+    note = ("Requires continued enrollment / a later graduation date than "
+            "the candidate's true one -- no second resume identity to "
+            "satisfy this with.")
+    changed = 0
+    for r in rows:
+        reason = r["eligibility_reason"] or ""
+        new_reason = f"{reason} {note}".strip() if reason else note
+        conn.execute(
+            "UPDATE jobs SET eligible = 'no', eligibility_reason = ?, "
+            "is_terminal_internship = 'no', is_terminal_internship_likely = 'no' "
+            "WHERE url = ?",
+            (new_reason, r["url"]),
+        )
+        changed += 1
+    conn.commit()
+    log.info("Eligibility tightened for grad-date mismatch: %d changed.", changed)
+    return changed
+
+
+def recompute_eligibility_for_unwanted_term(conn=None) -> int:
+    """Exclude internships in a term the candidate won't actually be free for.
+
+    By Fall 2027 the candidate expects to already be working a new-grad job
+    (or has one lined up) -- a Fall or Winter 2027 internship isn't a real
+    option regardless of how grad-date-safe it is, so this is a genuine
+    exclusion, not a ranking demotion. Summer internships (the main terminal
+    route, right after May graduation) and Spring internships (the
+    remote-spring route, before graduation) are unaffected.
+
+    `term` is the LLM's own read of the posting (TERM CHECK in SCORE_PROMPT),
+    NULL/'unclear' for jobs scored before it existed or where the posting
+    genuinely doesn't say -- both pass here rather than being excluded on a
+    guess, same fail-open reasoning as the `eligible` column generally.
+
+    Derived from stored columns, no LLM call -- safe to re-run any time term
+    values change. Only ever tightens eligibility, same as
+    recompute_eligibility_for_grad_date, for the same reason: a wrong
+    exclusion here should be fixed by re-scoring, not guessed back open.
+
+    Returns the number of rows changed.
+    """
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT url, eligibility_reason FROM jobs "
+        "WHERE job_type = 'internship' AND term IN ('fall', 'winter') "
+        "AND (eligible IS NULL OR eligible != 'no')"
+    ).fetchall()
+
+    note = ("Fall/Winter 2027 term -- candidate expects to already be in a "
+            "new-grad role by then, not looking for an internship.")
+    changed = 0
+    for r in rows:
+        reason = r["eligibility_reason"] or ""
+        new_reason = f"{reason} {note}".strip() if reason else note
+        conn.execute(
+            "UPDATE jobs SET eligible = 'no', eligibility_reason = ?, "
+            "is_terminal_internship = 'no', is_terminal_internship_likely = 'no' "
+            "WHERE url = ?",
+            (new_reason, r["url"]),
+        )
+        changed += 1
+    conn.commit()
+    log.info("Eligibility tightened for unwanted term: %d changed.", changed)
+    return changed
+
+
+def recompute_job_type_from_title(conn=None) -> int:
+    """Fix job_type for rows Jobright's own "intern" feed mislabeled.
+
+    _classify_job_type() (discovery/smartextract.py) trusts the source site
+    unconditionally at insert time, and title_suggests_new_grad() now catches
+    the mismatch for new rows -- but it doesn't reach rows already in the DB
+    from before that check existed. Re-derived from the stored title rather
+    than at parse time, same rationale as compute_terminal_internships: no
+    LLM call, and a batch that ran before this existed gets repaired by
+    re-running this instead of re-scraping.
+
+    Only corrects internship -> new_grad; the reverse (a genuine internship
+    posting caught by the title heuristic) hasn't been observed and would be
+    a title_suggests_new_grad false positive worth fixing there instead.
+
+    Returns the number of rows whose job_type changed.
+    """
+    from applypilot.discovery.smartextract import title_suggests_new_grad
+
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT url, title FROM jobs WHERE job_type = 'internship'"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        if title_suggests_new_grad(r["title"]):
+            conn.execute(
+                "UPDATE jobs SET job_type = 'new_grad' WHERE url = ?",
+                (r["url"],),
+            )
+            changed += 1
+    conn.commit()
+    log.info("job_type corrected from title: %d changed.", changed)
+    return changed
+
+
 def compute_terminal_internships(conn=None) -> int:
     """Recompute `is_terminal_internship` for every scored job. No LLM calls.
 
-    A terminal internship -- one that explicitly accepts candidates who have
-    already graduated -- is functionally a new-grad bridge role, and
+    A terminal internship -- one that affirmatively accepts candidates who
+    have already graduated -- is functionally a new-grad bridge role, and
     acquire_job() sorts on this flag ahead of any composite score. Because
     that override is absolute, the bar has to be high on every axis:
 
-      1. The posting explicitly says so (terminal_evidence), not merely fails
-         to say otherwise.
+      1. Evidence the posting says so, not merely fails to say otherwise.
+         Primary source is terminal_evidence_llm -- the scoring prompt's own
+         TERMINAL EVIDENCE CHECK, read with actual comprehension rather than
+         a fixed phrase list, which is what makes co-ops, "must have attained
+         a degree", and garbled/run-on phrasing all readable in the first
+         place. TERMINAL_EXCLUDE_RE still runs as an unconditional veto on
+         top -- a posting the regex recognizes as explicitly exclusionary
+         wins even over an LLM "yes", since that's a cheap safety net against
+         a model mistake. Falls back to the regex alone (terminal_evidence())
+         only for rows scored before terminal_evidence_llm existed; re-score
+         those to get the LLM's read.
       2. Strong skill match -- fit_score >= terminal_min_fit.
-      3. A job actually worth jumping the queue for --
-         desirability_score >= terminal_min_desirability. Without this a
-         fit-9 role at an unknown company with desirability 2.0 outranked
-         fit-10/desirability-10.0 roles at Google, Mastercard and Adobe.
+      3. A reputable enough employer to be worth jumping the queue for --
+         company_prestige >= terminal_min_prestige. Gated on prestige
+         directly rather than the blended desirability_score on purpose:
+         desirability also folds in location/pay, and the candidate wants
+         "is this company legit" judged separately from "is this a good
+         deal for me". Below-floor pay is still excluded unconditionally by
+         pay_below_floor regardless of this bar.
 
     Derived from stored columns rather than at parse time so the whole flag
     can be re-tuned or corrected without re-running a single LLM call, and so
-    a scoring batch that silently skips the column can be repaired by
+    a scoring batch that silently skips a column can be repaired by
     re-running this instead of re-scoring.
 
     Returns the number of rows whose flag changed.
@@ -727,27 +1027,42 @@ def compute_terminal_internships(conn=None) -> int:
     if conn is None:
         conn = get_connection()
     settings = _config.load_settings()
-    min_fit = settings.get("terminal_min_fit", 9)
-    min_des = settings.get("terminal_min_desirability", 6.0)
+    min_fit = settings.get("terminal_min_fit", 6)
+    min_prestige = settings.get("terminal_min_prestige", 6)
 
     rows = conn.execute(
-        "SELECT url, job_type, fit_score, desirability_score, "
-        "       requires_returning_student, full_description, is_terminal_internship FROM jobs "
+        "SELECT url, job_type, fit_score, company_prestige, pay_below_floor, "
+        "       requires_returning_student, terminal_evidence_llm, eligible, "
+        "       full_description, is_terminal_internship FROM jobs "
         "WHERE fit_score IS NOT NULL"
     ).fetchall()
 
     changed = 0
     for r in rows:
+        llm_ev = r["terminal_evidence_llm"]
+        evidence = llm_ev if llm_ev in ("yes", "no") else terminal_evidence(r["full_description"])
         want = "yes" if (
             r["job_type"] == "internship"
+            # A flag that means "apply to this, it's safe and worth it" has
+            # no business being true for a role the apply queue would never
+            # actually pick up -- pay_below_floor is a hard, unconditional
+            # exclusion everywhere else in the pipeline, so it has to be one
+            # here too, regardless of how high prestige happens to be.
+            and r["pay_below_floor"] != "yes"
             # Necessary, not sufficient. This is the only field that compares
             # the candidate's graduation dates against a window the posting
-            # states; the phrase check below adds the "explicitly says so"
+            # states; the evidence check above adds the "explicitly says so"
             # requirement it lacks.
             and r["requires_returning_student"] == "no"
+            # Explicit disqualifiers (e.g. "requires a PhD in progress") must
+            # never be overridden by a high fit/prestige score -- eligibility
+            # is enforced here directly rather than relying on fit_score
+            # happening to be low for the same row.
+            and r["eligible"] != "no"
             and (r["fit_score"] or 0) >= min_fit
-            and (r["desirability_score"] or 0) >= min_des
-            and terminal_evidence(r["full_description"]) == "yes"
+            and (r["company_prestige"] or 0) >= min_prestige
+            and evidence == "yes"
+            and not TERMINAL_EXCLUDE_RE.search(r["full_description"] or "")
         ) else "no"
         if r["is_terminal_internship"] != want:
             conn.execute(
@@ -760,6 +1075,201 @@ def compute_terminal_internships(conn=None) -> int:
     return changed
 
 
+def compute_remote_spring_internships(conn=None) -> int:
+    """Recompute `is_remote_spring_internship` for every scored job.
+
+    A Spring-term internship that's fully remote needs no grad-date evidence
+    at all: the candidate is a normal enrolled student for the whole term
+    (it ends at or before their May graduation), and remote means no
+    relocation/on-campus conflict either. That makes it equally safe to
+    auto-send as a confirmed terminal internship, just via a different route
+    -- one relies on the posting welcoming an already-graduated candidate,
+    this one never needs to raise the graduation question because the
+    candidate is still in school throughout. Same fit/prestige bar as
+    is_terminal_internship, so the two are comparable priority.
+
+    `location` holds "Remote" only when the scoring prompt judged the role
+    fully remote (no onsite/hybrid component) -- see JOB_LOCATION in
+    SCORE_PROMPT, written to the `location` column by _write_score_results.
+    `term` is the LLM's own read of the posting's academic term (TERM
+    CHECK). Both NULL/unclear for jobs scored before these fields existed,
+    so this only starts finding matches after a re-score.
+
+    Deliberately independent of is_terminal_internship -- acquire_job()
+    combines the two with OR into a single top-priority tier rather than
+    stacking them, so a role that happens to satisfy both isn't
+    double-boosted (see is_remote_spring_internship's column comment in
+    database.py).
+
+    Uses its own bar (remote_spring_min_fit/prestige) rather than
+    is_terminal_internship's -- this route to the priority tier needs no
+    grad-date evidence at all, so both can stay looser than the terminal
+    bars while still keeping out genuine bottom-tier noise.
+
+    Returns the number of rows whose flag changed.
+    """
+    from applypilot import config as _config
+
+    if conn is None:
+        conn = get_connection()
+    settings = _config.load_settings()
+    min_fit = settings.get("remote_spring_min_fit", 5)
+    min_prestige = settings.get("remote_spring_min_prestige", 5)
+
+    rows = conn.execute(
+        "SELECT url, job_type, fit_score, company_prestige, term, "
+        "       location, pay_below_floor, is_remote_spring_internship FROM jobs "
+        "WHERE fit_score IS NOT NULL"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        want = "yes" if (
+            r["job_type"] == "internship"
+            and r["pay_below_floor"] != "yes"
+            and r["term"] == "spring"
+            and (r["location"] or "").strip().lower() == "remote"
+            and (r["fit_score"] or 0) >= min_fit
+            and (r["company_prestige"] or 0) >= min_prestige
+        ) else "no"
+        if r["is_remote_spring_internship"] != want:
+            conn.execute(
+                "UPDATE jobs SET is_remote_spring_internship = ? WHERE url = ?",
+                (want, r["url"]),
+            )
+            changed += 1
+    conn.commit()
+    log.info("Remote-spring-internship flags recomputed: %d changed.", changed)
+    return changed
+
+
+def compute_likely_terminal_internships(conn=None) -> int:
+    """Recompute `is_terminal_internship_likely` for every scored job.
+
+    Sibling of compute_terminal_internships() for the postings that never
+    address post-grad eligibility at all -- no explicit welcome phrase (that
+    bucket is already 'yes' on is_terminal_internship) and no explicit
+    return-to-school requirement (terminal_evidence() already vetoes those).
+    Same fit/prestige bar as the confirmed flag, since this is meant to
+    surface "would already be terminal except the posting is silent," not to
+    lower the quality bar.
+
+    This is a judgment call, not a fact: a posting that says nothing is, by
+    base rate, far more often indifferent to your exact graduation date than
+    it is a hidden trap -- postings that actually care tend to say so (that's
+    the whole premise TERMINAL_EXCLUDE_RE relies on). Deliberately NOT wired
+    into acquire_job()'s queue-jump ordering, unlike is_terminal_internship --
+    the confidence here doesn't clear that bar.
+
+    Must run after compute_terminal_internships(), since it treats
+    is_terminal_internship == 'no' as "not already confirmed."
+
+    Does NOT trust requires_returning_student alone to mean "silent" --
+    that field is an LLM judgment call, not a regex match, and the exact
+    failure mode this flag exists to avoid (see terminal_evidence()'s
+    docstring: an earlier audit found 77.5% of a requires_returning_student
+    -only flag were flagged on silence, not real evidence) can also produce
+    a false "no" on a posting that actually states a disqualifying
+    graduation requirement in wording TERMINAL_EXCLUDE_RE doesn't happen to
+    match. So this still runs TERMINAL_EXCLUDE_RE directly against the
+    description as an independent veto, same as terminal_evidence() does
+    for the confirmed flag.
+
+    Returns the number of rows whose flag changed.
+    """
+    from applypilot import config as _config
+
+    if conn is None:
+        conn = get_connection()
+    settings = _config.load_settings()
+    min_fit = settings.get("terminal_min_fit", 6)
+    min_prestige = settings.get("terminal_min_prestige", 6)
+
+    rows = conn.execute(
+        "SELECT url, job_type, fit_score, company_prestige, pay_below_floor, "
+        "       requires_returning_student, is_terminal_internship, "
+        "       full_description, is_terminal_internship_likely FROM jobs "
+        "WHERE fit_score IS NOT NULL"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        want = "yes" if (
+            r["job_type"] == "internship"
+            and r["pay_below_floor"] != "yes"
+            and r["is_terminal_internship"] == "no"
+            and r["requires_returning_student"] == "no"
+            and (r["fit_score"] or 0) >= min_fit
+            and (r["company_prestige"] or 0) >= min_prestige
+            and not TERMINAL_EXCLUDE_RE.search(r["full_description"] or "")
+        ) else "no"
+        if r["is_terminal_internship_likely"] != want:
+            conn.execute(
+                "UPDATE jobs SET is_terminal_internship_likely = ? WHERE url = ?",
+                (want, r["url"]),
+            )
+            changed += 1
+    conn.commit()
+    log.info("Likely-terminal-internship flags recomputed: %d changed.", changed)
+    return changed
+
+
+def compute_company_tiers(conn=None) -> int:
+    """Stamp every scored job with 'tier1', 'adjacent', or NULL.
+
+    Pure string matching over the stored `company` column plus the prestige
+    floor -- no LLM call, so re-running this after editing the company lists
+    is free.
+
+    Matching is on config.normalize_company()'s output, and a posting matches
+    when either normalized name is a whole-word prefix of the other. That
+    two-way rule is what makes both "Meta Platforms, Inc." -> "meta" and
+    "Jane Street" -> "Jane Street Capital" land, while the word boundary is
+    what stops "Block" from swallowing "Blockchain Widgets".
+
+    Returns the number of rows updated.
+    """
+    from applypilot import config as _config
+
+    if conn is None:
+        conn = get_connection()
+
+    tier1_names, adjacent_names = _config.get_tier_companies()
+    tier1 = {_config.normalize_company(n) for n in tier1_names} - {""}
+    adjacent = {_config.normalize_company(n) for n in adjacent_names} - {""}
+    prestige_floor = _config.TIER_PRESTIGE_FLOOR
+
+    def _matches(name: str, candidates: set[str]) -> bool:
+        if not name:
+            return False
+        if name in candidates:
+            return True
+        return any(
+            name.startswith(c + " ") or c.startswith(name + " ")
+            for c in candidates
+        )
+
+    rows = conn.execute(
+        "SELECT url, company, company_prestige FROM jobs WHERE scored_at IS NOT NULL"
+    ).fetchall()
+
+    updated = 0
+    for row in rows:
+        name = _config.normalize_company(row["company"])
+        if _matches(name, tier1):
+            tier = "tier1"
+        elif _matches(name, adjacent) or (row["company_prestige"] or 0) >= prestige_floor:
+            tier = "adjacent"
+        else:
+            tier = None
+        conn.execute("UPDATE jobs SET company_tier = ? WHERE url = ?", (tier, row["url"]))
+        updated += 1
+
+    conn.commit()
+    log.info("Recomputed company tiers for %d jobs", updated)
+    return updated
+
+
 def compute_desirability(conn=None) -> int:
     """Recompute `desirability_score` for every scored job. No LLM calls.
 
@@ -769,13 +1279,18 @@ def compute_desirability(conn=None) -> int:
     what lets the apply queue rank on a blend of the two without either
     number quietly absorbing the other.
 
-    Location and pay used to be independent weighted components, but that
-    let a bad location and bad pay double-count against each other in a
-    plain average rather than genuinely interacting -- the candidate wants
-    good pay to actively rescue an otherwise-so-so location, not just
-    partially offset it. They're folded into one component now (see
-    _location_desirability/_pay_tier_score), with pay's old weight rolled
-    into location's so the total weight distribution is unchanged.
+    Three genuinely independent components -- pay, company prestige, and
+    location -- each weighted per lane. Pay and location were previously
+    folded into a single term, which silently discarded pay whenever the
+    location scored well on its own: every NYC new-grad posting at the same
+    prestige came out with an identical desirability whether it paid $83k or
+    $354k. They are separate terms now.
+
+    The weights differ by lane because the candidate's priorities do. For a
+    new-grad role, staying in New York is worth nearly as much as the money.
+    For an internship it is only one semester, relocation is often paid, and
+    good pay makes anywhere workable -- so pay carries more and location
+    less.
 
     Deliberately pure arithmetic over columns that are already stored, so
     re-tuning the weights costs nothing and never requires re-scoring 121 jobs
@@ -791,18 +1306,12 @@ def compute_desirability(conn=None) -> int:
     # load_settings() already merges DEFAULT_SETTINGS, so these keys are
     # present whether or not the user's settings.json mentions them.
     settings = _config.load_settings()
-    w_prestige = settings.get("prestige_weight", 0.4)
-    w_location = settings.get("location_weight", 0.4) + settings.get("pay_weight", 0.2)
+    ng_w = settings.get("new_grad_weights", DEFAULT_NEW_GRAD_WEIGHTS)
+    int_w = settings.get("internship_weights", DEFAULT_INTERNSHIP_WEIGHTS)
     preferred_city = settings.get("preferred_city", "New York")
 
-    comp = _config.load_profile().get("compensation", {})
-    hourly_floor = _float_or_zero(comp.get("internship_hourly_floor"))
-    # parse_pay_range() always normalizes a posting's range to an hourly
-    # figure (even one stated as an annual salary), so the new-grad floor
-    # needs the same conversion to compare on equal terms.
-    annual_floor_hourly = _float_or_zero(comp.get("salary_expectation")) / _HOURS_PER_YEAR
-
     housing_bonus = _float_or_zero(settings.get("housing_bonus", 0.5))
+    remote_bonus = _float_or_zero(settings.get("remote_bonus", 0.5))
 
     rows = conn.execute(
         "SELECT url, location, salary, company_prestige, job_type, full_description "
@@ -811,15 +1320,22 @@ def compute_desirability(conn=None) -> int:
 
     updated = 0
     for row in rows:
+        is_internship = row["job_type"] == "internship"
+        weights = int_w if is_internship else ng_w
+
         prestige = row["company_prestige"] or 0
-        floor = hourly_floor if row["job_type"] == "internship" else annual_floor_hourly
-        location = _location_desirability(row["location"], preferred_city, row["salary"], floor)
+        location = _location_desirability(row["location"], preferred_city)
+        pay = _pay_tier_score(row["salary"], is_internship)
 
         # Drop prestige if we have no signal for it and renormalise, so a job
-        # with no company identified is judged on location+pay alone rather
-        # than being dragged toward zero by a missing component.
-        parts = [(prestige, w_prestige)] if prestige else []
-        parts.append((location, w_location))
+        # with no company identified is judged on pay+location alone rather
+        # than being dragged toward zero by a missing component. Pay does not
+        # need the same treatment -- _pay_tier_score already returns a
+        # neutral 5.0 when a posting states no salary.
+        parts = [(pay, weights.get("pay", 0.35)),
+                 (location, weights.get("location", 0.30))]
+        if prestige:
+            parts.append((prestige, weights.get("prestige", 0.35)))
 
         total_weight = sum(w for _, w in parts)
         score = (sum(v * w for v, w in parts) / total_weight) if total_weight else 5.0
@@ -830,6 +1346,15 @@ def compute_desirability(conn=None) -> int:
         # salary already prices in relocation, and it isn't a recurring perk.
         if row["job_type"] == "internship" and offers_housing(row["full_description"]):
             score = min(10.0, score + housing_bonus)
+
+        # Same flat-bump treatment as housing, and for the same reason: a
+        # remote role is worth more to the candidate regardless of where it
+        # sits, and that shouldn't only register for roles that happen to
+        # land near a location-tier boundary. `location` holds "Remote"
+        # only when the scoring prompt judged the role fully remote (no
+        # onsite/hybrid component) -- see JOB_LOCATION in SCORE_PROMPT.
+        if row["job_type"] == "internship" and (row["location"] or "").strip().lower() == "remote":
+            score = min(10.0, score + remote_bonus)
 
         conn.execute(
             "UPDATE jobs SET desirability_score = ? WHERE url = ?",
@@ -879,7 +1404,8 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
             continue
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
-            "requires_returning_student = ?, pay_text = ?, pay_below_floor = ?, "
+            "term = ?, requires_returning_student = ?, terminal_evidence_llm = ?, "
+            "pay_text = ?, pay_below_floor = ?, "
             # Never let an "unknown" from the model erase a real name that
             # discovery already captured -- keep the existing value instead.
             "company = COALESCE(NULLIF(?, ''), company), "
@@ -887,7 +1413,9 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
             "keywords = ? "
             "WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now,
+             r.get("term", "unclear"),
              r.get("requires_returning_student", "no"),
+             r.get("terminal_evidence_llm", "no"),
              r.get("pay_text", ""), r.get("pay_below_floor", "unknown"),
              r.get("company", ""), r.get("company_prestige", 0),
              r.get("eligible", "unclear"), r.get("eligibility_reason", ""),
@@ -911,12 +1439,22 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
     return skipped
 
 
-def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
+def run_scoring(limit: int = 0, rescore: bool = False,
+                stale_only: bool = False) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
         limit: Maximum number of jobs to score in this run.
         rescore: If True, re-score all jobs (not just unscored ones).
+        stale_only: Re-score only rows that were scored before the TERM and
+            TERMINAL EVIDENCE checks were added to the prompt -- they can be
+            identified exactly, because those rows have a scored_at but a
+            NULL `term`. This matters more than it sounds: 87% of the corpus
+            predates those checks, which is why only a couple of dozen rows
+            are flagged as terminal internships. Without `term`, the
+            Spring/Summer gate falls back to reading the title and the
+            terminal-internship path (the one that makes a Summer role
+            reachable at all after graduating) never fires.
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -924,7 +1462,13 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
-    if rescore:
+    if stale_only:
+        query = ("SELECT * FROM jobs WHERE full_description IS NOT NULL "
+                 "AND scored_at IS NOT NULL AND (term IS NULL OR term = '')")
+        if limit > 0:
+            query += f" LIMIT {limit}"
+        jobs = conn.execute(query).fetchall()
+    elif rescore:
         query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
         if limit > 0:
             query += f" LIMIT {limit}"
@@ -1006,8 +1550,22 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     # columns that were already there (location, salary), so it's recomputed
     # once at the end rather than needing a separate command.
     compute_desirability(conn=conn)
+    # Must precede the terminal computations below -- both filter on
+    # job_type == 'internship'.
+    recompute_job_type_from_title(conn=conn)
+    # No ordering dependency on the others; tightens eligibility wherever
+    # requires_returning_student says the candidate's one true grad date
+    # can't satisfy the posting.
+    recompute_eligibility_for_grad_date(conn=conn)
+    # Independent of the above -- excludes Fall/Winter 2027 internships on
+    # timing grounds, not grad-date grounds.
+    recompute_eligibility_for_unwanted_term(conn=conn)
     # Must follow compute_desirability -- it reads desirability_score.
     compute_terminal_internships(conn=conn)
+    # Must follow compute_terminal_internships -- it reads is_terminal_internship.
+    compute_likely_terminal_internships(conn=conn)
+    # Independent of the above -- a separate route to the same priority tier.
+    compute_remote_spring_internships(conn=conn)
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec), %d skipped (kept existing score after an error)",

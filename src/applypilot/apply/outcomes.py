@@ -18,6 +18,12 @@ PERMANENT_FAILURES: set[str] = {
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    # Only ever printed when the form/posting requires a graduation date the
+    # attached resume doesn't have. Used to be retryable because the pipeline
+    # could swap to a second resume printed with a later graduation date --
+    # that identity was retired (single true grad date only), so there is no
+    # honest resume left to retry with.
+    "grad_date_mismatch",
 }
 
 # Clean, understood reasons this job will never be applicable -- no human
@@ -26,6 +32,7 @@ DISQUALIFIED_REASONS: set[str] = {
     "not_eligible_location", "not_eligible_salary", "already_applied",
     "expired", "captcha", "account_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "grad_date_mismatch",
 }
 
 # Reasons where something unusual happened -- worth a human glance rather

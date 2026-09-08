@@ -72,7 +72,9 @@ enrich_loop() {
         # `|| true`: a single crashed batch (e.g. a Playwright driver EPIPE)
         # must not kill this whole unattended run -- log it and retry next
         # iteration.
-        applypilot run enrich >> "$LOG" 2>&1 || echo "enrich batch failed (see above), continuing" | tee -a "$LOG"
+        # workers=2: one Playwright/Chromium instance per worker, so this is
+        # capped by RAM (8GB machine) rather than pushed higher blindly.
+        applypilot run enrich --workers 2 >> "$LOG" 2>&1 || echo "enrich batch failed (see above), continuing" | tee -a "$LOG"
     done
 }
 

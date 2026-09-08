@@ -24,15 +24,13 @@ def _build_profile_summary(profile: dict, start_date_override: str = "") -> str:
     human-readable multi-line summary for the agent.
 
     Args:
-        start_date_override: The active resume variant's configured
-            start_date (see settings.json resume_variants). The gap between
-            graduating and being available isn't a fixed offset across
-            variants -- May 2027 grad -> August 2027 start (+3 months), but
-            January 2028 grad -> February 2028 start (+1 month) -- so this
-            must come from the variant's own config, never computed from
-            grad_date with one formula. Falls back to the profile's static
-            availability.earliest_start_date only if a variant lookup wasn't
-            available at all.
+        start_date_override: The configured earliest_start_date from
+            settings. The gap between graduating and being available to
+            start isn't a fixed offset (May 2027 grad -> August 2027 start
+            is +3 months, but a December grad is +2), so this is configured
+            explicitly and never computed from grad_date with one formula.
+            Falls back to the profile's static
+            availability.earliest_start_date if settings don't carry one.
     """
     p = profile
     personal = p["personal"]
@@ -646,12 +644,11 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
             shutil.copy(str(cl_pdf_src), str(cl_upload))
             cl_upload_path = str(cl_upload)
 
-    # --- Resume variant -> graduation date + start date (must match the resume) ---
-    resume_variant = job.get("resume_variant") or "default"
-    _, _, grad_date, variant_start_date = config.get_resume_variant_paths(resume_variant)
+    # --- Graduation date + start date (must match the one resume) ---
+    grad_date, start_date = config.get_grad_and_start_dates()
 
     # --- Build all prompt sections ---
-    profile_summary = _build_profile_summary(profile, start_date_override=variant_start_date)
+    profile_summary = _build_profile_summary(profile, start_date_override=start_date)
     location_check = _build_location_check(profile, search_config)
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile, grad_date=grad_date,
@@ -685,8 +682,10 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
         cl_display = cover_letter_text
 
     # One password across every employer site -- referenced by both step 5 and
-    # the ACCOUNT RECOVERY section, so bind it once.
-    STD_PASSWORD = personal.get("password", "")
+    # the ACCOUNT RECOVERY section, so bind it once. Lives in .env, not
+    # profile.json, so it isn't sitting in plaintext on disk outside the
+    # test-harness override path below.
+    STD_PASSWORD = personal.get("password") or os.environ.get("APPLYPILOT_JOB_PASSWORD", "")
 
     # Phone digits only (for fields with country prefix)
     phone_digits = "".join(c for c in personal.get("phone", "") if c.isdigit())

@@ -24,8 +24,10 @@ from applypilot.database import _DAY_EXPR, get_connection
 # view.py inlined every description into one page and produced a 21 MB file.
 _ROW_COLUMNS = f"""
     url, title, company, site, location, salary, pay_text,
-    fit_score, desirability_score, company_prestige,
-    job_type, ats, eligible, keywords,
+    fit_score, desirability_score, company_prestige, company_tier,
+    job_type, ats, eligible, keywords, term,
+    is_terminal_internship, is_terminal_internship_likely,
+    is_remote_spring_internship,
     pay_min_hourly, pay_max_hourly, pay_below_floor,
     apply_status, applied_at, apply_error, apply_cost_usd,
     queue_batch, tailored_resume_path,
@@ -35,7 +37,16 @@ _ROW_COLUMNS = f"""
 
 # Sortable columns, mapped to SQL. A whitelist rather than interpolation --
 # the sort key arrives from a query string.
+# Big tech first, then desirability, with fit demoted to a pure tiebreaker.
+# This is the default the candidate actually browses by: skills fit was
+# previously the dominant term and it buried the postings they most wanted
+# (Meta internships average fit 3.4, Anthropic new-grad 2.0, both at
+# prestige 10, and neither had ever been applied to).
+_TIER_RANK = ("CASE company_tier WHEN 'tier1' THEN 2 "
+              "WHEN 'adjacent' THEN 1 ELSE 0 END DESC")
+
 SORTS: dict[str, str] = {
+    "top": f"{_TIER_RANK}, desirability_score DESC, fit_score DESC",
     "prestige": "company_prestige DESC, fit_score DESC",
     "fit": "fit_score DESC, desirability_score DESC",
     "desirability": "desirability_score DESC, fit_score DESC",
@@ -46,7 +57,7 @@ SORTS: dict[str, str] = {
     # lexically and puts the nine first.
     "pay": "pay_max_hourly DESC NULLS LAST",
 }
-DEFAULT_SORT = "prestige"
+DEFAULT_SORT = "top"
 
 
 def _filter_clauses(f: dict) -> tuple[str, list]:
@@ -56,23 +67,30 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     if f.get("day"):
         clauses.append(f"{_DAY_EXPR} = ?")
         params.append(f["day"])
+    # Quality bars. With include_tier set, a tier1/adjacent posting is exempt
+    # from every one of them -- the whole point of the tier is that a big-tech
+    # opening gets applied to regardless of how it scores, and these bars are
+    # exactly what used to hide them (Meta's prestige-10 internships average a
+    # fit of 3.4, well under the priority panels' own floor).
+    exempt = bool(f.get("include_tier"))
+
+    def _bar(clause: str, value) -> None:
+        clauses.append(f"(company_tier IS NOT NULL OR ({clause}))" if exempt else clause)
+        params.append(value)
+
     if f.get("min_fit") is not None:
-        clauses.append("fit_score >= ?")
-        params.append(f["min_fit"])
+        _bar("fit_score >= ?", f["min_fit"])
     if f.get("min_desirability") is not None:
-        clauses.append("desirability_score >= ?")
-        params.append(f["min_desirability"])
+        _bar("desirability_score >= ?", f["min_desirability"])
     if f.get("min_prestige") is not None:
-        clauses.append("company_prestige >= ?")
-        params.append(f["min_prestige"])
+        _bar("company_prestige >= ?", f["min_prestige"])
     if f.get("min_pay") is not None:
         # Compared against the *high* end: "pay >= 40" asks which jobs could
         # pay at least that, and a $30-$60 posting qualifies. -1 is the
         # "unparseable" marker and NULL is "no stated pay"; both are excluded,
         # because a threshold the user typed is a deliberate act and silently
         # including unknowns would defeat it.
-        clauses.append("pay_max_hourly IS NOT NULL AND pay_max_hourly >= ?")
-        params.append(f["min_pay"])
+        _bar("pay_max_hourly IS NOT NULL AND pay_max_hourly >= ?", f["min_pay"])
     if f.get("job_type"):
         clauses.append("job_type = ?")
         params.append(f["job_type"])
@@ -80,14 +98,71 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
         clauses.append("site = ?")
         params.append(f["site"])
     if f.get("ats"):
-        clauses.append("ats = ?")
-        params.append(f["ats"])
-    if f.get("eligible_only"):
-        # NULL passes: a job scored before the eligibility gate existed is not
-        # known to be ineligible, and dropping it would hide real openings.
-        clauses.append("(eligible IS NULL OR eligible != 'no')")
+        # A checklist, not a single choice -- f["ats"] is a list (even a
+        # one-item one), so this is always an IN, never a bare `=`.
+        ats_list = f["ats"]
+        clauses.append(f"ats IN ({','.join('?' * len(ats_list))})")
+        params.extend(ats_list)
+    # Unconditional, not opt-in: there is no reason this browse table should
+    # ever surface a job you can't honestly take. NULL passes because a job
+    # scored before the eligibility gate existed is not known to be
+    # ineligible, and dropping it would hide a real opening.
+    clauses.append("(eligible IS NULL OR eligible != 'no')")
+    # Unconditional, not opt-in, and season-based rather than title-text
+    # matching: internships only in Spring or Summer term (your only two
+    # workable terms -- Spring because you're still enrolled, Summer because
+    # it's right after graduation). `term` is the LLM's own read (TERM
+    # CHECK); NULL/'unclear' rows (not yet re-scored, or the posting truly
+    # doesn't say) fall back to the same title-text heuristic this used to
+    # be gated behind, so nothing regresses ahead of a re-score. That old
+    # heuristic used to require the title also say "summer" even for a
+    # legitimate Spring-only posting -- fixed here, since Spring alone is
+    # now explicitly wanted, not just tolerated.
+    clauses.append("""(
+        job_type != 'internship'
+        OR term IN ('spring', 'summer')
+        OR (
+            (term IS NULL OR term = 'unclear')
+            AND (
+                (LOWER(title) NOT LIKE '%winter%' AND LOWER(title) NOT LIKE '%fall%')
+                OR LOWER(title) LIKE '%summer%'
+            )
+        )
+    )""")
+    if f.get("tier_only"):
+        clauses.append("company_tier IS NOT NULL")
+    if f.get("location"):
+        # Coarse buckets, matching _location_desirability's own tiers so the
+        # filter and the score can't disagree about what "NYC" means.
+        bucket = f["location"]
+        if bucket == "nyc":
+            clauses.append("(LOWER(location) LIKE '%new york%' "
+                           "OR LOWER(location) LIKE '%, ny%' "
+                           "OR LOWER(location) LIKE '%brooklyn%' "
+                           "OR LOWER(location) LIKE '%queens%')")
+        elif bucket == "remote":
+            clauses.append("(LOWER(location) LIKE '%remote%' "
+                           "OR LOWER(location) LIKE '%anywhere%')")
+        elif bucket == "metro":
+            metro_likes = " OR ".join(
+                ["LOWER(location) LIKE '%new york%'"]
+                + [f"LOWER(location) LIKE '%{m}%'" for m in
+                   ("san francisco", "seattle", "austin", "boston", "palo alto",
+                    "san jose", "mountain view", "sunnyvale")]
+            )
+            clauses.append(f"({metro_likes})")
+    if f.get("term"):
+        clauses.append("term = ?")
+        params.append(f["term"])
     if f.get("above_pay_floor"):
         clauses.append("(pay_below_floor IS NULL OR pay_below_floor != 'yes')")
+    if f.get("terminal_only"):
+        clauses.append("is_terminal_internship = 'yes'")
+    if f.get("likely_terminal_only"):
+        # Manual-review queue: strong matches whose posting never says
+        # either way about post-grad eligibility (see
+        # compute_likely_terminal_internships in scoring/scorer.py).
+        clauses.append("is_terminal_internship_likely = 'yes'")
     if f.get("unapplied_only"):
         clauses.append("(apply_status IS NULL OR apply_status = 'failed')")
     if f.get("posted_within_days") is not None:
@@ -108,8 +183,13 @@ def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
 
     The counts come back with the days rather than from three more round
     trips, because the chips are labelled before anyone clicks them.
+
+    Gated by the same eligibility/term clause list_jobs() applies unconditionally
+    -- otherwise a day's total would count rows the table itself never shows,
+    which reads as "10 jobs vanished" the moment you open that day.
     """
     conn = conn or get_connection()
+    visible_where, _ = _filter_clauses({})
     rows = conn.execute(f"""
         SELECT {_DAY_EXPR} AS day,
                COUNT(*) AS total,
@@ -118,7 +198,7 @@ def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
                         THEN 1 ELSE 0 END) AS best_fit,
                SUM(CASE WHEN apply_status = 'applied' THEN 1 ELSE 0 END) AS applied
         FROM jobs
-        WHERE {_DAY_EXPR} IS NOT NULL
+        WHERE {_DAY_EXPR} IS NOT NULL AND ({visible_where})
         GROUP BY day
         ORDER BY day DESC
     """).fetchall()

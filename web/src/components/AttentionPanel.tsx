@@ -6,19 +6,34 @@ import type { GlobalFilters, JobRow, SortKey } from "@/lib/types"
 
 const CHUNK = 40
 const PREFETCH_MARGIN = 300
-const MIN_BOX_HEIGHT = 140
-const MAX_BOX_HEIGHT = 900
-const DEFAULT_BOX_HEIGHT = 8 * ROW_HEIGHT + HEADER_HEIGHT
+export const ATTENTION_MIN_BOX_HEIGHT = 140
+export const ATTENTION_MAX_BOX_HEIGHT = 900
+export const ATTENTION_DEFAULT_BOX_HEIGHT = 8 * ROW_HEIGHT + HEADER_HEIGHT
 
 interface Props {
   title: string
   defaultSort: SortKey
   minPrestige: number
+  // This lane's own pay floor, in $/hr. Both bars are waived for a
+  // tier1/adjacent posting -- see include_tier below.
+  minPay: number
+  // Fixed for this panel, independent of globalFilters.job_type -- the
+  // whole point of these two panels is to BE the internship/new_grad split
+  // (see BrowseTab), so each panel's type can't be knocked out by whatever
+  // the global job-type dropdown happens to be set to. null = either type.
+  jobType: string | null
   postedWithinDays: number | null
   globalFilters: GlobalFilters
   selected: Set<string>
-  onToggleSelect: (url: string) => void
-  onToggleMany: (urls: string[], checked: boolean) => void
+  onToggleSelect: (url: string, jobType: string | null) => void
+  onToggleMany: (rows: { url: string; job_type: string | null }[], checked: boolean) => void
+  // Both Priority panels share one height: dragging either grip resizes both,
+  // and each independently loads enough of its own rows to fill it (rather
+  // than one panel loading rows while the other just stretches to match with
+  // nothing to show) -- that's the whole point of sharing this instead of
+  // each panel owning its own boxHeight.
+  boxHeight: number
+  onBoxHeightChange: (h: number) => void
 }
 
 /**
@@ -36,11 +51,15 @@ export function AttentionPanel({
   title,
   defaultSort,
   minPrestige,
+  minPay,
+  jobType,
   postedWithinDays,
   globalFilters,
   selected,
   onToggleSelect,
   onToggleMany,
+  boxHeight,
+  onBoxHeightChange,
 }: Props) {
   const [sort, setSort] = useState<SortKey>(defaultSort)
   const [rows, setRows] = useState<JobRow[]>([])
@@ -52,7 +71,6 @@ export function AttentionPanel({
   const requestIdRef = useRef(0)
   const fetchingRef = useRef(false)
   const wrapRef = useRef<HTMLDivElement>(null)
-  const [boxHeight, setBoxHeight] = useState(DEFAULT_BOX_HEIGHT)
   const [openRows, setOpenRows] = useState<Set<string>>(new Set())
 
   function buildQuery(pageIndex: number) {
@@ -61,14 +79,25 @@ export function AttentionPanel({
       page: pageIndex,
       page_size: CHUNK,
       min_prestige: minPrestige,
+      min_pay: minPay,
       unapplied_only: true,
       posted_within_days: postedWithinDays,
       q: globalFilters.q || undefined,
-      job_type: globalFilters.job_type,
+      job_type: jobType,
       site: globalFilters.site,
-      ats: globalFilters.ats,
-      eligible_only: globalFilters.eligible_only,
+      ats: globalFilters.ats.length ? globalFilters.ats.join(",") : undefined,
       above_pay_floor: globalFilters.above_pay_floor,
+      terminal_only: globalFilters.terminal_only,
+      likely_terminal_only: globalFilters.likely_terminal_only,
+      location: globalFilters.location,
+      term: globalFilters.term,
+      tier_only: globalFilters.tier_only,
+      // The point of the whole panel is not missing a good opening, and the
+      // bars above are exactly what used to hide the best ones -- Meta's
+      // prestige-10 internships average a fit of 3.4, and 128 of the 470
+      // eligible high-prestige internships state no salary at all. A
+      // big-tech posting clears every bar here by fiat.
+      include_tier: true,
     }
   }
 
@@ -104,7 +133,7 @@ export function AttentionPanel({
     setOpenRows(new Set())
     loadPage(id, 0, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort, minPrestige, postedWithinDays, globalFilters])
+  }, [sort, minPrestige, minPay, jobType, postedWithinDays, globalFilters])
 
   function maybeLoadMore() {
     if (fetchingRef.current) return
@@ -156,8 +185,11 @@ export function AttentionPanel({
     const onMove = (ev: MouseEvent) => {
       if (!dragState.current) return
       const dy = ev.clientY - dragState.current.startY
-      const next = Math.max(MIN_BOX_HEIGHT, Math.min(MAX_BOX_HEIGHT, dragState.current.startHeight + dy))
-      setBoxHeight(next)
+      const next = Math.max(
+        ATTENTION_MIN_BOX_HEIGHT,
+        Math.min(ATTENTION_MAX_BOX_HEIGHT, dragState.current.startHeight + dy),
+      )
+      onBoxHeightChange(next)
     }
     const onUp = () => {
       dragState.current = null
@@ -175,7 +207,12 @@ export function AttentionPanel({
       <div className="dayhead">
         <span className="dayname">{title}</span>
         <span className="daycount">
-          unapplied · prestige {minPrestige}+{postedWithinDays ? ` · last ${postedWithinDays}d` : ""} · {total} total
+          {jobType ? `${jobType} · ` : ""}unapplied · prestige {minPrestige}+ ·{" "}
+          {jobType === "new_grad"
+            ? `$${Math.round(minPay * 2080 / 1000)}k+`
+            : `$${minPay}/hr+`}
+          {postedWithinDays ? ` · last ${postedWithinDays}d` : ""} · big tech always ·{" "}
+          {total} total
           {loadingInitial ? " · loading…" : ""}
         </span>
       </div>
@@ -191,7 +228,10 @@ export function AttentionPanel({
                   checked={allLoadedSelected}
                   onChange={(e) =>
                     onToggleMany(
-                      tableRows.map((r) => r.original.url),
+                      tableRows.map((r) => ({
+                        url: r.original.url,
+                        job_type: r.original.job_type,
+                      })),
                       e.target.checked,
                     )
                   }

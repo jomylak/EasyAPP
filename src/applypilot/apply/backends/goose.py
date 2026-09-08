@@ -79,8 +79,9 @@ def _extension_args(cdp_port: int) -> list[str]:
     ]
 
 
-def _build_command(cdp_port: int, model: str, provider: str) -> list[str]:
+def _build_command(cdp_port: int, model: str, provider: str, settings: dict | None = None) -> list[str]:
     """Assemble the full ``goose run`` argv."""
+    settings = settings or {}
     return [
         "goose", "run",
         "--no-session",          # no session file; every job starts clean
@@ -90,9 +91,12 @@ def _build_command(cdp_port: int, model: str, provider: str) -> list[str]:
         "--model", model,
         "--output-format", "stream-json",
         # A cheap model that loses the thread will otherwise call the same tool
-        # forever. Observed healthy runs top out around 140 turns.
-        "--max-turns", str(config.DEFAULTS["goose_max_turns"]),
-        "--max-tool-repetitions", str(config.DEFAULTS["goose_max_tool_repetitions"]),
+        # forever. Observed healthy runs top out around 140 turns. Settings
+        # override lets this be tuned from the Settings tab without a code
+        # change; falls back to the measured-good default.
+        "--max-turns", str(settings.get("goose_max_turns") or config.DEFAULTS["goose_max_turns"]),
+        "--max-tool-repetitions",
+        str(settings.get("goose_max_tool_repetitions") or config.DEFAULTS["goose_max_tool_repetitions"]),
         *_extension_args(cdp_port),
     ]
 
@@ -164,7 +168,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         dry_run=dry_run,
     )
 
-    cmd = _build_command(port, goose_model, goose_provider)
+    cmd = _build_command(port, goose_model, goose_provider, settings)
 
     env = os.environ.copy()
     # Goose reads the key from the environment; ~/.applypilot/.env is already
@@ -183,6 +187,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                  # scoring has not filled it in yet -- `site` is the board
                  # ("Intern List - SWE"), never the company.
                  company=job.get("company") or job.get("site", ""),
+                 company_tier=job.get("company_tier"),
                  url=job.get("url", ""), score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
@@ -270,7 +275,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # loop alive well past the point of being useful, and --max-turns only
         # bounds turns, not time.
         def _watch_clock() -> None:
-            limit = config.DEFAULTS["goose_timeout"]
+            limit = settings.get("goose_timeout") or config.DEFAULTS["goose_timeout"]
             if done.wait(limit):
                 return  # run finished (or died) before the cap
             if proc.poll() is None:

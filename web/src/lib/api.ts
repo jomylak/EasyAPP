@@ -3,11 +3,14 @@ import type {
   AtsStat,
   CostEstimate,
   DayBucket,
+  EnvKeyName,
+  EnvKeyStatus,
   Facets,
   JobDetail,
   JobsPage,
   QueueResponse,
   RunState,
+  Settings,
   Stats,
 } from "./types"
 
@@ -46,10 +49,19 @@ export interface JobsQuery {
   site?: string | null
   ats?: string | null
   q?: string
-  eligible_only?: boolean
   above_pay_floor?: boolean
   unapplied_only?: boolean
+  terminal_only?: boolean
+  likely_terminal_only?: boolean
   posted_within_days?: number | null
+  // Narrow to big-tech postings.
+  tier_only?: boolean
+  // Exempt big-tech postings from the min_* bars instead of narrowing to
+  // them -- how a prestige-10 posting with a fit of 3 still shows up in a
+  // filtered view.
+  include_tier?: boolean
+  location?: string | null
+  term?: string | null
 }
 
 export const api = {
@@ -100,4 +112,14 @@ export const api = {
   stopAll: () => request<{ stopped: boolean; released: number }>("/api/stop-all", { method: "POST" }),
 
   atsStats: () => request<{ rows: AtsStat[] }>("/api/ats-stats"),
+
+  settings: () => request<Settings>("/api/settings"),
+
+  updateSettings: (patch: Partial<Settings>) =>
+    request<Settings>("/api/settings", { method: "POST", body: JSON.stringify(patch) }),
+
+  envKeys: () => request<EnvKeyStatus>("/api/env-keys"),
+
+  setEnvKeys: (values: Partial<Record<EnvKeyName, string>>) =>
+    request<{ updated: string[] }>("/api/env-keys", { method: "POST", body: JSON.stringify(values) }),
 }

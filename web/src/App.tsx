@@ -12,47 +12,86 @@ export default function App() {
   // A Set of urls held above the day tables, so it survives across days and
   // tab switches and drives the sticky launch bar.
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  // url -> job_type for everything currently ticked, so the 60/40 split
+  // counter can be read straight off the selection without a round-trip per
+  // checkbox. Kept beside `selected` rather than replacing it because every
+  // consumer only ever asks "is this url ticked".
+  const [selectedTypes, setSelectedTypes] = useState<Map<string, string | null>>(new Map())
   const [launching, setLaunching] = useState(false)
   const [launchNote, setLaunchNote] = useState<string | null>(null)
+  const [launchError, setLaunchError] = useState(false)
+  const [dryRun, setDryRun] = useState(false)
 
-  function toggleSelect(url: string) {
+  function toggleSelect(url: string, jobType: string | null) {
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(url)) next.delete(url)
       else next.add(url)
       return next
     })
+    setSelectedTypes((prev) => {
+      const next = new Map(prev)
+      if (next.has(url)) next.delete(url)
+      else next.set(url, jobType)
+      return next
+    })
   }
 
-  function toggleMany(urls: string[], checked: boolean) {
+  function toggleMany(rows: { url: string; job_type: string | null }[], checked: boolean) {
     setSelected((prev) => {
       const next = new Set(prev)
-      for (const u of urls) {
-        if (checked) next.add(u)
-        else next.delete(u)
+      for (const r of rows) {
+        if (checked) next.add(r.url)
+        else next.delete(r.url)
+      }
+      return next
+    })
+    setSelectedTypes((prev) => {
+      const next = new Map(prev)
+      for (const r of rows) {
+        if (checked) next.set(r.url, r.job_type)
+        else next.delete(r.url)
       }
       return next
     })
   }
 
   async function handleLaunch() {
-    // /api/launch spends real money and submits real applications -- it is
-    // wired here only as far as /api/queue (which just marks rows 'queued'
-    // and prices them). Nothing calls /api/launch from this UI.
+    // Two real HTTP calls, deliberately kept as two steps: /api/queue marks
+    // the selection 'queued' and prices it (harmless, reversible), then
+    // /api/launch actually spawns `applypilot apply --queued <batch>` as a
+    // background subprocess -- the one call in this app that submits real
+    // forms and spends real money when dry_run is off.
     setLaunching(true)
     setLaunchNote(null)
+    setLaunchError(false)
     try {
-      const res = await api.queue(Array.from(selected))
+      const queued = await api.queue(Array.from(selected))
+      if (queued.queued === 0) {
+        setLaunchNote(
+          `Nothing to launch -- all ${queued.skipped} selected job(s) were already applied, ` +
+            `in flight, or otherwise unqueueable.`,
+        )
+        setSelected(new Set())
+        setSelectedTypes(new Map())
+        return
+      }
+
+      const launch = await api.launch(queued.batch, { workers: 1, dry_run: dryRun })
       setLaunchNote(
-        `Queued ${res.queued} job(s) as batch ${res.batch} ` +
-          `(est. $${res.estimate.expected.toFixed(2)}` +
-          `${res.estimate.n_samples === 0 ? ", default" : ""}). ` +
-          `Run \`applypilot apply --queued ${res.batch}\` to actually apply -- ` +
-          `this UI does not call /api/launch.`,
+        `${dryRun ? "[DRY RUN] " : ""}Launched batch ${queued.batch}: ${launch.jobs} job(s), ` +
+          `pid ${launch.pid} (est. $${queued.estimate.expected.toFixed(2)}` +
+          `${queued.estimate.n_samples === 0 ? ", default" : ""}). Watch it on the Dashboard tab.`,
       )
       setSelected(new Set())
+      setSelectedTypes(new Map())
+      setTab("dashboard")
     } catch (e) {
-      setLaunchNote(`Failed to queue: ${String(e)}`)
+      setLaunchError(true)
+      setLaunchNote(
+        `Failed to launch: ${String(e)}. Anything already queued is still queued -- ` +
+          `retry from here, or run \`applypilot apply --queued <batch>\` yourself.`,
+      )
     } finally {
       setLaunching(false)
     }
@@ -79,7 +118,13 @@ export default function App() {
             Settings
           </button>
         </div>
-        <LaunchBar selected={selected} onLaunch={handleLaunch} launching={launching} />
+        <LaunchBar
+          selected={selected}
+          onLaunch={handleLaunch}
+          launching={launching}
+          dryRun={dryRun}
+          onDryRunChange={setDryRun}
+        />
       </div>
 
       {launchNote && (
@@ -87,7 +132,7 @@ export default function App() {
           style={{
             padding: "6px 16px",
             fontSize: 12,
-            color: "var(--a-text-2)",
+            color: launchError ? "var(--a-bad)" : "var(--a-text-2)",
             background: "var(--a-sel-bg)",
             borderBottom: "1px solid var(--a-line)",
           }}
@@ -97,7 +142,12 @@ export default function App() {
       )}
 
       {tab === "browse" && (
-        <BrowseTab selected={selected} onToggleSelect={toggleSelect} onToggleMany={toggleMany} />
+        <BrowseTab
+          selected={selected}
+          selectedTypes={selectedTypes}
+          onToggleSelect={toggleSelect}
+          onToggleMany={toggleMany}
+        />
       )}
       {tab === "dashboard" && <DashboardTab />}
       {tab === "settings" && <SettingsTab />}

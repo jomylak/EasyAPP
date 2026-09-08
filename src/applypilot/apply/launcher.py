@@ -14,7 +14,6 @@ import atexit
 import json
 import logging
 import platform
-import re
 import signal
 import sys
 import threading
@@ -73,6 +72,38 @@ _JOB_COLUMNS = """url, title, site, company, application_url,
 # set aside before giving up. Bounded so a selection made entirely of unusable
 # rows ends the worker instead of spinning against the database.
 _MAX_DEFERRALS = 50
+
+
+def _daily_cap_reason(conn, settings: dict) -> str | None:
+    """Whether today's spend or application count has hit a configured cap.
+
+    Both caps are soft stops, checked once per acquire_job call rather than
+    enforced mid-run: a job already `in_progress` finishes normally (killing
+    it mid-application would waste the money already spent getting it that
+    far), and this just stops the next claim from being made. `None` (the
+    default) on either setting means no cap.
+
+    Spend and count are read from the `jobs` table itself, not a separate
+    counter -- `apply_cost_usd` and `apply_status` are already the durable
+    record `mark_result` writes, so "today's totals" is just today's slice of
+    that, with no new bookkeeping to keep in sync.
+    """
+    max_spend = settings.get("max_daily_spend_usd")
+    max_count = settings.get("max_daily_applications")
+    if max_spend is None and max_count is None:
+        return None
+    row = conn.execute("""
+        SELECT COALESCE(SUM(apply_cost_usd), 0) AS spend,
+               SUM(apply_status IN ('applied', 'failed')) AS attempts
+        FROM jobs
+        WHERE date(COALESCE(last_attempted_at, applied_at)) = date('now')
+    """).fetchone()
+    spend, attempts = row["spend"] or 0.0, row["attempts"] or 0
+    if max_spend is not None and spend >= max_spend:
+        return f"daily spend cap reached (${spend:.2f} >= ${max_spend:.2f})"
+    if max_count is not None and attempts >= max_count:
+        return f"daily application cap reached ({attempts} >= {max_count})"
+    return None
 
 
 def _like_to_substring(pattern: str) -> str:
@@ -175,36 +206,42 @@ def _select_ranked(conn, min_score: int, skip: set,
           {seen_clause}
           {site_clause}
           {url_clauses}
-        -- Terminal internships -- ones that don't require returning
-        -- to school, functionally a new-grad bridge role -- are rare
-        -- (a few dozen out of thousands) and have already cleared
-        -- every gate above (pay floor, eligibility) by the time we
-        -- get here, so there's no reason to hold one back waiting
-        -- for something hypothetically better: sort on the flag
-        -- FIRST, ahead of the score blend entirely, so one always
-        -- wins when it exists.
+        -- Terminal internships (don't require returning to school) and
+        -- remote-spring internships (term ends before graduation, so the
+        -- question never comes up) are two different routes to the same
+        -- guarantee: a role the candidate can honestly take right now, no
+        -- caveats. Both are rare and have already cleared every gate above
+        -- (pay floor, eligibility) by the time we get here, so there's no
+        -- reason to hold one back waiting for something hypothetically
+        -- better: sort on EITHER flag FIRST, ahead of the score blend
+        -- entirely. OR, not added -- a role that happens to satisfy both
+        -- is still just one top-priority row, not a double boost.
         --
-        -- Below that: rank on a weighted blend of skill match and
-        -- desirability, then decay by age, then a small blanket edge
-        -- for new_grad roles generally -- internships consistently
-        -- outnumber new_grad roles in the high-score tiers here (see
-        -- `applypilot status`), so a plain highest-score-wins order
-        -- would apply to a lot more internships than new-grad roles
-        -- by volume alone, not because they're actually better
-        -- matches. Jobs scored before desirability existed fall back
-        -- to their fit_score so they still order sanely.
+        -- Below that: big-tech postings, then desirability (which now
+        -- carries pay, prestige and location as three genuinely separate
+        -- weighted terms), decayed by age. Skill fit is a pure tiebreaker
+        -- and nothing more: it used to be the dominant term at weight 0.7
+        -- and it buried exactly the postings worth applying to -- Meta
+        -- internships average a fit of 3.4 and Anthropic new-grad a 2.0,
+        -- both at prestige 10, and not one had ever been applied to.
+        --
+        -- The old blanket +0.5 nudge for new_grad rows is gone: the
+        -- internship/new-grad balance is a selection decision now, made in
+        -- the browse UI's two ranked lanes against a running 60/40 counter,
+        -- not something for this ORDER BY to guess at.
         ORDER BY
-          (CASE WHEN is_terminal_internship = 'yes' THEN 1 ELSE 0 END) DESC,
-          (fit_score * ? + COALESCE(desirability_score, fit_score) * ?)
-          - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ?
-          + (CASE WHEN job_type = 'new_grad' THEN 0.5 ELSE 0 END) DESC,
+          (CASE WHEN is_terminal_internship = 'yes'
+                  OR is_remote_spring_internship = 'yes' THEN 1 ELSE 0 END) DESC,
+          (CASE company_tier WHEN 'tier1' THEN 2
+                             WHEN 'adjacent' THEN 1 ELSE 0 END) DESC,
+          COALESCE(desirability_score, fit_score)
+          - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ? DESC,
+          fit_score DESC,
           COALESCE(posted_date, discovered_at) DESC,
           url
         LIMIT 1
-    """, [config.DEFAULTS["max_apply_attempts"]] + params
-         + [_settings.get("fit_weight", 0.5),
-            _settings.get("desirability_weight", 0.5),
-            config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
+    """, [_settings.get("max_apply_attempts") or config.DEFAULTS["max_apply_attempts"]] + params
+         + [config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
 
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
@@ -233,6 +270,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     """
     conn = get_connection()
     blocked_sites, blocked_patterns = _load_blocked()
+
+    cap_reason = _daily_cap_reason(conn, config.load_settings())
+    if cap_reason:
+        logger.warning("Stopping acquisition: %s", cap_reason)
+        return None
 
     # Rows this call has set aside after recording a terminal outcome for them.
     # They are excluded from the next iteration's SELECT so the loop advances
@@ -311,87 +353,119 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     return None
 
 
-def _flip_grad_year(variant: str) -> str | None:
-    """Return the same resume track with the other graduation year.
-
-    The failure this serves is specifically a grad_date_mismatch, so the year
-    is the only axis that should move -- the track was chosen from the job's
-    own title and keywords and is still correct. Back when there were exactly
-    two variants, "the other one" happened to mean this; with six it does not,
-    and picking an arbitrary other variant could answer a returning-student
-    posting with a May-2027 resume, which is the mismatch this is meant to fix.
-    """
-    # Rows tailored before tracks existed carry the old two-variant names.
-    # Map them onto the current scheme so they keep swapping as they used to
-    # instead of silently becoming un-swappable.
-    legacy = {"default": "swe_2027", "returning_2028": "swe_2028"}
-    variant = legacy.get(variant, variant)
-
-    if "_" not in variant:
-        return None
-    track, _, year = variant.rpartition("_")
-    other = {"2027": "2028", "2028": "2027"}.get(year)
-    return f"{track}_{other}" if other else None
+# Above this many sibling internships, one company is running more than one
+# program and a single form mismatch stops being evidence about the rest.
+_SIBLING_SWEEP_MAX = 8
 
 
-def swap_resume_variant_for_retry(job_url: str, title: str, site: str) -> None:
-    """After a grad_date_mismatch failure, switch to the same resume track
-    with the other graduation year so the next retry (this failure isn't in
-    PERMANENT_FAILURES, so a retry is already permitted) uses a resume that
-    actually matches what the form required, instead of repeating the exact
-    same mismatch up to max_apply_attempts times.
+def _clear_terminal_flags_on_grad_date_mismatch(job_url: str) -> None:
+    """A grad_date_mismatch means the form itself required a graduation
+    timing the candidate's one true resume doesn't satisfy -- i.e. the job
+    turned out not to be a "terminal" internship after all, even if it was
+    flagged as one (confirmed or likely). Clear both flags so it stops
+    getting queue-jump priority its own apply attempt just proved wrong.
 
-    Best-effort and silent on failure -- a job that can't be swapped just
-    retries with its current resume, no worse off than before this existed.
+    grad_date_mismatch is a PERMANENT_FAILURES reason (see outcomes.py), so
+    this job won't be retried -- there's no second resume to swap to any
+    more, only the true graduation date. It also corrects other
+    not-yet-applied internships at the SAME company: near-identical postings
+    (e.g. Verkada's Backend/Frontend/Embedded/Mobile/Security internships)
+    routinely share the exact same graduation-date form field, so a
+    confirmed mismatch on one is real evidence about all of them, not just
+    the one that happened to be tried first. Without this, the pipeline
+    would spend a separate wasted apply attempt discovering the identical
+    wall on each sibling in turn.
+
+    That inference only holds for a company posting one program through one
+    form. It breaks badly at scale: Amazon has 29 distinct internships here
+    and Google, Meta and NVIDIA each run several unrelated programs with
+    their own eligibility rules, so one mismatch is not evidence about the
+    rest -- and killing them outright is the exact opposite of the standing
+    requirement that every big-tech posting gets applied to. So a large or
+    tier-listed employer is exempted: its siblings are marked 'unclear'
+    (still visible, still applyable, flagged for a human look) rather than
+    'no', and their terminal flags are left alone. The originating job's own
+    flags are cleared either way -- that one really did hit the wall.
+
+    Scoped to rows the acquire_job() gate would otherwise still offer
+    (apply_status IS NULL or 'failed', i.e. not 'applied' or 'in_progress')
+    -- there's no reason to touch a job already submitted or mid-attempt.
     """
     try:
         conn = get_connection()
-        row = conn.execute(
-            "SELECT resume_variant FROM jobs WHERE url = ?", (job_url,)
-        ).fetchone()
-        settings = config.load_settings()
-        current_variant = (row["resume_variant"] if row else None) or \
-            settings.get("default_resume_variant", "default")
-
-        variants = settings.get("resume_variants", {})
-        new_variant = _flip_grad_year(current_variant)
-        if not new_variant or new_variant not in variants:
-            logger.warning("No opposite-grad-year variant for %r; not swapping.",
-                           current_variant)
-            return
-
-        txt_path, pdf_path, _grad_date, _start_date = config.get_resume_variant_paths(new_variant)
-        if not txt_path.exists() or not pdf_path.exists():
-            logger.warning("Can't swap to resume variant '%s': files missing", new_variant)
-            return
-
-        safe_title = re.sub(r"[^\w\s-]", "", title or "")[:50].strip().replace(" ", "_")
-        safe_site = re.sub(r"[^\w\s-]", "", site or "")[:20].strip().replace(" ", "_")
-        prefix = f"{safe_site}_{safe_title}"
-        dest_txt = config.TAILORED_DIR / f"{prefix}.txt"
-        dest_pdf = config.TAILORED_DIR / f"{prefix}.pdf"
-        dest_txt.write_bytes(txt_path.read_bytes())
-        dest_pdf.write_bytes(pdf_path.read_bytes())
-
-        # A grad_date_mismatch is only ever discovered here because the form
-        # itself required a graduation window scoring judged this candidate
-        # already satisfied without returning to school -- i.e. the job
-        # turned out not to be a "terminal" internship after all, even if it
-        # was flagged as one. Clear the flag so it drops back to being
-        # ranked on plain fit+desirability like any other internship,
-        # instead of keeping a guaranteed-top-priority sort that its own
-        # apply attempt just proved wrong.
         conn.execute(
-            "UPDATE jobs SET resume_variant = ?, tailored_resume_path = ?, "
-            "is_terminal_internship = 'no' WHERE url = ?",
-            (new_variant, str(dest_txt), job_url),
+            "UPDATE jobs SET is_terminal_internship = 'no', "
+            "is_terminal_internship_likely = 'no' WHERE url = ?",
+            (job_url,),
         )
+        row = conn.execute(
+            "SELECT company, company_tier FROM jobs WHERE url = ?", (job_url,)
+        ).fetchone()
+        company = row["company"] if row else None
+        if company:
+            sibling_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE company = ? "
+                "AND job_type = 'internship' AND url != ?",
+                (company, job_url),
+            ).fetchone()["n"]
+            is_tiered = bool(
+                row["company_tier"] if "company_tier" in row.keys() else None
+            )
+            broad_employer = is_tiered or sibling_count > _SIBLING_SWEEP_MAX
+
+            note = (
+                "Sibling posting at this company confirmed a graduation-date "
+                "form mismatch (grad_date_mismatch)."
+                if broad_employer else
+                "Sibling posting at this company confirmed a graduation-date "
+                "form mismatch (grad_date_mismatch) -- treating this posting "
+                "as requiring the same continued enrollment."
+            )
+            if broad_employer:
+                # Flag for review, don't disqualify. Only ever softens a row
+                # that is currently 'yes' -- an existing 'no' from the
+                # scorer's own eligibility read is a real, separately
+                # established disqualifier and must not be undone here.
+                conn.execute(
+                    """
+                    UPDATE jobs SET
+                        eligible = 'unclear',
+                        eligibility_reason = CASE
+                            WHEN eligibility_reason IS NULL OR eligibility_reason = ''
+                            THEN ?
+                            ELSE eligibility_reason || ' ' || ?
+                        END
+                    WHERE company = ?
+                      AND job_type = 'internship'
+                      AND url != ?
+                      AND eligible = 'yes'
+                      AND (apply_status IS NULL OR apply_status = 'failed')
+                    """,
+                    (note, note, company, job_url),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs SET
+                        is_terminal_internship = 'no',
+                        is_terminal_internship_likely = 'no',
+                        requires_returning_student = 'yes',
+                        eligible = 'no',
+                        eligibility_reason = CASE
+                            WHEN eligibility_reason IS NULL OR eligibility_reason = ''
+                            THEN ?
+                            ELSE eligibility_reason || ' ' || ?
+                        END
+                    WHERE company = ?
+                      AND job_type = 'internship'
+                      AND url != ?
+                      AND (apply_status IS NULL OR apply_status = 'failed')
+                    """,
+                    (note, note, company, job_url),
+                )
         conn.commit()
-        logger.info("grad_date_mismatch: swapped resume variant %s -> %s for %s "
-                     "(cleared is_terminal_internship if it was set)",
-                     current_variant, new_variant, title)
     except Exception as e:
-        logger.warning("Could not swap resume variant after grad_date_mismatch: %s", e)
+        logger.warning("Could not clear terminal flags after grad_date_mismatch: %s", e)
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -650,7 +724,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             break
 
         update_state(worker_id, status="idle", job_title="", company="",
-                     last_action="waiting for job", actions=0)
+                     company_tier=None, last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
                           worker_id=worker_id, exclude_urls=attempted,
@@ -746,7 +820,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                             duration_ms=duration_ms, backend=used_backend,
                             llm_requests=llm_requests, stats=run_stats)
                 if reason == "grad_date_mismatch":
-                    swap_resume_variant_for_retry(job["url"], job["title"], job.get("site", ""))
+                    _clear_terminal_flags_on_grad_date_mismatch(job["url"])
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

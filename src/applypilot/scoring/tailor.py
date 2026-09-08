@@ -16,11 +16,11 @@ import time
 from datetime import datetime, timezone
 
 from applypilot.config import (
-    RESUME_PATH, TAILORED_DIR, load_profile, load_settings, get_resume_variant_paths,
+    RESUME_PATH, TAILORED_DIR, load_profile, load_settings,
+    get_resume_paths, get_grad_and_start_dates,
 )
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
-from applypilot.scoring.router import route_resume_track
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     sanitize_text,
@@ -459,46 +459,21 @@ def tailor_resume(
 
 # ── Passthrough mode (tailoring disabled) ─────────────────────────────────
 
-def _pick_resume_variant(job: dict, settings: dict) -> str:
-    """Pick which base resume variant to use for a job, no LLM involved.
-
-    Two independent axes, composed into a "{track}_{gradyear}" settings key:
-
-    - **track** -- swe / aiml / data, from scoring.router.route_resume_track.
-      Deterministic regex over the title, then the scorer's `keywords`, then
-      the description. Picking between three static files does not warrant an
-      LLM call, and a regex is auditable after the fact: you can read a title
-      and predict which resume it got.
-    - **grad year** -- 2028 when the scorer flagged the posting as requiring a
-      returning student, else 2027.
-
-    get_resume_variant_paths falls back along a year-preserving chain when a
-    variant's files aren't on disk yet, so this keeps working before all six
-    PDFs have been exported.
-    """
-    track = route_resume_track(job)
-    year = "2028" if job.get("requires_returning_student") == "yes" else "2027"
-    variant = f"{track}_{year}"
-    if variant not in settings.get("resume_variants", {}):
-        return settings.get("default_resume_variant", "swe_2027")
-    return variant
-
-
 def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
     """Skip LLM tailoring entirely -- attach the base resume as-is per job.
 
-    This is the intended production path, not a stopgap: the resumes are
+    This is the intended production path, not a stopgap: the resume is
     hand-authored LaTeX compiled on Overleaf, so there is nothing to generate
-    at run time. `tailoring_enabled` stays False on purpose. Tailoring happens
-    by *selection* -- _pick_resume_variant routes each job to one of six
-    prebuilt variants (three tracks x two grad years) with no LLM call, which
-    is what keeps this stage free across thousands of jobs and makes resume
+    at run time. `tailoring_enabled` stays False on purpose. There is exactly
+    one resume, printed with exactly one graduation date -- the multi-variant
+    router (three tracks x two grad years) was scrapped along with the second
+    "returning student" identity it existed to serve. Attaching a fixed file
+    keeps this stage free across thousands of jobs and makes resume
     formatting, one-page overflow, and fabrication structurally impossible.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
-    settings = load_settings()
     conn = get_connection()
     jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
 
@@ -516,8 +491,8 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
     needs_review = 0
 
     for job in jobs:
-        variant = _pick_resume_variant(job, settings)
-        txt_path, pdf_path, grad_date, _start_date = get_resume_variant_paths(variant)
+        txt_path, pdf_path = get_resume_paths()
+        grad_date, _start_date = get_grad_and_start_dates()
 
         safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
         safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
@@ -525,8 +500,8 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
 
         if not txt_path.exists() or not pdf_path.exists():
             log.warning(
-                "Resume variant '%s' not found (%s / %s) -- flagging for review: %s",
-                variant, txt_path, pdf_path, job["title"][:50],
+                "Resume not found (%s / %s) -- flagging for review: %s",
+                txt_path, pdf_path, job["title"][:50],
             )
             conn.execute(
                 "UPDATE jobs SET review_status = 'needs_review', "
@@ -550,17 +525,17 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
         )
         report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
         report_path.write_text(json.dumps({
-            "status": "passthrough", "resume_variant": variant, "grad_date": grad_date,
+            "status": "passthrough", "grad_date": grad_date,
         }, indent=2), encoding="utf-8")
 
         conn.execute(
             "UPDATE jobs SET tailored_resume_path = ?, tailored_at = ?, "
-            "tailor_attempts = COALESCE(tailor_attempts, 0) + 1, resume_variant = ? "
+            "tailor_attempts = COALESCE(tailor_attempts, 0) + 1 "
             "WHERE url = ?",
-            (str(dest_txt), now, variant, job["url"]),
+            (str(dest_txt), now, job["url"]),
         )
         approved += 1
-        log.info("[PASSTHROUGH] variant=%s -- %s", variant, job["title"][:50])
+        log.info("[PASSTHROUGH] %s", job["title"][:50])
 
     conn.commit()
     elapsed = time.time() - t0
