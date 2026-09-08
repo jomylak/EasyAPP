@@ -1440,7 +1440,8 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
 
 
 def run_scoring(limit: int = 0, rescore: bool = False,
-                stale_only: bool = False) -> dict:
+                stale_only: bool = False, stale_min_fit: int | None = None,
+                stale_min_prestige: int | None = None) -> dict:
     """Score unscored jobs that have full descriptions.
 
     Args:
@@ -1455,6 +1456,15 @@ def run_scoring(limit: int = 0, rescore: bool = False,
             Spring/Summer gate falls back to reading the title and the
             terminal-internship path (the one that makes a Summer role
             reachable at all after graduating) never fires.
+        stale_min_fit: With stale_only, skip rows whose prior fit_score is
+            below this bar -- a low-fit row isn't worth spending an LLM call
+            on just to pick up the newer TERM/TERMINAL_EVIDENCE fields. A row
+            with no prior fit_score at all (never successfully scored) is
+            never skipped regardless of this bar.
+        stale_min_prestige: With stale_only, also keep rows whose
+            company_prestige clears this bar even if fit_score doesn't --
+            a prestigious company is worth the rescore on its own, same as
+            company_tier being exempted from the fit floor elsewhere.
 
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
@@ -1465,6 +1475,13 @@ def run_scoring(limit: int = 0, rescore: bool = False,
     if stale_only:
         query = ("SELECT * FROM jobs WHERE full_description IS NOT NULL "
                  "AND scored_at IS NOT NULL AND (term IS NULL OR term = '')")
+        if stale_min_fit is not None or stale_min_prestige is not None:
+            conds = ["fit_score IS NULL"]
+            if stale_min_fit is not None:
+                conds.append(f"fit_score >= {stale_min_fit}")
+            if stale_min_prestige is not None:
+                conds.append(f"company_prestige > {stale_min_prestige}")
+            query += f" AND ({' OR '.join(conds)})"
         if limit > 0:
             query += f" LIMIT {limit}"
         jobs = conn.execute(query).fetchall()

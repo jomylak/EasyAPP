@@ -454,10 +454,10 @@ DEFAULT_SETTINGS: dict = {
     "remote_spring_min_fit": 5,
     "remote_spring_min_prestige": 5,
 
-    # The candidate has exactly one resume printed with exactly one
-    # graduation date. There is deliberately no second "returning student"
-    # identity to fall back on -- that idea was scrapped, so a posting that
-    # demands a later graduation date is simply not applicable.
+    # The candidate has exactly one graduation date printed on every resume.
+    # There is deliberately no second "returning student" identity to fall
+    # back on -- that idea was scrapped, so a posting that demands a later
+    # graduation date is simply not applicable.
     #
     # start_date is configured separately rather than computed from
     # graduation_date: the gap between graduating and being available to
@@ -465,6 +465,22 @@ DEFAULT_SETTINGS: dict = {
     # some terms.
     "graduation_date": "May 2027",
     "earliest_start_date": "August 2027",
+
+    # Which resume file to attach, by scoring.router.route_resume_track's
+    # output (swe | aiml | data) -- three hand-authored LaTeX resumes, one
+    # grad date shared by all of them (see graduation_date above; the
+    # grad-year axis of the old resume_variants system is gone, only the
+    # track axis survived). get_resume_paths falls back to "default" when a
+    # track's files aren't on disk yet, so this keeps working before all
+    # three PDFs are exported from Overleaf.
+    "default_resume_track": "swe",
+    "resume_tracks": {
+        "swe": {"pdf": "resume_swe.pdf", "txt": "resume_swe.txt"},
+        "aiml": {"pdf": "resume_aiml.pdf", "txt": "resume_aiml.txt"},
+        "data": {"pdf": "resume_data.pdf", "txt": "resume_data.txt"},
+        # Legacy, pre-track. Fallback target only -- never routed to.
+        "default": {"pdf": "resume.pdf", "txt": "resume.txt"},
+    },
 }
 
 
@@ -525,7 +541,9 @@ def load_settings() -> dict:
         return json.loads(json.dumps(DEFAULT_SETTINGS))
 
     merged = json.loads(json.dumps(DEFAULT_SETTINGS))
-    merged.update(user_settings)
+    merged.update({k: v for k, v in user_settings.items() if k != "resume_tracks"})
+    if "resume_tracks" in user_settings:
+        merged["resume_tracks"].update(user_settings["resume_tracks"])
     return merged
 
 
@@ -536,8 +554,25 @@ def save_settings(settings: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
-def get_resume_paths() -> tuple[Path, Path]:
-    """Resolve (txt_path, pdf_path) for the one and only resume."""
+def get_resume_paths(track: str | None = None) -> tuple[Path, Path]:
+    """Resolve (txt_path, pdf_path) for a resume track (swe | aiml | data).
+
+    No track (or an unrecognized one) resolves to the plain resume.txt /
+    resume.pdf. A recognized track whose files aren't on disk yet falls back
+    to the same plain resume rather than erroring, so the pipeline keeps
+    running before all three PDFs are exported from Overleaf.
+    """
+    if not track:
+        return RESUME_PATH, RESUME_PDF_PATH
+    settings = load_settings()
+    tracks = settings.get("resume_tracks", {})
+    cfg = tracks.get(track)
+    if not cfg:
+        return RESUME_PATH, RESUME_PDF_PATH
+    txt_path, pdf_path = APP_DIR / cfg["txt"], APP_DIR / cfg["pdf"]
+    if txt_path.exists() and pdf_path.exists():
+        return txt_path, pdf_path
+    log.warning("Resume track %r has no files on disk; using the plain resume instead.", track)
     return RESUME_PATH, RESUME_PDF_PATH
 
 

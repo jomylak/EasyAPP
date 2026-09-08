@@ -19,12 +19,15 @@ Two design rules do the real work here:
 """
 
 import re
+from pathlib import Path
+
+from applypilot import config
 
 # Track names. These used to compose with a grad year into a resume_variants
-# key ("aiml" + "2027"); that whole variant system is gone -- there is one
-# resume and one graduation date now. The routing itself is kept because the
-# track it reports is still a useful label on a posting, shown in the browse
-# tab's expanded row.
+# key ("aiml" + "2027"); only the grad-year axis is gone -- there is one
+# graduation date now, shared by all three tracks. The track itself still
+# picks which of the three resumes gets attached (config.get_resume_paths),
+# and is shown as a label on a posting in the browse tab's expanded row.
 SWE = "swe"
 AIML = "aiml"
 DATA = "data"
@@ -163,3 +166,24 @@ def explain_route(job: dict) -> dict:
         if matches:
             return {"track": matches[0], "matched_on": field, "candidates": matches}
     return {"track": FALLBACK, "matched_on": "fallback", "candidates": []}
+
+
+def resume_paths_for_job(job: dict) -> tuple[Path, Path]:
+    """(txt_path, pdf_path) to apply with -- the one thing an apply backend
+    actually needs, whether or not `run tailor` ever touched this job.
+
+    "Tailoring" here is bookkeeping (which file got attached, timestamped,
+    for audit), not a prerequisite: the routing decision is deterministic and
+    free, so there is no reason a job selected straight out of scoring can't
+    be applied to. Prefers a completed tailor pass's files when they're both
+    on disk (so a job that WAS explicitly routed to something other than its
+    live-computed track -- e.g. hand-corrected -- keeps that choice); falls
+    back to routing the job live otherwise.
+    """
+    tailored = job.get("tailored_resume_path")
+    if tailored:
+        txt_path = Path(tailored)
+        pdf_path = txt_path.with_suffix(".pdf")
+        if txt_path.exists() and pdf_path.exists():
+            return txt_path, pdf_path
+    return config.get_resume_paths(route_resume_track(job))

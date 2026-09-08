@@ -13,6 +13,7 @@ from pathlib import Path
 
 from applypilot import config
 from applypilot.ats import detect_ats
+from applypilot.scoring.router import resume_paths_for_job
 
 logger = logging.getLogger(__name__)
 
@@ -607,11 +608,12 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
     personal = profile["personal"]
 
     # --- Resolve resume PDF path ---
-    resume_path = job.get("tailored_resume_path")
-    if not resume_path:
-        raise ValueError(f"No tailored resume for job: {job.get('title', 'unknown')}")
-
-    src_pdf = Path(resume_path).with_suffix(".pdf").resolve()
+    # No hard requirement that `run tailor` has touched this job first --
+    # resume_paths_for_job routes it live off the same title/keywords/
+    # description already sitting on the row when there's no tailor pass to
+    # prefer.
+    _txt_path, src_pdf = resume_paths_for_job(job)
+    src_pdf = src_pdf.resolve()
     if not src_pdf.exists():
         raise ValueError(f"Resume PDF not found: {src_pdf}")
 

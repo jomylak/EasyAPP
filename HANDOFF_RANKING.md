@@ -37,7 +37,7 @@ trivially fine** — he's still enrolled through May.
 | Pay bug | `compute_desirability` now weights pay, prestige, location as three independent components, per lane (`new_grad_weights` / `internship_weights`). Previously pay was folded into location and **discarded entirely** for NYC postings. |
 | Pay curves | `_pay_tier_score(salary, is_internship)` — continuous piecewise-linear, separate annual/hourly anchors. Unstated pay = neutral **5.0, never 0**. |
 | Big-tech pin | New `company_tier` column (`tier1`/`adjacent`/NULL) from `config.TIER1_COMPANIES`/`TIER1_ADJACENT` + auto `prestige >= 9`. New `top` sort (now `DEFAULT_SORT`): tier → desirability → fit. `include_tier=true` exempts tiered rows from every `min_*` bar. |
-| Resume variants | Ripped out entirely. One resume, one grad date (`graduation_date` / `earliest_start_date` in settings). |
+| Resume variants | Grad-year axis ripped out (one grad date for everyone: `graduation_date` / `earliest_start_date` in settings). Track axis (swe/aiml/data) restored per Jakub's request -- `config.get_resume_paths(track)` + `resume_tracks` in settings, `resume_variant` DB column written again with the track name. |
 | Sibling nuke | `_clear_terminal_flags_on_grad_date_mismatch` no longer disqualifies all siblings at a tier-listed or large (>8 postings) employer — marks them `unclear` instead. |
 | Frontend | Gold chromatic sweep on big-tech names, live 60/40 `SplitCounter`, per-lane pay floors on the Priority panels, Big-tech/location/term filters, Big Tech preset chip, Settings → Ranking section. |
 | CLI | `applypilot rescore-stale`, `applypilot recompute`. |
@@ -144,8 +144,9 @@ is the existing home for this.
   Worth a tier row.
 - **`profile.json` contains a plaintext `personal.password`.** Pre-existing,
   not touched, but Jakub should know.
-- The `resume_variant` DB column is dead but retained (no migration). Never
-  written any more.
+- The `resume_variant` DB column is alive again, storing the swe/aiml/data
+  track name (see "Resume variants" above) -- no longer dead, no migration
+  needed since the column already existed.
 - `enriched_only.db` (28 MB) sits at the repo root and is not gitignored.
 
 ---

@@ -117,6 +117,15 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        # GLM burns hidden chain-of-thought tokens before its visible answer
+        # (a worst-case call measured 4027 reasoning tokens alone -- see
+        # scoring/scorer.py:score_job) even for short structured-extraction
+        # prompts that don't need it. Model-scoped, not call-site-scoped: this
+        # only ever matches the GLM model configured for scoring/enrichment,
+        # never Gemini/OpenAI, and never reaches the apply backends at all --
+        # Claude Code and Goose run as separate CLI subprocesses that don't
+        # go through this client.
+        self._suppress_reasoning: bool = "glm" in model.lower()
         # Proactive pacing (Gemini free tier = 15 RPM = one call per 4s).
         # Shared across threads since discovery/apply can run with --workers > 1
         # and all of them share this one client instance.
@@ -231,6 +240,8 @@ class LLMClient:
         # this codebase asks for (JSON, SCORE:/KEYWORDS: lines, etc).
         if self._is_gemini:
             payload["reasoning_effort"] = "minimal"
+        elif self._suppress_reasoning:
+            payload["reasoning"] = {"effort": "none"}
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
