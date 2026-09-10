@@ -20,7 +20,7 @@ const STATUS_PILLS: { id: string | null; label: string }[] = [
   { id: "manual", label: "Manual" },
 ]
 
-type SortKey = "when" | "applied_at" | "cost" | "status" | "backend" | "company"
+type SortKey = "when" | "applied_at" | "cost" | "status" | "backend" | "company" | "queue"
 
 const SORT_LABEL: Record<SortKey, string> = {
   when: "Last attempt",
@@ -29,6 +29,7 @@ const SORT_LABEL: Record<SortKey, string> = {
   status: "Status",
   backend: "Backend",
   company: "Company",
+  queue: "Priority",
 }
 
 function formatCost(v: number | null): string {
@@ -57,6 +58,8 @@ function sortValue(r: ApplicationRow, key: SortKey): string | number {
       return r.apply_backend ?? ""
     case "company":
       return (r.company ?? "").toLowerCase()
+    case "queue":
+      return r.queue_position ?? Number.MAX_SAFE_INTEGER
   }
 }
 
@@ -76,7 +79,13 @@ export function ApplicationsTable({ live }: { live: boolean }) {
   const [search, setSearch] = useState("")
   const [sortKey, setSortKey] = useState<SortKey>("when")
   const [sortDesc, setSortDesc] = useState(true)
+  const [draggedIndex, setDraggedIndex] = useState<number | null>(null)
   const debouncedSearch = useDebounced(search, 200)
+
+  // Dragging only makes sense over the exact set the reorder call will
+  // persist against -- the full queued list, in priority order, with
+  // nothing hidden by a search filter.
+  const isQueueView = statusFilter === "queued" && sortKey === "queue" && !debouncedSearch.trim()
 
   function refresh() {
     setLoading(true)
@@ -156,6 +165,30 @@ export function ApplicationsTable({ live }: { live: boolean }) {
     return sortKey === key ? (sortDesc ? " ▾" : " ▴") : ""
   }
 
+  function selectQueuedPill() {
+    setStatusFilter("queued")
+    setSortKey("queue")
+    setSortDesc(false)
+  }
+
+  // Drag-reorder writes queue_position onto local state immediately (so the
+  // row doesn't snap back to its old spot before the request round-trips)
+  // and persists in the background via the same call that folds every
+  // queued job into one fresh, contiguously-numbered batch.
+  function handleDrop(targetIndex: number) {
+    if (draggedIndex === null || draggedIndex === targetIndex) {
+      setDraggedIndex(null)
+      return
+    }
+    const arr = [...visible]
+    const [moved] = arr.splice(draggedIndex, 1)
+    arr.splice(targetIndex, 0, moved)
+    const reindexed = arr.map((r, i) => ({ ...r, queue_position: i }))
+    setRows(reindexed)
+    setDraggedIndex(null)
+    api.reorderQueue(reindexed.map((r) => r.url)).catch((e) => setError(String(e)))
+  }
+
   return (
     <section className="day-panel">
       <div className="dayhead">
@@ -170,11 +203,16 @@ export function ApplicationsTable({ live }: { live: boolean }) {
           <span
             key={p.label}
             className={`pill${statusFilter === p.id ? " on" : ""}`}
-            onClick={() => setStatusFilter(p.id)}
+            onClick={() => (p.id === "queued" ? selectQueuedPill() : setStatusFilter(p.id))}
           >
             {p.label}
           </span>
         ))}
+        {isQueueView && (
+          <span style={{ fontSize: 11.5, color: "var(--a-text-3)", marginLeft: 4 }}>
+            drag rows to reprioritize
+          </span>
+        )}
         <input
           className="srch"
           type="search"
@@ -230,8 +268,17 @@ export function ApplicationsTable({ live }: { live: boolean }) {
             {visible.map((r, i) => {
               const status = r.apply_status ?? "—"
               return (
-                <tr key={r.url}>
-                  <td className="idx">{i + 1}</td>
+                <tr
+                  key={r.url}
+                  draggable={isQueueView}
+                  onDragStart={isQueueView ? () => setDraggedIndex(i) : undefined}
+                  onDragOver={isQueueView ? (e) => e.preventDefault() : undefined}
+                  onDrop={isQueueView ? () => handleDrop(i) : undefined}
+                  className={isQueueView ? "draggable-row" : undefined}
+                >
+                  <td className="idx" style={isQueueView ? { cursor: "grab" } : undefined}>
+                    {isQueueView ? `⠿ ${i + 1}` : i + 1}
+                  </td>
                   <td className="co" title={r.company ?? undefined}>
                     {r.company ? (
                       <span className={r.company_tier === "tier1" ? "tier1-company" : r.company_tier ? "tier-adjacent" : undefined}>
