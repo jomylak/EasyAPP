@@ -47,6 +47,10 @@ export interface JobRow {
   // 'yes' | 'no' | null -- strong match, posting says nothing either way
   // about post-grad eligibility. Worth a manual look, not queue-boosted.
   is_terminal_internship_likely: string | null
+  // 'silent' | 'mentions_enrollment' | null -- review-aid only, set for
+  // is_terminal_internship_likely='yes' rows. Never drives ranking or
+  // filtering -- see compute_terminal_evidence_hints in scoring/scorer.py.
+  terminal_evidence_hint: string | null
   // 'yes' | 'no' | null -- fully-remote Spring-term internship; needs no
   // grad-date evidence at all since the term ends before graduation. Same
   // top apply-queue priority tier as is_terminal_internship.
@@ -56,6 +60,7 @@ export interface JobRow {
   apply_error: string | null
   apply_cost_usd: number | null
   queue_batch: string | null
+  queue_position: number | null
   tailored_resume_path: string | null
   day: string | null
   posted: string | null
@@ -78,6 +83,7 @@ export interface JobDetail extends JobRow {
     matched_on?: string[]
     candidates?: string[]
   } | null
+  company_limit: CompanyLimitStatus | null
 }
 
 export interface JobsPage {
@@ -159,6 +165,12 @@ export interface GlobalFilters {
   // strong match whose posting never addresses post-grad eligibility either
   // way, so it's worth a human look rather than an automatic queue boost.
   likely_terminal_only: boolean
+  // "The only internships I can actually apply to": confirmed OR
+  // likely-terminal, OR'd (unlike terminal_only + likely_terminal_only
+  // both on, which is always empty -- a row is never both). Defaults from
+  // Settings.default_eligible_internships_only on load, same as any other
+  // pill after that -- see BrowseTab.
+  eligible_only: boolean
   // Big tech only -- the "closed mouths don't get fed" view. Every FAANG /
   // big-tech posting gets applied to regardless of how its fit scores.
   tier_only: boolean
@@ -251,6 +263,21 @@ export interface AtsStat {
   median_duration_s: number | null
 }
 
+// src/applypilot/company_limits.py -- how many applications one employer
+// will actually consider from this candidate in the current period, and how
+// many of those have already been used.
+export interface CompanyLimitStatus {
+  company: string | null
+  limit: number
+  // "total" is a lifetime cap (never resets) -- the blanket default for any
+  // company with no confirmed renewing allowance. "month"/"season" are the
+  // few companies with a confirmed period-based limit (e.g. Google 3/month).
+  period: "total" | "month" | "season"
+  applied: number
+  remaining: number
+  at_cap: boolean
+}
+
 // src/applypilot/scoring/scorer.py:compute_desirability -- the three
 // independent components of a desirability score, weighted per lane. Pay and
 // location used to be one folded term, which silently discarded pay whenever
@@ -278,6 +305,10 @@ export interface Settings {
   goose_writes_quirks: boolean
   tailoring_enabled: boolean
   cover_letters_enabled: boolean
+  // Per-install default for the Browse tab's "Eligible for me" pill on
+  // page load -- see config.DEFAULT_SETTINGS in config.py for why this is
+  // a setting rather than a hardcoded default.
+  default_eligible_internships_only: boolean
   graduation_date: string
   earliest_start_date: string
   new_grad_weights: LaneWeights
@@ -303,6 +334,7 @@ export const EMPTY_GLOBAL_FILTERS: GlobalFilters = {
   unapplied_only: false,
   terminal_only: false,
   likely_terminal_only: false,
+  eligible_only: false,
   tier_only: false,
   location: null,
   term: null,

@@ -35,7 +35,11 @@ from applypilot.web import queries
 
 logger = logging.getLogger(__name__)
 
-HOST = "127.0.0.1"          # not configurable, on purpose
+HOST = os.environ.get("APPLYPILOT_HOST", "127.0.0.1")
+# Defaults to loopback-only, on purpose: this serves resumes and drives
+# Chrome profiles holding logged-in sessions. APPLYPILOT_HOST exists only
+# for binding to a private overlay-network interface (e.g. a Tailscale IP)
+# on a headless deployment -- never set it to 0.0.0.0 or a public interface.
 DEFAULT_PORT = 8420
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -82,17 +86,41 @@ def reconcile_stale_locks() -> int:
 
     A row that belonged to a batch goes back to 'queued' so relaunching the
     batch retries it; one from the ranked queue goes back to NULL.
+
+    Age-gated, not just keyed to run_is_live(): that check only sees runs
+    this server itself spawned via /api/launch, so a run started straight
+    from the CLI (a normal, supported way to run `applypilot apply`) has no
+    PID here for it to find, and looked exactly like an orphan. The result:
+    this function, called on every /api/stats poll, ripped the lock off a
+    job that was still being actively applied to seconds after it was
+    claimed, mid-run -- reproduced directly by launching `applypilot apply
+    --url ...` over SSH while a dashboard tab had the UI open. A lock is
+    only genuinely orphaned once it has sat untouched longer than any single
+    job could legitimately still be running, regardless of how that run was
+    launched -- so age is the real signal, and run_is_live() is kept only as
+    a cheap short-circuit for the common case (a live web-launched run means
+    nothing yet could be stale).
     """
     if run_is_live():
         return 0
     conn = get_connection()
+    settings = config.load_settings()
+    # Longest either backend's own per-job wall-clock cap allows, plus a
+    # buffer -- a job that has run longer than this without updating
+    # last_attempted_at is dead by definition, not just slow.
+    max_age = max(
+        settings.get("apply_timeout") or config.DEFAULTS["apply_timeout"],
+        settings.get("goose_timeout") or config.DEFAULTS["goose_timeout"],
+    ) + 300
     cur = conn.execute("""
         UPDATE jobs
            SET apply_status = CASE WHEN queue_batch IS NOT NULL
                                    THEN 'queued' ELSE NULL END,
                agent_id = NULL
          WHERE apply_status = 'in_progress'
-    """)
+           AND (last_attempted_at IS NULL
+                OR last_attempted_at < datetime('now', '-' || ? || ' seconds'))
+    """, (max_age,))
     conn.commit()
     if cur.rowcount:
         logger.info("Released %d stale apply lock(s).", cur.rowcount)
@@ -146,6 +174,7 @@ def api_jobs(
     unapplied_only: bool = False,
     terminal_only: bool = False,
     likely_terminal_only: bool = False,
+    eligible_only: bool = False,
     posted_within_days: int | None = None,
     tier_only: bool = False,
     include_tier: bool = False,
@@ -178,6 +207,7 @@ def api_jobs(
             "above_pay_floor": above_pay_floor, "unapplied_only": unapplied_only,
             "terminal_only": terminal_only,
             "likely_terminal_only": likely_terminal_only,
+            "eligible_only": eligible_only,
             "posted_within_days": posted_within_days,
             "tier_only": tier_only, "include_tier": include_tier,
             "location": location, "term": term,
@@ -214,7 +244,15 @@ def api_applications(status: str | None = None, limit: int = 200) -> dict:
 
 @app.get("/api/ats-stats")
 def api_ats_stats() -> dict:
-    return {"rows": costs.ats_stats()}
+    # Dashboard-only filter to goose -- costs.ats_stats() itself stays
+    # backend-inclusive since `applypilot ats-stats` and estimate_batch's
+    # per-(ats, backend) sampling both still want Claude's historical rows.
+    return {"rows": [r for r in costs.ats_stats() if r["backend"] == "goose"]}
+
+
+@app.get("/api/company-limits")
+def api_company_limits() -> dict:
+    return {"rows": queries.company_limit_breakdown()}
 
 
 @app.get("/api/resume")
@@ -293,6 +331,33 @@ def api_estimate(payload: dict = Body(...)) -> dict:
     urls = payload.get("urls") or []
     backend = payload.get("backend") or config.load_settings().get("apply_backend", "goose")
     return costs.estimate_batch(urls, backend)
+
+
+@app.post("/api/queue/reorder")
+def api_queue_reorder(payload: dict = Body(...)) -> dict:
+    """Rewrite priority order for the given queued jobs (drag-to-reorder).
+
+    Folds every url into one fresh batch, in the order given -- the queue is
+    meant to read as a single prioritized list regardless of which browse
+    session originally queued each job, and the apply launcher only drains
+    one queue_batch at a time, so a reorder across batches has to merge them.
+    Rows not still 'queued' (already picked up by a running worker) are
+    silently skipped rather than erroring, since the drag happened against a
+    snapshot that may be a few seconds stale.
+    """
+    urls = payload.get("urls") or []
+    if not urls:
+        raise HTTPException(400, "No jobs given")
+
+    batch = f"batch-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+    conn = get_connection()
+    with conn:
+        for position, url in enumerate(urls):
+            conn.execute("""
+                UPDATE jobs SET queue_batch = ?, queue_position = ?
+                 WHERE url = ? AND apply_status = 'queued'
+            """, (batch, position, url))
+    return {"batch": batch}
 
 
 @app.post("/api/unqueue")

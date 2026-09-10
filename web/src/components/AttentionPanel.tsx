@@ -25,8 +25,7 @@ interface Props {
   postedWithinDays: number | null
   globalFilters: GlobalFilters
   selected: Set<string>
-  onToggleSelect: (url: string, jobType: string | null) => void
-  onToggleMany: (rows: { url: string; job_type: string | null }[], checked: boolean) => void
+  onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   // Both Priority panels share one height: dragging either grip resizes both,
   // and each independently loads enough of its own rows to fill it (rather
   // than one panel loading rows while the other just stretches to match with
@@ -57,7 +56,6 @@ export function AttentionPanel({
   globalFilters,
   selected,
   onToggleSelect,
-  onToggleMany,
   boxHeight,
   onBoxHeightChange,
 }: Props) {
@@ -89,6 +87,7 @@ export function AttentionPanel({
       above_pay_floor: globalFilters.above_pay_floor,
       terminal_only: globalFilters.terminal_only,
       likely_terminal_only: globalFilters.likely_terminal_only,
+      eligible_only: globalFilters.eligible_only,
       location: globalFilters.location,
       term: globalFilters.term,
       tier_only: globalFilters.tier_only,
@@ -161,7 +160,6 @@ export function AttentionPanel({
   })
 
   const tableRows = table.getRowModel().rows
-  const allLoadedSelected = tableRows.length > 0 && tableRows.every((r) => selected.has(r.original.url))
 
   function toggleOpen(url: string) {
     setOpenRows((prev) => {
@@ -221,22 +219,7 @@ export function AttentionPanel({
         <table>
           <thead>
             <tr>
-              <th className="cbcell">
-                <input
-                  type="checkbox"
-                  aria-label="Select all loaded"
-                  checked={allLoadedSelected}
-                  onChange={(e) =>
-                    onToggleMany(
-                      tableRows.map((r) => ({
-                        url: r.original.url,
-                        job_type: r.original.job_type,
-                      })),
-                      e.target.checked,
-                    )
-                  }
-                />
-              </th>
+              <th className="cbcell" />
               <th className="col-idx num">#</th>
               {HEADERS.map((h) => (
                 <th
@@ -275,6 +258,7 @@ export function AttentionPanel({
                   original={r}
                   isSel={selected.has(r.url)}
                   isOpen={openRows.has(r.url)}
+                  tableId={title}
                   onToggleSelect={onToggleSelect}
                   onToggleOpen={toggleOpen}
                 />

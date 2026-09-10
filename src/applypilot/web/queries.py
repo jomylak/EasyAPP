@@ -17,6 +17,7 @@ Two conventions matter here:
 
 import sqlite3
 
+from applypilot import company_limits
 from applypilot.database import _DAY_EXPR, get_connection
 
 # What the browse table shows per row. Deliberately excludes full_description:
@@ -26,11 +27,11 @@ _ROW_COLUMNS = f"""
     url, title, company, site, location, salary, pay_text,
     fit_score, desirability_score, company_prestige, company_tier,
     job_type, ats, eligible, keywords, term,
-    is_terminal_internship, is_terminal_internship_likely,
+    is_terminal_internship, is_terminal_internship_likely, terminal_evidence_hint,
     is_remote_spring_internship,
     pay_min_hourly, pay_max_hourly, pay_below_floor,
     apply_status, applied_at, apply_error, apply_cost_usd,
-    queue_batch, tailored_resume_path,
+    queue_batch, queue_position, tailored_resume_path,
     {_DAY_EXPR} AS day,
     COALESCE(posted_date, discovered_at) AS posted
 """
@@ -157,12 +158,34 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     if f.get("above_pay_floor"):
         clauses.append("(pay_below_floor IS NULL OR pay_below_floor != 'yes')")
     if f.get("terminal_only"):
-        clauses.append("is_terminal_internship = 'yes'")
+        # Meaningless for a non-internship row -- "will this convert to
+        # full-time" only applies to internships, so a new-grad posting
+        # (which is already full-time) shouldn't be hidden by a pill that's
+        # asking a question that doesn't apply to it.
+        clauses.append("(job_type != 'internship' OR is_terminal_internship = 'yes')")
     if f.get("likely_terminal_only"):
         # Manual-review queue: strong matches whose posting never says
         # either way about post-grad eligibility (see
-        # compute_likely_terminal_internships in scoring/scorer.py).
-        clauses.append("is_terminal_internship_likely = 'yes'")
+        # compute_likely_terminal_internships in scoring/scorer.py). Same
+        # non-internship exemption as terminal_only above.
+        clauses.append(
+            "(job_type != 'internship' OR is_terminal_internship_likely = 'yes')"
+        )
+    if f.get("eligible_only"):
+        # "The only internships I can actually apply to" -- confirmed OR
+        # likely terminal, OR'd rather than the AND the two pills above give
+        # when combined (which is always empty: a row is never both). Kept
+        # as its own filter key instead of asking the UI to check both pills
+        # at once, since "either kind" and "only the confirmed kind" are
+        # different questions a viewer might actually want answered.
+        # Only internships need this post-grad-eligibility gate -- new grad
+        # (and other non-internship) roles aren't terminal-internship-scored
+        # at all, so requiring the terminal flag on them would wrongly hide
+        # every new-grad posting from someone eligible for new grad roles.
+        clauses.append(
+            "(job_type != 'internship' "
+            "OR is_terminal_internship = 'yes' OR is_terminal_internship_likely = 'yes')"
+        )
     if f.get("unapplied_only"):
         clauses.append("(apply_status IS NULL OR apply_status = 'failed')")
     if f.get("posted_within_days") is not None:
@@ -263,7 +286,16 @@ def job_detail(url: str, conn: sqlite3.Connection | None = None) -> dict | None:
     except Exception:
         job["resume_route"] = None
 
+    job["company_limit"] = company_limits.status_for(conn, job.get("company")) if job.get("company") else None
+
     return job
+
+
+def company_limit_breakdown(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Per-company cap status for every employer already applied to, for the
+    Dashboard tab's breakdown."""
+    conn = conn or get_connection()
+    return company_limits.all_statuses(conn)
 
 
 def facets(conn: sqlite3.Connection | None = None) -> dict:
@@ -296,6 +328,13 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
     'queued' without clearing its historical cost, so `applied + failed`
     alone would shrink on a retry while `spend` stayed put -- inflating
     avg-cost-per-attempt for a click that hasn't spent anything yet.
+
+    `spend`/`priced_attempts` are goose-only. Claude is a rarely-used
+    fallback backend that costs ~30x more per job (subscription-quota
+    Claude Code vs. a cheap OpenRouter model) -- a handful of Claude
+    attempts mixed into the average swamps it (measured: $1.16 avg with 3
+    Claude rows vs $0.001 for goose), which misrepresents what the actual
+    default backend costs going forward.
     """
     conn = conn or get_connection()
     row = conn.execute("""
@@ -308,8 +347,10 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
                SUM(fit_score IS NOT NULL)                                AS scored,
                SUM(detail_scraped_at IS NULL)                            AS pending_enrich,
                SUM(review_status = 'needs_review')                       AS needs_review,
-               COALESCE(SUM(apply_cost_usd), 0)                          AS spend,
-               SUM(apply_cost_usd IS NOT NULL)                           AS priced_attempts
+               COALESCE(SUM(apply_cost_usd) FILTER (WHERE apply_backend = 'goose'), 0)
+                                                                          AS spend,
+               SUM(apply_cost_usd IS NOT NULL AND apply_backend = 'goose')
+                                                                          AS priced_attempts
         FROM jobs
     """).fetchone()
     return {k: (row[k] or 0) for k in row.keys()}

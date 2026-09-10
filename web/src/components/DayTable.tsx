@@ -11,7 +11,7 @@ import { NumericFilter } from "@/components/NumericFilter"
 import { api } from "@/lib/api"
 import type { DayBucket, DayFilters, GlobalFilters, JobRow, SortKey } from "@/lib/types"
 import { EMPTY_DAY_FILTERS } from "@/lib/types"
-import { fitColor, formatDayLabel, formatPay, preColor, useDebounced } from "@/lib/utils"
+import { fitColor, formatDayLabel, formatDaysAgo, formatPay, preColor, useDebounced } from "@/lib/utils"
 
 export const ROW_HEIGHT = 34
 export const HEADER_HEIGHT = 34
@@ -46,6 +46,7 @@ export const HEADERS: HeaderSpec[] = [
   { id: "company", label: "Company", sortKey: "company" },
   { id: "title", label: "Title", sortKey: "title" },
   { id: "location", label: "Location" },
+  { id: "posted", label: "Posted", sortKey: "posted", numeric: true },
   { id: "pay", label: "Pay", sortKey: "pay" },
   { id: "prestige", label: "Pres", sortKey: "prestige", numeric: true },
   { id: "fit", label: "Fit", sortKey: "fit", numeric: true },
@@ -86,6 +87,13 @@ export const columns = [
     id: "location",
     cell: (info) => info.getValue() || "—",
   }),
+  columnHelper.accessor("posted", {
+    id: "posted",
+    cell: (info) => {
+      const v = info.getValue()
+      return <span title={v ? new Date(v).toLocaleString() : undefined}>{formatDaysAgo(v)}</span>
+    },
+  }),
   columnHelper.display({
     id: "pay",
     cell: (info) => formatPay(info.row.original),
@@ -112,8 +120,7 @@ interface Props {
   defaultPageSize: number
   globalFilters: GlobalFilters
   selected: Set<string>
-  onToggleSelect: (url: string, jobType: string | null) => void
-  onToggleMany: (rows: { url: string; job_type: string | null }[], checked: boolean) => void
+  onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
 }
 
 interface Preset {
@@ -132,7 +139,6 @@ export function DayTable({
   globalFilters,
   selected,
   onToggleSelect,
-  onToggleMany,
 }: Props) {
   const [sort, setSort] = useState<SortKey>("prestige")
   const [filters, setFilters] = useState<DayFilters>(EMPTY_DAY_FILTERS)
@@ -211,6 +217,7 @@ export function DayTable({
       unapplied_only: globalFilters.unapplied_only,
       terminal_only: globalFilters.terminal_only,
       likely_terminal_only: globalFilters.likely_terminal_only,
+      eligible_only: globalFilters.eligible_only,
       location: globalFilters.location,
       term: globalFilters.term,
       tier_only:
@@ -294,7 +301,6 @@ export function DayTable({
   })
 
   const tableRows = table.getRowModel().rows
-  const allLoadedSelected = tableRows.length > 0 && tableRows.every((r) => selected.has(r.original.url))
 
   function applyPreset(id: string) {
     const preset = presets[id]
@@ -433,22 +439,7 @@ export function DayTable({
         <table>
           <thead>
             <tr>
-              <th className="cbcell">
-                <input
-                  type="checkbox"
-                  aria-label="Select all loaded"
-                  checked={allLoadedSelected}
-                  onChange={(e) =>
-                    onToggleMany(
-                      tableRows.map((r) => ({
-                        url: r.original.url,
-                        job_type: r.original.job_type,
-                      })),
-                      e.target.checked,
-                    )
-                  }
-                />
-              </th>
+              <th className="cbcell" />
               <th className="col-idx num">#</th>
               {HEADERS.map((h) => (
                 <th
@@ -489,6 +480,7 @@ export function DayTable({
                   original={r}
                   isSel={isSel}
                   isOpen={isOpen}
+                  tableId={day.day}
                   onToggleSelect={onToggleSelect}
                   onToggleOpen={toggleOpen}
                 />
@@ -515,7 +507,8 @@ export interface RowPairProps {
   original: JobRow
   isSel: boolean
   isOpen: boolean
-  onToggleSelect: (url: string, jobType: string | null) => void
+  tableId: string
+  onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   onToggleOpen: (url: string) => void
 }
 
@@ -542,8 +535,20 @@ function TerminalBadge({ row }: { row: JobRow }) {
     )
   }
   if (row.is_terminal_internship_likely === "yes") {
+    // terminal_evidence_hint is a review-aid label only (never affects
+    // ranking/filtering, see compute_terminal_evidence_hints in
+    // scoring/scorer.py) -- "silent" means the posting never mentions
+    // grad timing/enrollment at all; "mentions_enrollment" means it
+    // describes a "currently pursuing"/"currently enrolled" candidate
+    // profile without stating that as a requirement, which the scoring
+    // prompt deliberately treats as non-disqualifying but which reads
+    // less clean-cut than true silence to a human skimming this list.
+    const hint =
+      row.terminal_evidence_hint === "mentions_enrollment"
+        ? "Likely terminal: strong match; posting mentions \"currently pursuing/enrolled\" language (boilerplate candidate description, not a stated requirement) but never explicitly says either way about post-grad eligibility -- worth a manual look"
+        : "Likely terminal: strong match; posting says nothing at all about grad timing or enrollment -- worth a manual look"
     return (
-      <span className="tbadge tbadge-likely" title="Likely terminal: strong match, but posting never says either way about post-grad eligibility -- worth a manual look">
+      <span className="tbadge tbadge-likely" title={hint}>
         L?
       </span>
     )
@@ -551,7 +556,7 @@ function TerminalBadge({ row }: { row: JobRow }) {
   return null
 }
 
-export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggleOpen }: RowPairProps) {
+export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen }: RowPairProps) {
   const cellsById = new Map(row.getVisibleCells().map((c) => [c.column.id, c]))
   return (
     <>
@@ -562,7 +567,14 @@ export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggle
             checked={isSel}
             aria-label={`Select ${original.company ?? original.title ?? original.url}`}
             onClick={(e) => e.stopPropagation()}
-            onChange={() => onToggleSelect(original.url, original.job_type)}
+            onChange={() => {
+              onToggleSelect(original.url, original.job_type, tableId, original.posted)
+              // Checking a row is a confirm-and-move-on action -- close the
+              // expanded detail so the next row is ready to review. Only on
+              // check, not uncheck: un-ticking usually means "wait, let me
+              // look again," so leave it open.
+              if (!isSel && isOpen) onToggleOpen(original.url)
+            }}
           />
         </td>
         <td className="idx">{row.index + 1}</td>
@@ -573,6 +585,9 @@ export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggle
         </td>
         <td className="loc">
           {flexRender(cellsById.get("location")!.column.columnDef.cell, cellsById.get("location")!.getContext())}
+        </td>
+        <td className="num posted">
+          {flexRender(cellsById.get("posted")!.column.columnDef.cell, cellsById.get("posted")!.getContext())}
         </td>
         <td className="pay">{flexRender(cellsById.get("pay")!.column.columnDef.cell, cellsById.get("pay")!.getContext())}</td>
         <td className="num" style={{ color: preColor(original.company_prestige) }}>
@@ -586,7 +601,7 @@ export function RowPair({ row, original, isSel, isOpen, onToggleSelect, onToggle
         </td>
       </tr>
       <tr className={`exp${isOpen ? " open" : ""}`}>
-        <td colSpan={9}>
+        <td colSpan={COL_COUNT}>
           <div className="slide">
             <div>
               <JobExpansion row={original} open={isOpen} />

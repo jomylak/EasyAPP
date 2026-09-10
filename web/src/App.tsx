@@ -17,12 +17,23 @@ export default function App() {
   // checkbox. Kept beside `selected` rather than replacing it because every
   // consumer only ever asks "is this url ticked".
   const [selectedTypes, setSelectedTypes] = useState<Map<string, string | null>>(new Map())
+  // The actual click sequence, tagged with which table each click came from
+  // and that job's posted date. Selecting is a Set for O(1) membership
+  // checks everywhere else, but the apply queue needs to preserve intent:
+  // clicks are grouped into runs by table (a run ends when the user moves to
+  // a different table), each run is sorted newest-posted-first internally,
+  // and the runs stay in the order the user started them -- so a batch
+  // picked in one table always lands ahead of a batch started afterward in
+  // another, regardless of visual row order within either table.
+  const [selectionOrder, setSelectionOrder] = useState<
+    { url: string; tableId: string; posted: string | null }[]
+  >([])
   const [launching, setLaunching] = useState(false)
   const [launchNote, setLaunchNote] = useState<string | null>(null)
   const [launchError, setLaunchError] = useState(false)
   const [dryRun, setDryRun] = useState(false)
 
-  function toggleSelect(url: string, jobType: string | null) {
+  function toggleSelect(url: string, jobType: string | null, tableId: string, posted: string | null) {
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(url)) next.delete(url)
@@ -35,25 +46,27 @@ export default function App() {
       else next.set(url, jobType)
       return next
     })
+    setSelectionOrder((prev) => {
+      if (prev.some((e) => e.url === url)) return prev.filter((e) => e.url !== url)
+      return [...prev, { url, tableId, posted }]
+    })
   }
 
-  function toggleMany(rows: { url: string; job_type: string | null }[], checked: boolean) {
-    setSelected((prev) => {
-      const next = new Set(prev)
-      for (const r of rows) {
-        if (checked) next.add(r.url)
-        else next.delete(r.url)
-      }
-      return next
-    })
-    setSelectedTypes((prev) => {
-      const next = new Map(prev)
-      for (const r of rows) {
-        if (checked) next.set(r.url, r.job_type)
-        else next.delete(r.url)
-      }
-      return next
-    })
+  // Groups consecutive same-table entries into runs, sorts each run by
+  // posted date descending (nulls last), and concatenates runs in the order
+  // they started.
+  function queueOrder(): string[] {
+    const runs: { tableId: string; entries: typeof selectionOrder }[] = []
+    for (const entry of selectionOrder) {
+      const last = runs[runs.length - 1]
+      if (last && last.tableId === entry.tableId) last.entries.push(entry)
+      else runs.push({ tableId: entry.tableId, entries: [entry] })
+    }
+    return runs.flatMap((run) =>
+      [...run.entries]
+        .sort((a, b) => (b.posted ?? "").localeCompare(a.posted ?? ""))
+        .map((e) => e.url),
+    )
   }
 
   async function handleLaunch() {
@@ -66,7 +79,7 @@ export default function App() {
     setLaunchNote(null)
     setLaunchError(false)
     try {
-      const queued = await api.queue(Array.from(selected))
+      const queued = await api.queue(queueOrder())
       if (queued.queued === 0) {
         setLaunchNote(
           `Nothing to launch -- all ${queued.skipped} selected job(s) were already applied, ` +
@@ -74,6 +87,7 @@ export default function App() {
         )
         setSelected(new Set())
         setSelectedTypes(new Map())
+        setSelectionOrder([])
         return
       }
 
@@ -85,6 +99,7 @@ export default function App() {
       )
       setSelected(new Set())
       setSelectedTypes(new Map())
+      setSelectionOrder([])
       setTab("dashboard")
     } catch (e) {
       setLaunchError(true)
@@ -146,7 +161,6 @@ export default function App() {
           selected={selected}
           selectedTypes={selectedTypes}
           onToggleSelect={toggleSelect}
-          onToggleMany={toggleMany}
         />
       )}
       {tab === "dashboard" && <DashboardTab />}

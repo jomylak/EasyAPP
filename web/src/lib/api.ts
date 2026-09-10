@@ -1,6 +1,7 @@
 import type {
   ApplicationRow,
   AtsStat,
+  CompanyLimitStatus,
   CostEstimate,
   DayBucket,
   EnvKeyName,
@@ -53,6 +54,7 @@ export interface JobsQuery {
   unapplied_only?: boolean
   terminal_only?: boolean
   likely_terminal_only?: boolean
+  eligible_only?: boolean
   posted_within_days?: number | null
   // Narrow to big-tech postings.
   tier_only?: boolean
@@ -86,6 +88,12 @@ export const api = {
       body: JSON.stringify({ urls, backend }),
     }),
 
+  reorderQueue: (urls: string[]) =>
+    request<{ batch: string }>("/api/queue/reorder", {
+      method: "POST",
+      body: JSON.stringify({ urls }),
+    }),
+
   unqueue: (urls: string[], revertStatus?: "failed") =>
     request<{ removed: number }>("/api/unqueue", {
       method: "POST",
@@ -112,6 +120,8 @@ export const api = {
   stopAll: () => request<{ stopped: boolean; released: number }>("/api/stop-all", { method: "POST" }),
 
   atsStats: () => request<{ rows: AtsStat[] }>("/api/ats-stats"),
+
+  companyLimits: () => request<{ rows: CompanyLimitStatus[] }>("/api/company-limits"),
 
   settings: () => request<Settings>("/api/settings"),
 

@@ -16,11 +16,10 @@ const DEFAULT_ATTENTION_WINDOW_DAYS = 7
 interface Props {
   selected: Set<string>
   selectedTypes: Map<string, string | null>
-  onToggleSelect: (url: string, jobType: string | null) => void
-  onToggleMany: (rows: { url: string; job_type: string | null }[], checked: boolean) => void
+  onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
 }
 
-export function BrowseTab({ selected, selectedTypes, onToggleSelect, onToggleMany }: Props) {
+export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
   const [days, setDays] = useState<DayBucket[] | null>(null)
   const [facets, setFacets] = useState<Facets | null>(null)
   const [globalFilters, setGlobalFilters] = useState<GlobalFilters>(EMPTY_GLOBAL_FILTERS)
@@ -29,6 +28,21 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, onToggleMan
   useEffect(() => {
     api.days().then((d) => setDays(d.days)).catch((e) => setError(String(e)))
     api.facets().then(setFacets).catch(() => {})
+    // Seed the "Eligible for me" pill from this install's own default --
+    // a candidate who can only honestly apply to terminal/likely-terminal
+    // internships wants this view every time the dashboard opens, without
+    // re-clicking the pill each session. Only ever overrides the pill's
+    // OWN initial value (still false at this point, since this effect runs
+    // once on mount before the user could have touched anything), so a
+    // per-session toggle after load is never clobbered by a slow settings
+    // fetch landing later.
+    api.settings()
+      .then((s) => {
+        if (s.default_eligible_internships_only) {
+          setGlobalFilters((f) => ({ ...f, eligible_only: true }))
+        }
+      })
+      .catch(() => {})
   }, [])
 
   const dayList = useMemo(() => days ?? [], [days])
@@ -94,7 +108,6 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, onToggleMan
             globalFilters={globalFilters}
             selected={selected}
             onToggleSelect={onToggleSelect}
-            onToggleMany={onToggleMany}
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
           />
@@ -108,7 +121,6 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, onToggleMan
             globalFilters={globalFilters}
             selected={selected}
             onToggleSelect={onToggleSelect}
-            onToggleMany={onToggleMany}
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
           />
@@ -134,7 +146,6 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, onToggleMan
             globalFilters={globalFilters}
             selected={selected}
             onToggleSelect={onToggleSelect}
-            onToggleMany={onToggleMany}
           />
         ))}
       </div>
