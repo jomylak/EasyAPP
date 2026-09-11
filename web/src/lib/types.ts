@@ -78,6 +78,15 @@ export interface JobDetail extends JobRow {
   is_terminal_internship: string | null
   requires_returning_student: string | null
   eligibility_reason: string | null
+  // Post-application telemetry -- all null until the job has actually been
+  // attempted. Mirrors the same columns costs.ats_stats() reads.
+  apply_backend: string | null
+  apply_duration_ms: number | null
+  last_attempted_at: string | null
+  apply_llm_requests: number | null
+  apply_input_tokens: number | null
+  apply_output_tokens: number | null
+  apply_cache_read_tokens: number | null
   resume_route: {
     track?: string
     matched_on?: string[]
@@ -92,6 +101,7 @@ export interface JobsPage {
   page: number
   page_size: number
   sort: string
+  dir: SortDir
 }
 
 export interface Facets {
@@ -129,6 +139,9 @@ export type SortKey =
   | "title"
   | "posted"
   | "pay"
+  | "location"
+
+export type SortDir = "asc" | "desc"
 
 // Filters a single DayTable owns, scoped to its own day. Mirrors the query
 // params /api/jobs accepts, minus `day`/`page`/`page_size`/`sort`, which the
@@ -262,6 +275,16 @@ export interface AtsStat {
   median_cost_usd: number | null
   total_cost_usd: number
   median_duration_s: number | null
+}
+
+// src/applypilot/costs.py:failure_reasons() -- count of failed apply
+// attempts per canonical category (apply.failure_taxonomy normalizes the raw
+// apply_error string down to `category` so near-duplicate phrasings collapse
+// into one bar instead of fragmenting).
+export interface FailureReasonStat {
+  category: string
+  label: string
+  n: number
 }
 
 // src/applypilot/company_limits.py -- how many applications one employer

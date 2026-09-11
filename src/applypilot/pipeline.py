@@ -108,6 +108,20 @@ def _run_score(rescore: bool = False) -> dict:
     try:
         from applypilot.scoring.scorer import run_scoring
         run_scoring(rescore=rescore)
+        # Safety net for rows scored in an earlier pipeline run, before a
+        # matching-logic or threshold change -- run_scoring's own per-row
+        # loop already re-runs check_duplicate once company is known, but
+        # only for rows it scores in *this* pass. Folded into this stage
+        # (rather than a new named stage) so it doesn't need its own entry
+        # in STAGE_ORDER/_UPSTREAM; a failure here logs and degrades rather
+        # than aborting scoring, since it's retroactive cleanup, not
+        # something downstream stages depend on.
+        try:
+            from applypilot import dedup
+            from applypilot.database import get_connection
+            dedup.backfill(get_connection())
+        except Exception as e:
+            log.error("Dedup backfill failed: %s", e)
         return {"status": "ok"}
     except Exception as e:
         log.error("Scoring failed: %s", e)

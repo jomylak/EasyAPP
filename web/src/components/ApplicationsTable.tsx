@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
+import { Fragment, useEffect, useMemo, useState } from "react"
+import { JobExpansion } from "@/components/JobExpansion"
 import { api } from "@/lib/api"
 import type { ApplicationRow } from "@/lib/types"
 import { useDebounced } from "@/lib/utils"
@@ -80,6 +81,15 @@ export function ApplicationsTable({ live }: { live: boolean }) {
   const [sortKey, setSortKey] = useState<SortKey>("when")
   const [sortDesc, setSortDesc] = useState(true)
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null)
+  // Which row's detail (JobExpansion) is open -- click-to-expand, same as
+  // Browse's DayTable, so this table isn't the one place in the app a row
+  // doesn't expand.
+  const [openRows, setOpenRows] = useState<Set<string>>(new Set())
+  // Inline "Report ineligible" note field -- which row (if any) has it open,
+  // the text typed into it, and the most recent result to show back.
+  const [reportingUrl, setReportingUrl] = useState<string | null>(null)
+  const [reportNote, setReportNote] = useState("")
+  const [reportResult, setReportResult] = useState<{ url: string; text: string } | null>(null)
   const debouncedSearch = useDebounced(search, 200)
 
   // Dragging only makes sense over the exact set the reorder call will
@@ -159,6 +169,45 @@ export function ApplicationsTable({ live }: { live: boolean }) {
       setBusyUrl(null)
       refresh()
     }
+  }
+
+  // For jobs already applied to: the pipeline has no visibility into a
+  // rejection email citing graduation date, so this is how that finding gets
+  // back in -- feeds the same company-wide sibling sweep the automated
+  // grad_date_mismatch detector uses (see apply.ineligibility), not just a
+  // flag on this one row. An inline note field, not window.prompt -- a
+  // native dialog blocks the page until dismissed, and there's no reason to
+  // make this the one action in the app that works differently.
+  async function reportIneligible(r: ApplicationRow) {
+    setBusyUrl(r.url)
+    try {
+      const res = await api.reportIneligible(r.url, reportNote)
+      const swept = res.siblings_softened + res.siblings_disqualified
+      setReportResult({
+        url: r.url,
+        text:
+          swept > 0
+            ? `Marked ineligible. Also ${res.siblings_disqualified ? "disqualified" : "flagged for review"} ` +
+              `${swept} sibling posting(s) at ${res.company ?? "this company"}.`
+            : "Marked ineligible.",
+      })
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusyUrl(null)
+      setReportingUrl(null)
+      setReportNote("")
+      refresh()
+    }
+  }
+
+  function toggleOpen(url: string) {
+    setOpenRows((prev) => {
+      const next = new Set(prev)
+      if (next.has(url)) next.delete(url)
+      else next.add(url)
+      return next
+    })
   }
 
   function sortIndicator(key: SortKey) {
@@ -268,13 +317,14 @@ export function ApplicationsTable({ live }: { live: boolean }) {
             {visible.map((r, i) => {
               const status = r.apply_status ?? "—"
               return (
+                <Fragment key={r.url}>
                 <tr
-                  key={r.url}
+                  className={`row${isQueueView ? " draggable-row" : ""}`}
                   draggable={isQueueView}
                   onDragStart={isQueueView ? () => setDraggedIndex(i) : undefined}
                   onDragOver={isQueueView ? (e) => e.preventDefault() : undefined}
                   onDrop={isQueueView ? () => handleDrop(i) : undefined}
-                  className={isQueueView ? "draggable-row" : undefined}
+                  onClick={() => !isQueueView && toggleOpen(r.url)}
                 >
                   <td className="idx" style={isQueueView ? { cursor: "grab" } : undefined}>
                     {isQueueView ? `⠿ ${i + 1}` : i + 1}
@@ -312,7 +362,7 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                   <td className="num">{formatCost(r.apply_cost_usd)}</td>
                   <td className="loc">{r.apply_backend ?? "—"}</td>
                   <td className="loc">{formatWhen(r.last_attempted_at)}</td>
-                  <td>
+                  <td onClick={(e) => e.stopPropagation()}>
                     {r.tailored_resume_path ? (
                       <a
                         href={`/api/resume?url=${encodeURIComponent(r.url)}`}
@@ -326,7 +376,7 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                       "—"
                     )}
                   </td>
-                  <td>
+                  <td onClick={(e) => e.stopPropagation()}>
                     {status === "queued" && (
                       <button className="rowbtn danger" disabled={busyUrl === r.url} onClick={() => act(r, "cancel")}>
                         Cancel
@@ -344,6 +394,61 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                     )}
                   </td>
                 </tr>
+                <tr className={`exp${openRows.has(r.url) ? " open" : ""}`}>
+                  <td colSpan={10}>
+                    <div className="slide">
+                      <div>
+                        <JobExpansion row={r} open={openRows.has(r.url)} />
+                        {status === "applied" && (
+                          <div style={{ marginTop: 14, borderTop: "1px solid var(--a-line)", paddingTop: 12 }}>
+                            {reportingUrl === r.url ? (
+                              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <span style={{ fontSize: 12, color: "var(--a-text-2)" }}>
+                                  Optional note (e.g. what the email said):
+                                </span>
+                                <input
+                                  className="srch"
+                                  style={{ flex: 1, width: "auto" }}
+                                  autoFocus
+                                  value={reportNote}
+                                  onChange={(e) => setReportNote(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") reportIneligible(r)
+                                    if (e.key === "Escape") setReportingUrl(null)
+                                  }}
+                                />
+                                <button className="rowbtn danger" disabled={busyUrl === r.url} onClick={() => reportIneligible(r)}>
+                                  {busyUrl === r.url ? "Reporting…" : "Confirm"}
+                                </button>
+                                <button className="rowbtn" onClick={() => setReportingUrl(null)}>
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                className="rowbtn danger"
+                                disabled={busyUrl === r.url}
+                                onClick={() => {
+                                  setReportingUrl(r.url)
+                                  setReportNote("")
+                                  setReportResult(null)
+                                }}
+                              >
+                                Report ineligible
+                              </button>
+                            )}
+                            {reportResult && reportResult.url === r.url && (
+                              <div style={{ marginTop: 8, fontSize: 11.5, color: "var(--a-text-2)" }}>
+                                {reportResult.text}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+                </Fragment>
               )
             })}
           </tbody>

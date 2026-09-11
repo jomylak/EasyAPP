@@ -14,15 +14,35 @@ import time
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply import proxy_forwarder
 
 logger = logging.getLogger(__name__)
 
 # CDP port base — each worker uses BASE_CDP_PORT + worker_id
 BASE_CDP_PORT = 9222
 
+# Local forwarding-proxy port base — each worker uses BASE_PROXY_PORT + worker_id
+BASE_PROXY_PORT = 9322
+
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
+# Track each worker's *current job's* upstream proxy string (CapSolver format,
+# "type:host:port:user:pass") and forwarder-stop callable, keyed by worker_id.
+# Multiple workers run as threads in the same process (see launcher.worker_loop's
+# ThreadPoolExecutor), so this must be worker_id-scoped, not a bare module global.
+_worker_proxies: dict[int, str] = {}
+_worker_forwarder_stops: dict[int, callable] = {}
 _chrome_lock = threading.Lock()
+
+
+def get_worker_proxy(worker_id: int) -> str | None:
+    """The CapSolver-format proxy string ("type:host:port:user:pass") this
+    worker's currently-launched Chrome is using, or None if APPLY_PROXY isn't
+    configured. CapSolver must solve through the exact same egress IP Chrome
+    is browsing from -- see get_apply_proxy's docstring for why.
+    """
+    with _chrome_lock:
+        return _worker_proxies.get(worker_id)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +300,33 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     chrome_exe = config.get_chrome_path()
 
+    # A fresh sticky-session proxy per job: this worker's Chrome and the
+    # CAPTCHA solve for whatever job it runs must share one egress IP, since
+    # the whole point is making the solve session and the submitting session
+    # look like the same real user. Only active when APPLY_PROXY is set --
+    # unset reproduces today's exact (no-proxy) behavior.
+    import secrets
+    session_id = f"w{worker_id}-{secrets.token_hex(4)}"
+    proxy = config.get_apply_proxy(session_id)
+
+    _stop_forwarder_for_worker(worker_id)
+    proxy_port = None
+    if proxy:
+        proxy_port = BASE_PROXY_PORT + worker_id
+        stop = proxy_forwarder.start_forwarder(
+            local_port=proxy_port,
+            upstream_host=proxy["host"],
+            upstream_port=proxy["port"],
+            user=proxy["user"],
+            passwd=proxy["pass"],
+        )
+        with _chrome_lock:
+            _worker_proxies[worker_id] = proxy["capsolver"]
+            _worker_forwarder_stops[worker_id] = stop
+    else:
+        with _chrome_lock:
+            _worker_proxies.pop(worker_id, None)
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
@@ -308,7 +355,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--use-fake-ui-for-media-stream",
         "--deny-permission-prompts",
         "--disable-notifications",
+        # Real Chrome connected over CDP still exposes navigator.webdriver and
+        # other automation tells to fingerprinting scripts (reCAPTCHA v3,
+        # Ashby's own bot check) by default. This is the one free mitigation;
+        # it does not need a vendor decision the way the proxy below does.
+        "--disable-blink-features=AutomationControlled",
     ]
+    if proxy_port:
+        cmd.append(f"--proxy-server=127.0.0.1:{proxy_port}")
     if headless:
         cmd.append("--headless=new")
 
@@ -328,6 +382,15 @@ def launch_chrome(worker_id: int, port: int | None = None,
     return proc
 
 
+def _stop_forwarder_for_worker(worker_id: int) -> None:
+    """Stop and forget this worker's local proxy forwarder, if any."""
+    with _chrome_lock:
+        stop = _worker_forwarder_stops.pop(worker_id, None)
+        _worker_proxies.pop(worker_id, None)
+    if stop:
+        stop()
+
+
 def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
     """Kill a worker's Chrome instance and remove it from tracking.
 
@@ -339,6 +402,7 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         _kill_process_tree(process.pid)
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
+    _stop_forwarder_for_worker(worker_id)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
 
 
@@ -350,11 +414,15 @@ def kill_all_chrome() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         _chrome_procs.clear()
+        worker_ids = list(_worker_forwarder_stops.keys())
 
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
         _kill_on_port(BASE_CDP_PORT + wid)
+
+    for wid in worker_ids:
+        _stop_forwarder_for_worker(wid)
 
     # Sweep base port in case of zombies
     _kill_on_port(BASE_CDP_PORT)
@@ -387,11 +455,15 @@ def cleanup_on_exit() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         _chrome_procs.clear()
+        worker_ids = list(_worker_forwarder_stops.keys())
 
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
         _kill_on_port(BASE_CDP_PORT + wid)
+
+    for wid in worker_ids:
+        _stop_forwarder_for_worker(wid)
 
     # Sweep base port for any orphan
     _kill_on_port(BASE_CDP_PORT)

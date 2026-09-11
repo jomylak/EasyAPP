@@ -160,6 +160,7 @@ def api_days() -> dict:
 def api_jobs(
     day: str | None = None,
     sort: str = queries.DEFAULT_SORT,
+    dir: str | None = None,
     page: int = 0,
     page_size: int = 30,
     min_fit: int | None = None,
@@ -212,7 +213,7 @@ def api_jobs(
             "tier_only": tier_only, "include_tier": include_tier,
             "location": location, "term": term,
         },
-        sort=sort, page=page, page_size=page_size,
+        sort=sort, direction=dir, page=page, page_size=page_size,
     )
 
 
@@ -258,6 +259,11 @@ def api_ats_stats() -> dict:
 @app.get("/api/company-limits")
 def api_company_limits() -> dict:
     return {"rows": queries.company_limit_breakdown()}
+
+
+@app.get("/api/failure-reasons")
+def api_failure_reasons() -> dict:
+    return {"rows": costs.failure_reasons()}
 
 
 @app.get("/api/resume")
@@ -395,6 +401,30 @@ def api_unqueue(payload: dict = Body(...)) -> dict:
              WHERE url IN ({placeholders}) AND apply_status = 'queued'
         """, [revert_status, *urls])
     return {"removed": cur.rowcount}
+
+
+@app.post("/api/report-ineligible")
+def api_report_ineligible(payload: dict = Body(...)) -> dict:
+    """A human learned this job (or the candidate generally, for this
+    company) is ineligible some way the pipeline has no visibility into --
+    e.g. a rejection email citing graduation date. Applies the same
+    company-wide sibling sweep as the automated grad_date_mismatch path (see
+    apply.ineligibility), so a manual report counts toward the same
+    2+-postings company pattern the live apply agent's own discoveries do.
+    """
+    from applypilot.apply.ineligibility import mark_ineligibility_and_sweep_company
+
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(400, "No job given")
+    note = (payload.get("note") or "").strip() or "Manually reported ineligible."
+
+    conn = get_connection()
+    row = conn.execute("SELECT url FROM jobs WHERE url = ?", (url,)).fetchone()
+    if not row:
+        raise HTTPException(404, "No such job")
+
+    return mark_ineligibility_and_sweep_company(url, note, conn=conn)
 
 
 # --- running ---------------------------------------------------------------
@@ -615,8 +645,27 @@ async def api_events() -> StreamingResponse:
 
 # --- the frontend ----------------------------------------------------------
 
+class _CacheAwareStaticFiles(StaticFiles):
+    """index.html must always be revalidated -- it's the one file whose name
+    never changes, so a browser tab left open (or a heuristic-freshness cache
+    with no explicit header to override) can keep serving a stale copy that
+    still points at yesterday's hashed JS/CSS filenames indefinitely, even
+    after a fresh deploy. Every other file under /assets/ carries a
+    content hash in its own name (Vite's build output), so those are safe to
+    cache hard -- a new build never reuses an old file's name.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path in ("index.html", "."):
+            response.headers["Cache-Control"] = "no-cache"
+        else:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 if (STATIC_DIR / "index.html").exists():
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+    app.mount("/", _CacheAwareStaticFiles(directory=STATIC_DIR, html=True), name="ui")
 else:
     @app.get("/")
     def _no_build() -> dict:

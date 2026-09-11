@@ -3,6 +3,7 @@ import { ApplicationsTable } from "@/components/ApplicationsTable"
 import { AtsBreakdown } from "@/components/AtsBreakdown"
 import { CompanyLimits } from "@/components/CompanyLimits"
 import { Donut } from "@/components/Donut"
+import { FailureBreakdown } from "@/components/FailureBreakdown"
 import { api } from "@/lib/api"
 import type { Stats } from "@/lib/types"
 import { useRunStream } from "@/lib/useRunStream"
@@ -130,7 +131,7 @@ export function DashboardTab() {
 
       {stats && (
         <div className="dash-grid">
-          <section className="day-panel">
+          <section className="day-panel dash-area-outcomes">
             <div className="dayhead">
               <span className="dayname">Outcomes</span>
             </div>
@@ -157,6 +158,7 @@ export function DashboardTab() {
               </div>
             </div>
           </section>
+          <FailureBreakdown />
           <AtsBreakdown />
           <CompanyLimits />
         </div>

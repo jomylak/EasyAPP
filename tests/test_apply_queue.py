@@ -192,6 +192,29 @@ def test_duplicate_row_is_failed_not_applied_to(db):
     assert err == "duplicate_of:https://a.example/1"
 
 
+def test_gap_window_duplicate_is_failed_not_applied_to(db):
+    """Two rows with identical company/title/description/location, neither
+    with duplicate_of set (the gap window: enrichment/scoring hasn't run
+    the backfill on either yet). One has already been applied to -- the
+    live recheck must fail the second rather than double-applying, but
+    only because a same-content sibling has *already been committed*, not
+    merely because it looks similar."""
+    _insert(db, "https://a.example/1", queue_position=0,
+            apply_status="applied",
+            company="TikTok", full_description="A" * 50, location="Remote")
+    _insert(db, "https://a.example/2", queue_position=1,
+            company="TikTok", full_description="A" * 50, location="Remote")
+
+    job = launcher.acquire_job(queue_batch="batch-1")
+
+    assert job is None, "the only queued row was the gap-window duplicate"
+    status, err = db.execute(
+        "SELECT apply_status, apply_error FROM jobs WHERE url = 'https://a.example/2'"
+    ).fetchone()
+    assert status == "failed"
+    assert err == "duplicate_of:https://a.example/1"
+
+
 def test_empty_batch_returns_none(db):
     assert launcher.acquire_job(queue_batch="batch-1") is None
 

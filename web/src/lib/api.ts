@@ -7,6 +7,7 @@ import type {
   EnvKeyName,
   EnvKeyStatus,
   Facets,
+  FailureReasonStat,
   JobDetail,
   JobsPage,
   QueueResponse,
@@ -40,6 +41,7 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
 export interface JobsQuery {
   day?: string
   sort?: string
+  dir?: string
   page?: number
   page_size?: number
   min_fit?: number | null
@@ -126,6 +128,14 @@ export const api = {
   atsStats: () => request<{ rows: AtsStat[] }>("/api/ats-stats"),
 
   companyLimits: () => request<{ rows: CompanyLimitStatus[] }>("/api/company-limits"),
+
+  failureReasons: () => request<{ rows: FailureReasonStat[] }>("/api/failure-reasons"),
+
+  reportIneligible: (url: string, note?: string) =>
+    request<{ job_marked: boolean; company: string | null; broad_employer: boolean | null; siblings_softened: number; siblings_disqualified: number }>(
+      "/api/report-ineligible",
+      { method: "POST", body: JSON.stringify({ url, note }) },
+    ),
 
   settings: () => request<Settings>("/api/settings"),
 

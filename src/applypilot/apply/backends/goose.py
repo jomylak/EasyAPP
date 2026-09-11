@@ -43,7 +43,7 @@ from pathlib import Path
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 from applypilot.ats import detect_ats
-from applypilot.apply.chrome import reset_worker_dir, _kill_process_tree
+from applypilot.apply.chrome import get_worker_proxy, reset_worker_dir, _kill_process_tree
 from applypilot.apply.dashboard import add_event, get_state, update_state
 from applypilot.scoring.router import resume_paths_for_job
 
@@ -164,6 +164,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        proxy_string=get_worker_proxy(worker_id),
     )
 
     cmd = _build_command(port, goose_model, goose_provider, settings)

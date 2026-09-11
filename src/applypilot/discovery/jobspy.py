@@ -16,6 +16,7 @@ from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db
+from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, normalize_location
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +157,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         site_label = f"{site_name}"
         if is_remote:
             location_str = f"{location_str} (Remote)" if location_str else "Remote"
+        location_str = normalize_location(location_str)
 
         strategy = "jobspy"
 
@@ -168,6 +170,11 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         # Extract apply URL if JobSpy provided it
         apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+
+        url = canonicalize_url(url)
+        if find_exact_text_duplicate(conn, title, description, location_str, text_column="description"):
+            existing += 1
+            continue
 
         try:
             conn.execute(

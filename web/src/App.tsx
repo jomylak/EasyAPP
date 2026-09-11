@@ -10,6 +10,27 @@ type Tab = "browse" | "dashboard" | "settings"
 
 type SelectionEntry = { url: string; tableId: string; posted: string | null }
 
+// Broadcast to every mounted job list (DayTable, AttentionPanel) that these
+// jobs just left Browse -- queued/applied/skipped, doesn't matter which,
+// since the backend already excludes all of those outcomes from a fresh
+// /api/jobs fetch (see web/queries.py's _filter_clauses). Without this, a
+// queued row stays visible and re-selectable in a table's own cached `rows`
+// state until an unrelated filter/day change forces a refetch.
+//
+// Broadcast to ALL mounted lists by url, not just the table a click came
+// from: the same job can appear in a day table AND an attention panel
+// simultaneously, and both need to drop it.
+//
+// Carries the same {url, tableId} shape as selectionOrder (not bare urls) so
+// BrowseTab can also decrement the originating day's own `total` badge --
+// see queueOrder, which already groups clicks by tableId for exactly this
+// reason. `token` exists because a bare array's identity isn't a reliable
+// "this changed" signal for a dependency array; a monotonically increasing
+// counter always is.
+export type RemovedEntry = { url: string; tableId: string }
+export type RemovedUrls = { entries: RemovedEntry[]; token: number }
+const EMPTY_REMOVED: RemovedUrls = { entries: [], token: 0 }
+
 // Selecting jobs in Browse is real work -- losing it to a page reload (a
 // pushed frontend update, an accidental refresh) has no upside, so the raw
 // click sequence is mirrored into localStorage and everything else
@@ -53,9 +74,15 @@ export default function App() {
   const [launchNote, setLaunchNote] = useState<string | null>(null)
   const [launchError, setLaunchError] = useState(false)
   const [dryRun, setDryRun] = useState(false)
+  const [removedUrls, setRemovedUrls] = useState<RemovedUrls>(EMPTY_REMOVED)
   // Whether an apply run is already going -- if so, Launch must not attempt
   // to spawn a second one (that's the /api/launch 409). See handleLaunch.
   const { live } = useRunStream()
+
+  function broadcastRemoved(entries: RemovedEntry[]) {
+    if (!entries.length) return
+    setRemovedUrls((prev) => ({ entries, token: prev.token + 1 }))
+  }
 
   useEffect(() => {
     try {
@@ -123,8 +150,18 @@ export default function App() {
     setLaunching(true)
     setLaunchNote(null)
     setLaunchError(false)
+    // Captured before queueOrder()/clearSelection() run: selectionOrder
+    // already carries {url, tableId} for exactly this reason.
+    const removedEntries: RemovedEntry[] = selectionOrder.map((e) => ({ url: e.url, tableId: e.tableId }))
     try {
       const queued = await api.queue(queueOrder())
+      // Safe to remove every url here, not just the "queued" subset: the
+      // endpoint only returns aggregate counts (queued/skipped), never a
+      // per-url outcome, but web/queries.py's Browse filter already excludes
+      // every possible outcome (queued, applied, in_progress, duplicate) --
+      // so a "skipped" row should never have been visible in Browse to begin
+      // with, and removing it now is a correctness fix, not a risk.
+      broadcastRemoved(removedEntries)
       if (queued.queued === 0) {
         setLaunchNote(
           `Nothing to launch -- all ${queued.skipped} selected job(s) were already applied, ` +
@@ -215,6 +252,7 @@ export default function App() {
           selected={selected}
           selectedTypes={selectedTypes}
           onToggleSelect={toggleSelect}
+          removedUrls={removedUrls}
         />
       )}
       {tab === "dashboard" && <DashboardTab />}

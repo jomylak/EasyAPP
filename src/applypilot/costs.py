@@ -148,6 +148,32 @@ def ats_stats(conn: sqlite3.Connection | None = None) -> list[dict]:
     return out
 
 
+def failure_reasons(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Count of failed apply attempts per canonical failure category, for the
+    dashboard's failure-reasons chart.
+
+    Grouped on `apply_error_category`, not raw `apply_error` -- see
+    apply.failure_taxonomy for why the raw string alone would fragment near-
+    duplicate reasons into separate bars.
+    """
+    from applypilot.apply.failure_taxonomy import FAILURE_LABELS
+
+    conn = conn or get_connection()
+    rows = conn.execute("""
+        SELECT apply_error_category AS category, COUNT(*) AS n
+        FROM jobs
+        WHERE apply_status = 'failed' AND apply_error_category IS NOT NULL
+        GROUP BY apply_error_category
+    """).fetchall()
+
+    out = [
+        {"category": r["category"], "label": FAILURE_LABELS.get(r["category"], r["category"]), "n": r["n"]}
+        for r in rows
+    ]
+    out.sort(key=lambda r: -r["n"])
+    return out
+
+
 def estimate_batch(urls: list[str], backend: str,
                    conn: sqlite3.Connection | None = None) -> dict:
     """Estimate what applying to these jobs will cost.

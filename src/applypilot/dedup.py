@@ -34,6 +34,23 @@ but a genuinely *different* location and no resolvable ATS id. That's the
 ambiguous case (a real per-office requisition vs. a re-crawl artifact can't
 be told apart from text alone) -- it's meant for the review tab, not an
 auto-decision either way.
+
+3. **After scoring** (`find_company_duplicate`, re-run from
+   scoring/scorer.py's per-row loop once `company` is known): the same
+   employer's posting can show up through more than one ATS tenant, or
+   through no resolvable ATS at all, so find_ats_duplicate's tenant-scoped
+   match never sees it. This closes that gap with the same conservative
+   philosophy as everything else here: normalized company AND similar
+   title AND similar full_description AND an EXACT location match are all
+   required -- location is deliberately not allowed to be fuzzy, since a
+   genuinely different office for the same role is a different req, not a
+   repost, and that's the one signal text similarity can't safely stand in
+   for. (A "same ATS job_id, different tenant" signal was considered and
+   rejected: tenant is derived from the ATS URL structure itself, so a
+   different tenant for the same employer essentially never happens --
+   in practice a different tenant means a different employer, which is
+   exactly the false-positive case find_ats_duplicate's own title check
+   guards against.)
 """
 
 import difflib
@@ -63,6 +80,13 @@ _MIN_TEXT_LEN = 30
 # scored 0.78-0.95, genuine different-posting pairs scored 0.26-0.67.
 _TITLE_SIMILARITY_THRESHOLD = 0.7
 
+# Stricter than the title threshold: full_description text is long and
+# specific enough that a coincidental 0.85+ match is vanishingly unlikely
+# to be a different posting, whereas two genuinely different titles for
+# the same underlying role can still legitimately fall under 0.85 on
+# description text alone -- title and description each need their own bar.
+_DESC_SIMILARITY_THRESHOLD = 0.85
+
 
 def canonicalize_url(url: str) -> str:
     """Strip known tracking params so campaign-tagged re-shares of the same
@@ -74,11 +98,29 @@ def canonicalize_url(url: str) -> str:
                         urlencode(kept), parts.fragment))
 
 
-def _titles_similar(a: str | None, b: str | None) -> bool:
+def normalize_location(location: str | None) -> str | None:
+    """Collapse '' and whitespace-only strings to None, so "no location
+    known" is stored the same way regardless of which ingestion path wrote
+    the row. Without this, dedup's `location IS ?` comparisons (NULL-safe,
+    but not ""-safe) silently fail to match a NULL-location row from one
+    source against an ""-location row from another for the same posting --
+    verified against production data: workday.py defaulted a missing
+    location to "" while jobspy.py defaulted the same case to None."""
+    if location is None:
+        return None
+    stripped = location.strip()
+    return stripped or None
+
+
+def _text_similar(a: str | None, b: str | None, threshold: float) -> bool:
     if not a or not b:
         return False
     ratio = difflib.SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
-    return ratio >= _TITLE_SIMILARITY_THRESHOLD
+    return ratio >= threshold
+
+
+def _titles_similar(a: str | None, b: str | None) -> bool:
+    return _text_similar(a, b, _TITLE_SIMILARITY_THRESHOLD)
 
 
 def find_exact_text_duplicate(
@@ -128,6 +170,40 @@ def find_ats_duplicate(
     return None, ats_job_id
 
 
+def find_company_duplicate(
+    conn: sqlite3.Connection, company: str | None, title: str | None,
+    text: str | None, location: str | None, *,
+    text_column: str = "full_description", exclude_url: str | None = None,
+) -> str | None:
+    """URL of an existing row at the same normalized company whose title,
+    description, and location are all close enough to trust as the same
+    req reposted/relisted under a different ATS tenant (or no ATS at all)
+    -- the case find_ats_duplicate can't catch because it scopes its match
+    to one (ats, tenant) pair.
+
+    All three of company + title + description must agree, and location
+    must match exactly (same NULL-safe comparison as
+    find_exact_text_duplicate). Location is deliberately not fuzzy: per
+    this module's docstring, two postings at the same company with a
+    genuinely different location are a different req, not a repost, and
+    that's the one signal text similarity can't safely stand in for.
+    """
+    normalized = normalize_company(company) if company else None
+    if not normalized or not title or not text or len(text) < _MIN_TEXT_LEN:
+        return None
+    rows = conn.execute(
+        f"SELECT url, title, {text_column} AS text FROM jobs "
+        f"WHERE company_normalized = ? AND url != ? AND location IS ? "
+        f"ORDER BY discovered_at ASC",
+        (normalized, exclude_url or "", location),
+    ).fetchall()
+    for row in rows:
+        if (_text_similar(title, row["title"], _TITLE_SIMILARITY_THRESHOLD)
+                and _text_similar(text, row["text"], _DESC_SIMILARITY_THRESHOLD)):
+            return row["url"]
+    return None
+
+
 def check_duplicate(conn: sqlite3.Connection, url: str) -> dict:
     """Run checkpoint 2 for one already-enriched row and persist the result.
 
@@ -138,7 +214,7 @@ def check_duplicate(conn: sqlite3.Connection, url: str) -> dict:
     Returns {"duplicate_of": url|None, "reason": str|None, "ats_job_id": str|None}.
     """
     row = conn.execute(
-        "SELECT title, full_description, location, application_url, ats "
+        "SELECT title, full_description, location, application_url, ats, company "
         "FROM jobs WHERE url = ?", (url,),
     ).fetchone()
     if row is None:
@@ -156,6 +232,14 @@ def check_duplicate(conn: sqlite3.Connection, url: str) -> dict:
         )
         if canonical:
             reason = "exact_text"
+
+    if not canonical:
+        canonical = find_company_duplicate(
+            conn, row["company"], row["title"], row["full_description"], row["location"],
+            text_column="full_description", exclude_url=url,
+        )
+        if canonical:
+            reason = "company_repost"
 
     conn.execute(
         "UPDATE jobs SET ats_job_id = ?, duplicate_of = ?, duplicate_reason = ? WHERE url = ?",

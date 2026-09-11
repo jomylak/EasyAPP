@@ -1,8 +1,18 @@
 import { getCoreRowModel, useReactTable } from "@tanstack/react-table"
-import { useEffect, useRef, useState } from "react"
-import { COL_COUNT, columns, HEADERS, HEADER_HEIGHT, ROW_HEIGHT, RowPair, SORT_LABEL } from "@/components/DayTable"
+import { useEffect, useMemo, useRef, useState } from "react"
+import type { RemovedUrls } from "@/App"
+import {
+  ClusteredTableBody,
+  COL_COUNT,
+  columns,
+  HEADER_HEIGHT,
+  ROW_HEIGHT,
+  TableHeadRow,
+  useTableSort,
+} from "@/components/DayTable"
 import { api } from "@/lib/api"
-import type { GlobalFilters, JobRow, SortKey } from "@/lib/types"
+import { clusterRows } from "@/lib/cluster"
+import type { GlobalFilters, JobDetail, JobRow, SortKey } from "@/lib/types"
 
 const CHUNK = 40
 const PREFETCH_MARGIN = 300
@@ -33,6 +43,7 @@ interface Props {
   // each panel owning its own boxHeight.
   boxHeight: number
   onBoxHeightChange: (h: number) => void
+  removedUrls: RemovedUrls
 }
 
 /**
@@ -58,8 +69,9 @@ export function AttentionPanel({
   onToggleSelect,
   boxHeight,
   onBoxHeightChange,
+  removedUrls,
 }: Props) {
-  const [sort, setSort] = useState<SortKey>(defaultSort)
+  const { sort, dir, onHeaderClick } = useTableSort(defaultSort)
   const [rows, setRows] = useState<JobRow[]>([])
   const [total, setTotal] = useState(0)
   const [nextPage, setNextPage] = useState(0)
@@ -70,10 +82,20 @@ export function AttentionPanel({
   const fetchingRef = useRef(false)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [openRows, setOpenRows] = useState<Set<string>>(new Set())
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set())
+  function toggleCluster(key: string) {
+    setExpandedClusters((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   function buildQuery(pageIndex: number) {
     return {
       sort,
+      dir,
       page: pageIndex,
       page_size: CHUNK,
       min_prestige: minPrestige,
@@ -129,9 +151,27 @@ export function AttentionPanel({
     setTotal(0)
     setNextPage(0)
     setOpenRows(new Set())
+    setExpandedClusters(new Set())
     loadPage(id, 0, true)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sort, minPrestige, minPay, jobType, postedWithinDays, globalFilters])
+  }, [sort, dir, minPrestige, minPay, jobType, postedWithinDays, globalFilters])
+
+  // Optimistic removal -- same fix and same reasoning as DayTable's. A job
+  // can be visible in both a day table and an attention panel at once, so
+  // this panel needs its own copy of the same effect, not a shared one --
+  // each owns its own `rows`/`total` state independently.
+  useEffect(() => {
+    if (!removedUrls.entries.length) return
+    const gone = new Set(removedUrls.entries.map((e) => e.url))
+    setRows((prev) => {
+      const next = prev.filter((r) => !gone.has(r.url))
+      if (next.length !== prev.length) {
+        setTotal((t) => Math.max(0, t - (prev.length - next.length)))
+      }
+      return next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [removedUrls.token])
 
   function maybeLoadMore() {
     if (fetchingRef.current) return
@@ -159,6 +199,32 @@ export function AttentionPanel({
   })
 
   const tableRows = table.getRowModel().rows
+  const rowByUrl = useMemo(
+    () => new Map(tableRows.map((row) => [row.original.url, row])),
+    [tableRows],
+  )
+  const clusteredEntries = useMemo(() => clusterRows(rows), [rows])
+
+  // Same staleness fix as DayTable.patchRow -- see JobExpansion's
+  // onDetailLoaded doc comment for why the list and detail fetches can
+  // disagree on pay/location.
+  function patchRow(url: string, detail: JobDetail) {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.url === url
+          ? {
+              ...r,
+              location: detail.location ?? r.location,
+              pay_text: detail.pay_text ?? r.pay_text,
+              salary: detail.salary ?? r.salary,
+              pay_min_hourly: detail.pay_min_hourly ?? r.pay_min_hourly,
+              pay_max_hourly: detail.pay_max_hourly ?? r.pay_max_hourly,
+              pay_below_floor: detail.pay_below_floor ?? r.pay_below_floor,
+            }
+          : r,
+      ),
+    )
+  }
 
   function toggleOpen(url: string) {
     setOpenRows((prev) => {
@@ -217,21 +283,7 @@ export function AttentionPanel({
       <div className="tablewrap" style={{ maxHeight: boxHeight }} ref={wrapRef} onScroll={maybeLoadMore}>
         <table>
           <thead>
-            <tr>
-              <th className="cbcell" />
-              <th className="col-idx num">#</th>
-              {HEADERS.map((h) => (
-                <th
-                  key={h.id}
-                  className={["col-" + h.id, h.numeric ? "num" : "", h.sortKey ? "sortable" : ""].join(" ").trim()}
-                  title={h.sortKey ? `Sort by ${SORT_LABEL[h.sortKey]}` : undefined}
-                  onClick={h.sortKey ? () => setSort(h.sortKey as SortKey) : undefined}
-                >
-                  {h.label}
-                  {h.sortKey === sort ? " ▾" : ""}
-                </th>
-              ))}
-            </tr>
+            <TableHeadRow sort={sort} dir={dir} onHeaderClick={onHeaderClick} />
           </thead>
           <tbody>
             {loadError && (
@@ -248,21 +300,18 @@ export function AttentionPanel({
                 </td>
               </tr>
             )}
-            {tableRows.map((row) => {
-              const r = row.original
-              return (
-                <RowPair
-                  key={r.url}
-                  row={row}
-                  original={r}
-                  isSel={selected.has(r.url)}
-                  isOpen={openRows.has(r.url)}
-                  tableId={title}
-                  onToggleSelect={onToggleSelect}
-                  onToggleOpen={toggleOpen}
-                />
-              )
-            })}
+            <ClusteredTableBody
+              entries={clusteredEntries}
+              rowByUrl={rowByUrl}
+              selected={selected}
+              tableId={title}
+              openRows={openRows}
+              onToggleSelect={onToggleSelect}
+              onToggleOpen={toggleOpen}
+              onDetailLoaded={patchRow}
+              expandedClusters={expandedClusters}
+              onToggleCluster={toggleCluster}
+            />
           </tbody>
         </table>
       </div>

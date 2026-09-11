@@ -5,15 +5,19 @@ import {
   useReactTable,
   type Row,
 } from "@tanstack/react-table"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState } from "react"
+import type { RemovedUrls } from "@/App"
 import { JobExpansion } from "@/components/JobExpansion"
 import { NumericFilter } from "@/components/NumericFilter"
 import { api } from "@/lib/api"
-import type { DayBucket, DayFilters, GlobalFilters, JobRow, SortKey } from "@/lib/types"
+import { clusterRows, isCluster, type ClusterEntry } from "@/lib/cluster"
+import type { DayBucket, DayFilters, GlobalFilters, JobDetail, JobRow, SortDir, SortKey } from "@/lib/types"
 import { EMPTY_DAY_FILTERS } from "@/lib/types"
 import { fitColor, formatDayLabel, formatDaysAgo, formatPay, preColor, useDebounced } from "@/lib/utils"
 
-export const ROW_HEIGHT = 34
+// Matches tbody td's height in index.css -- bumped from 34 for the stacked
+// Pay/Location cell (two lines need more room than one).
+export const ROW_HEIGHT = 40
 export const HEADER_HEIGHT = 34
 // How many rows each infinite-scroll fetch pulls in. Independent of the box's
 // visible height, which the user controls with the resize grip.
@@ -32,6 +36,55 @@ export const SORT_LABEL: Record<SortKey, string> = {
   title: "Title",
   posted: "Posted",
   pay: "Pay",
+  location: "Location",
+}
+
+// Direction a column starts in the first time it's clicked -- text columns
+// read naturally A-first, every score/date column reads naturally
+// highest/most-recent-first. Mirrors queries.py's `_SORT_COLUMNS`.
+const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = {
+  top: "desc",
+  prestige: "desc",
+  fit: "desc",
+  desirability: "desc",
+  company: "asc",
+  title: "asc",
+  posted: "desc",
+  pay: "desc",
+  location: "asc",
+}
+
+function defaultDirFor(key: SortKey): SortDir {
+  return SORT_DEFAULT_DIR[key] ?? "desc"
+}
+
+// `useState` pair shared by every job table (DayTable, AttentionPanel) so a
+// QOL change to how sorting/direction-toggling works only has to happen once.
+// Clicking the already-active column flips its direction; clicking a new one
+// switches to it at that column's natural starting direction.
+export function useTableSort(defaultKey: SortKey) {
+  const [sort, setSortKey] = useState<SortKey>(defaultKey)
+  const [dir, setDir] = useState<SortDir>(defaultDirFor(defaultKey))
+
+  function setSort(key: SortKey, direction?: SortDir) {
+    setSortKey(key)
+    setDir(direction ?? defaultDirFor(key))
+  }
+
+  function onHeaderClick(key: SortKey) {
+    if (key === sort) setDir((d) => (d === "asc" ? "desc" : "asc"))
+    else setSort(key)
+  }
+
+  return { sort, dir, setSort, onHeaderClick }
+}
+
+// A header can be a single sortable column (Posted, Pay) or two independently
+// sortable halves sharing one column of screen space (Pay / Location) --
+// see HEADERS' "paylocation" entry.
+interface HeaderPart {
+  label: string
+  sortKey: SortKey
 }
 
 interface HeaderSpec {
@@ -40,18 +93,83 @@ interface HeaderSpec {
   sortKey?: SortKey
   numeric?: boolean
   className?: string
+  parts?: HeaderPart[]
 }
 
 export const HEADERS: HeaderSpec[] = [
   { id: "company", label: "Company", sortKey: "company" },
   { id: "title", label: "Title", sortKey: "title" },
-  { id: "location", label: "Location" },
+  {
+    id: "paylocation",
+    label: "Pay / Location",
+    parts: [
+      { label: "Pay", sortKey: "pay" },
+      { label: "Location", sortKey: "location" },
+    ],
+  },
   { id: "posted", label: "Posted", sortKey: "posted", numeric: true },
-  { id: "pay", label: "Pay", sortKey: "pay" },
   { id: "prestige", label: "Pres", sortKey: "prestige", numeric: true },
   { id: "fit", label: "Fit", sortKey: "fit", numeric: true },
   { id: "desirability", label: "Des", sortKey: "desirability", numeric: true },
 ]
+
+/**
+ * The `<tr>` of column headers, shared by every job table so sort/direction
+ * behavior can't drift between DayTable and AttentionPanel. `sort`/`dir`
+ * come from `useTableSort`.
+ */
+export function TableHeadRow({
+  sort,
+  dir,
+  onHeaderClick,
+}: {
+  sort: SortKey
+  dir: SortDir
+  onHeaderClick: (key: SortKey) => void
+}) {
+  function arrow(key: SortKey) {
+    return key === sort ? (dir === "asc" ? " ▴" : " ▾") : ""
+  }
+  function titleFor(key: SortKey) {
+    return `Sort by ${SORT_LABEL[key]}${key === sort ? " (click again to flip direction)" : ""}`
+  }
+  return (
+    <tr>
+      <th className="cbcell" />
+      <th className="col-idx num">#</th>
+      {HEADERS.map((h) => (
+        <th
+          key={h.id}
+          className={["col-" + h.id, h.numeric ? "num" : "", h.sortKey || h.parts ? "sortable" : ""].join(" ").trim()}
+        >
+          {h.parts ? (
+            h.parts.map((p, i) => (
+              <span key={p.sortKey}>
+                {i > 0 ? " / " : ""}
+                <span
+                  className="hpart"
+                  title={titleFor(p.sortKey)}
+                  onClick={() => onHeaderClick(p.sortKey)}
+                >
+                  {p.label}
+                  {arrow(p.sortKey)}
+                </span>
+              </span>
+            ))
+          ) : (
+            <span
+              title={h.sortKey ? titleFor(h.sortKey) : undefined}
+              onClick={h.sortKey ? () => onHeaderClick(h.sortKey as SortKey) : undefined}
+            >
+              {h.label}
+              {h.sortKey ? arrow(h.sortKey) : ""}
+            </span>
+          )}
+        </th>
+      ))}
+    </tr>
+  )
+}
 
 // +1 for the checkbox column, +1 for the index column.
 export const COL_COUNT = HEADERS.length + 2
@@ -83,9 +201,20 @@ export const columns = [
     id: "title",
     cell: (info) => info.getValue() || "—",
   }),
-  columnHelper.accessor("location", {
-    id: "location",
-    cell: (info) => info.getValue() || "—",
+  columnHelper.display({
+    // One column, two stacked lines -- see the "make pay/location easier to
+    // see" ask. They're rendered together because they're read together:
+    // "is this worth it" is a pay-and-place question, not two separate ones.
+    id: "paylocation",
+    cell: (info) => {
+      const r = info.row.original
+      return (
+        <div className="paylocation">
+          <div className="pl-pay">{formatPay(r)}</div>
+          <div className="pl-loc">{r.location || "—"}</div>
+        </div>
+      )
+    },
   }),
   columnHelper.accessor("posted", {
     id: "posted",
@@ -93,10 +222,6 @@ export const columns = [
       const v = info.getValue()
       return <span title={v ? new Date(v).toLocaleString() : undefined}>{formatDaysAgo(v)}</span>
     },
-  }),
-  columnHelper.display({
-    id: "pay",
-    cell: (info) => formatPay(info.row.original),
   }),
   columnHelper.accessor("company_prestige", {
     id: "prestige",
@@ -121,6 +246,7 @@ interface Props {
   globalFilters: GlobalFilters
   selected: Set<string>
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
+  removedUrls: RemovedUrls
 }
 
 interface Preset {
@@ -139,11 +265,14 @@ export function DayTable({
   globalFilters,
   selected,
   onToggleSelect,
+  removedUrls,
 }: Props) {
-  const [sort, setSort] = useState<SortKey>("prestige")
+  // Default sort is by posting date, newest first -- see queries.DEFAULT_SORT.
+  const { sort, dir, setSort, onHeaderClick } = useTableSort("posted")
   const [filters, setFilters] = useState<DayFilters>(EMPTY_DAY_FILTERS)
   const [activeChip, setActiveChip] = useState<string | null>(null)
   const [openRows, setOpenRows] = useState<Set<string>>(new Set())
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set())
 
   // Rows accumulate across scroll-triggered fetches -- this is one flat list
   // for the whole day, not a single page. `nextPage` is the next offset to
@@ -203,6 +332,7 @@ export function DayTable({
     return {
       day: day.day,
       sort,
+      dir,
       page: pageIndex,
       page_size: CHUNK,
       min_fit: debouncedFilters.min_fit,
@@ -264,12 +394,31 @@ export function DayTable({
     setTotal(day.total)
     setNextPage(0)
     setOpenRows(new Set())
+    setExpandedClusters(new Set())
     loadPage(id, 0, true)
     // activeChip is a dep because the Big Tech preset changes the *scope*
     // (tier_only) without touching filters or sort -- going to it from "All"
     // would otherwise leave every dep identical and never refetch.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [day.day, sort, debouncedFilters, globalFilters, activeChip])
+  }, [day.day, sort, dir, debouncedFilters, globalFilters, activeChip])
+
+  // Optimistic removal: a job just queued/applied elsewhere must disappear
+  // from this table immediately, not wait for an unrelated refetch (see
+  // App.tsx's RemovedUrls doc comment). No selection cleanup needed here --
+  // App.tsx's clearSelection() already runs as part of the launch flow that
+  // triggers this.
+  useEffect(() => {
+    if (!removedUrls.entries.length) return
+    const gone = new Set(removedUrls.entries.map((e) => e.url))
+    setRows((prev) => {
+      const next = prev.filter((r) => !gone.has(r.url))
+      if (next.length !== prev.length) {
+        setTotal((t) => Math.max(0, t - (prev.length - next.length)))
+      }
+      return next
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [removedUrls.token])
 
   // Infinite scroll: fetch the next chunk when the user nears the bottom of
   // this day's own scroll box, or when the box is taller than the content
@@ -300,6 +449,22 @@ export function DayTable({
   })
 
   const tableRows = table.getRowModel().rows
+  const rowByUrl = useMemo(
+    () => new Map(tableRows.map((row) => [row.original.url, row])),
+    [tableRows],
+  )
+  // Clustered from `rows` (not tableRows) since it's the same array in the
+  // same order react-table built its rows from -- manualSorting is on, so
+  // there's no re-sort happening inside the table to diverge from.
+  const clusteredEntries = useMemo(() => clusterRows(rows), [rows])
+  function toggleCluster(key: string) {
+    setExpandedClusters((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   function applyPreset(id: string) {
     const preset = presets[id]
@@ -308,6 +473,27 @@ export function DayTable({
     setFilters(preset.filters)
     setSort(preset.sort)
     setOpenRows(new Set())
+  }
+
+  // Patches a loaded row in place with any fields the detail fetch (which
+  // reads live from the DB) came back richer on than the list fetch did --
+  // see JobExpansion's onDetailLoaded doc comment for why they can diverge.
+  function patchRow(url: string, detail: JobDetail) {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.url === url
+          ? {
+              ...r,
+              location: detail.location ?? r.location,
+              pay_text: detail.pay_text ?? r.pay_text,
+              salary: detail.salary ?? r.salary,
+              pay_min_hourly: detail.pay_min_hourly ?? r.pay_min_hourly,
+              pay_max_hourly: detail.pay_max_hourly ?? r.pay_max_hourly,
+              pay_below_floor: detail.pay_below_floor ?? r.pay_below_floor,
+            }
+          : r,
+      ),
+    )
   }
 
   function toggleOpen(url: string) {
@@ -437,21 +623,7 @@ export function DayTable({
       <div className="tablewrap" style={{ maxHeight: boxHeight }} ref={wrapRef} onScroll={maybeLoadMore}>
         <table>
           <thead>
-            <tr>
-              <th className="cbcell" />
-              <th className="col-idx num">#</th>
-              {HEADERS.map((h) => (
-                <th
-                  key={h.id}
-                  className={["col-" + h.id, h.numeric ? "num" : "", h.sortKey ? "sortable" : ""].join(" ").trim()}
-                  title={h.sortKey ? `Sort by ${SORT_LABEL[h.sortKey]}` : undefined}
-                  onClick={h.sortKey ? () => setSort(h.sortKey as SortKey) : undefined}
-                >
-                  {h.label}
-                  {h.sortKey === sort ? " ▾" : ""}
-                </th>
-              ))}
-            </tr>
+            <TableHeadRow sort={sort} dir={dir} onHeaderClick={onHeaderClick} />
           </thead>
           <tbody>
             {loadError && (
@@ -468,23 +640,18 @@ export function DayTable({
                 </td>
               </tr>
             )}
-            {tableRows.map((row) => {
-              const r = row.original
-              const isSel = selected.has(r.url)
-              const isOpen = openRows.has(r.url)
-              return (
-                <RowPair
-                  key={r.url}
-                  row={row}
-                  original={r}
-                  isSel={isSel}
-                  isOpen={isOpen}
-                  tableId={day.day}
-                  onToggleSelect={onToggleSelect}
-                  onToggleOpen={toggleOpen}
-                />
-              )
-            })}
+            <ClusteredTableBody
+              entries={clusteredEntries}
+              rowByUrl={rowByUrl}
+              selected={selected}
+              tableId={day.day}
+              openRows={openRows}
+              onToggleSelect={onToggleSelect}
+              onToggleOpen={toggleOpen}
+              onDetailLoaded={patchRow}
+              expandedClusters={expandedClusters}
+              onToggleCluster={toggleCluster}
+            />
           </tbody>
         </table>
       </div>
@@ -509,6 +676,7 @@ export interface RowPairProps {
   tableId: string
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   onToggleOpen: (url: string) => void
+  onDetailLoaded?: (url: string, detail: JobDetail) => void
 }
 
 /**
@@ -555,7 +723,7 @@ function TerminalBadge({ row }: { row: JobRow }) {
   return null
 }
 
-export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen }: RowPairProps) {
+export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen, onDetailLoaded }: RowPairProps) {
   const cellsById = new Map(row.getVisibleCells().map((c) => [c.column.id, c]))
   return (
     <>
@@ -582,13 +750,12 @@ export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect,
           <TerminalBadge row={original} />
           {flexRender(cellsById.get("title")!.column.columnDef.cell, cellsById.get("title")!.getContext())}
         </td>
-        <td className="loc">
-          {flexRender(cellsById.get("location")!.column.columnDef.cell, cellsById.get("location")!.getContext())}
+        <td className="payloc">
+          {flexRender(cellsById.get("paylocation")!.column.columnDef.cell, cellsById.get("paylocation")!.getContext())}
         </td>
         <td className="num posted">
           {flexRender(cellsById.get("posted")!.column.columnDef.cell, cellsById.get("posted")!.getContext())}
         </td>
-        <td className="pay">{flexRender(cellsById.get("pay")!.column.columnDef.cell, cellsById.get("pay")!.getContext())}</td>
         <td className="num" style={{ color: preColor(original.company_prestige) }}>
           {flexRender(cellsById.get("prestige")!.column.columnDef.cell, cellsById.get("prestige")!.getContext())}
         </td>
@@ -603,11 +770,118 @@ export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect,
         <td colSpan={COL_COUNT}>
           <div className="slide">
             <div>
-              <JobExpansion row={original} open={isOpen} />
+              <JobExpansion row={original} open={isOpen} onDetailLoaded={onDetailLoaded} />
             </div>
           </div>
         </td>
       </tr>
+    </>
+  )
+}
+
+export interface ClusteredTableBodyProps {
+  entries: ClusterEntry[]
+  rowByUrl: Map<string, Row<JobRow>>
+  selected: Set<string>
+  tableId: string
+  openRows: Set<string>
+  onToggleSelect: RowPairProps["onToggleSelect"]
+  onToggleOpen: (url: string) => void
+  onDetailLoaded?: (url: string, detail: JobDetail) => void
+  expandedClusters: Set<string>
+  onToggleCluster: (key: string) => void
+}
+
+/**
+ * Renders `entries` (the output of cluster.ts's clusterRows) as table rows,
+ * shared by DayTable and AttentionPanel so the summary-row/expand mechanic
+ * can't drift between them. A plain JobRow entry renders through the exact
+ * same RowPair every ungrouped row already used -- clustering only changes
+ * what's rendered, never how a row itself behaves, so every row inside an
+ * expanded cluster stays individually selectable/queueable/expandable.
+ */
+export function ClusteredTableBody({
+  entries,
+  rowByUrl,
+  selected,
+  tableId,
+  openRows,
+  onToggleSelect,
+  onToggleOpen,
+  onDetailLoaded,
+  expandedClusters,
+  onToggleCluster,
+}: ClusteredTableBodyProps) {
+  return (
+    <>
+      {entries.map((entry) => {
+        if (isCluster(entry)) {
+          const expanded = expandedClusters.has(entry.key)
+          return (
+            <Fragment key={entry.key}>
+              <tr className="row cluster-row" onClick={() => onToggleCluster(entry.key)}>
+                <td className="cbcell" />
+                <td className="idx" />
+                <td className="co" title={entry.company ?? undefined}>{entry.company ?? "—"}</td>
+                <td className="ti cluster-title" title={entry.titleLabel}>
+                  <span className="cluster-arrow">{expanded ? "▾" : "▸"}</span>
+                  {entry.titleLabel}
+                </td>
+                <td className="payloc">
+                  <span className="cluster-count">{entry.rows.length} postings</span>
+                </td>
+                <td className="num posted">
+                  <span title={entry.latestPosted ? new Date(entry.latestPosted).toLocaleString() : undefined}>
+                    {formatDaysAgo(entry.latestPosted)}
+                  </span>
+                </td>
+                <td className="num" style={{ color: preColor(entry.avgPrestige) }}>
+                  {entry.avgPrestige === null ? "—" : entry.avgPrestige.toFixed(1)}
+                </td>
+                <td className="num" style={{ color: fitColor(entry.avgFit) }}>
+                  {entry.avgFit === null ? "—" : entry.avgFit.toFixed(1)}
+                </td>
+                <td className="num">
+                  {entry.avgDesirability === null ? "—" : entry.avgDesirability.toFixed(1)}
+                </td>
+              </tr>
+              {expanded &&
+                entry.rows.map((r) => {
+                  const row = rowByUrl.get(r.url)
+                  if (!row) return null
+                  return (
+                    <RowPair
+                      key={r.url}
+                      row={row}
+                      original={r}
+                      isSel={selected.has(r.url)}
+                      isOpen={openRows.has(r.url)}
+                      tableId={tableId}
+                      onToggleSelect={onToggleSelect}
+                      onToggleOpen={onToggleOpen}
+                      onDetailLoaded={onDetailLoaded}
+                    />
+                  )
+                })}
+            </Fragment>
+          )
+        }
+        const row = rowByUrl.get(entry.url)
+        if (!row) return null
+        return (
+          <RowPair
+            key={entry.url}
+            row={row}
+            original={entry}
+            isSel={selected.has(entry.url)}
+            isOpen={openRows.has(entry.url)}
+            tableId={tableId}
+            onToggleSelect={onToggleSelect}
+            onToggleOpen={onToggleOpen}
+            onDetailLoaded={onDetailLoaded}
+          />
+        )
+      })}
     </>
   )
 }

@@ -108,7 +108,14 @@ export function daysAgo(posted: string | null | undefined): number | null {
 export function formatDaysAgo(posted: string | null | undefined): string {
   const d = daysAgo(posted)
   if (d === null) return "—"
-  if (d === 0) return "today"
+  if (d === 0) {
+    // Same calendar bucket as "today" -- but "today" alone doesn't distinguish
+    // a job posted 20 minutes ago from one posted 20 hours ago, so show hours.
+    const then = new Date(posted as string).getTime()
+    const hours = Math.floor((Date.now() - then) / 3_600_000)
+    if (hours <= 0) return "<1h"
+    return `${hours}h`
+  }
   if (d === 1) return "1d"
   return `${d}d`
 }

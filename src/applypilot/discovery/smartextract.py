@@ -31,6 +31,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from applypilot import config
 from applypilot.config import CONFIG_DIR
 from applypilot.database import init_db, get_stats, get_connection
+from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, normalize_location
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -216,12 +217,25 @@ def _store_jobs_filtered(
         if row_job_type == "internship" and title_suggests_new_grad(job.get("title")):
             row_job_type = "new_grad"
         normalized_posted = _normalize_posted_date(job.get("posted_date"))
+
+        url = canonicalize_url(url)
+        location = normalize_location(job.get("location"))
+
+        # Content-match check first: this is what catches Jobright reissuing
+        # a fresh internal job id for the same posting on re-crawl (same
+        # title/description/location, a genuinely different URL) -- the
+        # IntegrityError branch below only catches a literal same-URL repost,
+        # a different case (see its comment).
+        if find_exact_text_duplicate(conn, job.get("title"), job.get("description"), location):
+            existing += 1
+            continue
+
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date, airtable_record_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now, row_job_type,
+                 location, site, strategy, now, row_job_type,
                  normalized_posted,
                  job.get("airtable_record_id")),
             )

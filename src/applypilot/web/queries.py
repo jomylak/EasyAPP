@@ -39,26 +39,49 @@ _ROW_COLUMNS = f"""
 # Sortable columns, mapped to SQL. A whitelist rather than interpolation --
 # the sort key arrives from a query string.
 # Big tech first, then desirability, with fit demoted to a pure tiebreaker.
-# This is the default the candidate actually browses by: skills fit was
-# previously the dominant term and it buried the postings they most wanted
-# (Meta internships average fit 3.4, Anthropic new-grad 2.0, both at
-# prestige 10, and neither had ever been applied to).
+# "top" is the tier-boosted preset sort (used by the Big Tech/prestige/fit
+# chips), not a clickable column header, so it has no user-facing direction.
 _TIER_RANK = ("CASE company_tier WHEN 'tier1' THEN 2 "
               "WHEN 'adjacent' THEN 1 ELSE 0 END DESC")
+_TOP_ORDER = f"{_TIER_RANK}, desirability_score DESC, fit_score DESC"
 
-SORTS: dict[str, str] = {
-    "top": f"{_TIER_RANK}, desirability_score DESC, fit_score DESC",
-    "prestige": "company_prestige DESC, fit_score DESC",
-    "fit": "fit_score DESC, desirability_score DESC",
-    "desirability": "desirability_score DESC, fit_score DESC",
-    "company": "company COLLATE NOCASE ASC",
-    "title": "title COLLATE NOCASE ASC",
-    "posted": "COALESCE(posted_date, discovered_at) DESC",
+# Each clickable column: its own SQL expression, a fixed tiebreaker (applied
+# after the user's chosen direction, always in its own preferred direction so
+# ties don't reshuffle when the primary column flips), and the direction it
+# defaults to the first time a column is clicked.
+_SORT_COLUMNS: dict[str, dict] = {
+    "prestige": {"expr": "company_prestige", "tiebreak": "fit_score DESC", "default_dir": "desc"},
+    "fit": {"expr": "fit_score", "tiebreak": "desirability_score DESC", "default_dir": "desc"},
+    "desirability": {"expr": "desirability_score", "tiebreak": "fit_score DESC", "default_dir": "desc"},
+    "company": {"expr": "company COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
+    "title": {"expr": "title COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
+    "location": {"expr": "location COLLATE NOCASE", "tiebreak": None, "default_dir": "asc", "nulls": "LAST"},
+    "posted": {"expr": "COALESCE(posted_date, discovered_at)", "tiebreak": None, "default_dir": "desc"},
     # Never sort on the `salary` text: it compares "$9" against "$110500"
-    # lexically and puts the nine first.
-    "pay": "pay_max_hourly DESC NULLS LAST",
+    # lexically and puts the nine first. NULLS LAST regardless of direction --
+    # an unstated pay should never sort to the top just because the user
+    # flipped to ascending.
+    "pay": {"expr": "pay_max_hourly", "tiebreak": None, "default_dir": "desc", "nulls": "LAST"},
 }
-DEFAULT_SORT = "top"
+
+# Kept for callers (e.g. facets()) that just want the set of valid sort keys.
+SORTS: dict[str, str] = {"top": _TOP_ORDER, **{k: v["expr"] for k, v in _SORT_COLUMNS.items()}}
+DEFAULT_SORT = "posted"
+DEFAULT_DIR = "desc"
+
+
+def _order_clause(sort: str, direction: str | None) -> tuple[str, str]:
+    """SQL ORDER BY expression plus the (possibly defaulted) direction used."""
+    if sort not in _SORT_COLUMNS:
+        return _TOP_ORDER, "desc"
+    col = _SORT_COLUMNS[sort]
+    dir_ = direction if direction in ("asc", "desc") else col["default_dir"]
+    order = f"{col['expr']} {'ASC' if dir_ == 'asc' else 'DESC'}"
+    if col.get("nulls"):
+        order += f" NULLS {col['nulls']}"
+    if col.get("tiebreak"):
+        order += f", {col['tiebreak']}"
+    return order, dir_
 
 
 def _filter_clauses(f: dict) -> tuple[str, list]:
@@ -201,6 +224,15 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     # from its canonical row, even though nothing downstream re-checks
     # duplicate_of once a human, rather than the ranker, picked the job.
     clauses.append("duplicate_of IS NULL")
+    # A job with no scraped description can never be scored (scoring requires
+    # full_description IS NOT NULL -- see scorer.py's pending_score gate) and
+    # has nothing worth reviewing yet. Whether it's still queued for enrichment
+    # (detail_scraped_at IS NULL) or permanently failed after 3 attempts
+    # (detail_scraped_at set, detail_error set, full_description never
+    # filled), Browse should show neither -- both read as noise, not a real
+    # posting. `applypilot status`'s Pending enrichment / Enrichment errors
+    # counters are the right place to monitor these, not this table.
+    clauses.append("full_description IS NOT NULL")
     if f.get("posted_within_days") is not None:
         # Matches the expression `idx_jobs_day` is built on byte-for-byte, so
         # this range scan can use that index instead of a full table scan.
@@ -241,13 +273,13 @@ def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def list_jobs(filters: dict, sort: str = DEFAULT_SORT,
+def list_jobs(filters: dict, sort: str = DEFAULT_SORT, direction: str | None = None,
               page: int = 0, page_size: int = 30,
               conn: sqlite3.Connection | None = None) -> dict:
     """One page of one day's table."""
     conn = conn or get_connection()
     where, params = _filter_clauses(filters)
-    order = SORTS.get(sort, SORTS[DEFAULT_SORT])
+    order, dir_used = _order_clause(sort, direction)
     page_size = max(1, min(page_size, 500))
 
     total = conn.execute(
@@ -267,6 +299,7 @@ def list_jobs(filters: dict, sort: str = DEFAULT_SORT,
         "page": page,
         "page_size": page_size,
         "sort": sort if sort in SORTS else DEFAULT_SORT,
+        "dir": dir_used,
     }
 
 
@@ -276,7 +309,10 @@ def job_detail(url: str, conn: sqlite3.Connection | None = None) -> dict | None:
     row = conn.execute(
         f"SELECT {_ROW_COLUMNS}, full_description, description, application_url,"
         f" score_reasoning, resume_variant, review_status, apply_attempts,"
-        f" is_terminal_internship, requires_returning_student, eligibility_reason"
+        f" is_terminal_internship, requires_returning_student, eligibility_reason,"
+        f" apply_backend, apply_duration_ms, last_attempted_at,"
+        f" apply_llm_requests, apply_input_tokens, apply_output_tokens,"
+        f" apply_cache_read_tokens"
         f" FROM jobs WHERE url = ?", (url,)
     ).fetchone()
     if not row:

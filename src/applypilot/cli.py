@@ -551,6 +551,29 @@ def rescore_stale(
         raise typer.Exit(code=1)
 
 
+@app.command(name="dedup-backfill")
+def dedup_backfill_cmd() -> None:
+    """Retroactively re-run duplicate detection over every enriched job.
+
+    Safe to run any time -- dedup.check_duplicate always re-derives from
+    current column values, so this catches rows that predate a
+    matching-logic change (e.g. the company-normalized cross-tenant check)
+    or were enriched before check_duplicate first ran on them. The pipeline
+    already calls this at the end of the score stage; this command is for
+    running it on demand (e.g. right after landing a matching-threshold
+    change) without a full pipeline pass.
+    """
+    _bootstrap()
+    from applypilot.database import get_connection
+    from applypilot import dedup
+
+    conn = get_connection()
+    stats = dedup.backfill(conn)
+    typer.echo(f"Processed {stats['processed']} jobs, found {stats['duplicates_found']} duplicates")
+    for reason, count in stats["by_reason"].items():
+        typer.echo(f"  {reason}: {count}")
+
+
 @app.command(name="recompute")
 def recompute() -> None:
     """Recompute every derived field -- no LLM calls, so this is free.
@@ -674,6 +697,21 @@ def ats_stats_cmd() -> None:
         )
 
     console.print(table)
+
+
+@app.command(name="backfill-failure-reasons")
+def backfill_failure_reasons_cmd() -> None:
+    """One-time pass: fill apply_error_category for existing failed jobs.
+
+    Safe to re-run -- only touches rows still missing a category, so running
+    it again after new normalization rules land just fills in the gap.
+    """
+    _bootstrap()
+
+    from applypilot.apply.failure_taxonomy import backfill_failure_categories
+
+    n = backfill_failure_categories()
+    console.print(f"[green]Backfilled apply_error_category on {n} row(s).[/green]")
 
 
 @app.command()
