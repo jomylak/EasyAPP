@@ -130,9 +130,12 @@ def ranked_db(tmp_path):
         conn.execute(
             "INSERT INTO jobs (url, company, title, site, posted_date, fit_score,"
             " desirability_score, company_prestige, company_tier, job_type,"
-            " pay_max_hourly, eligible) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            # Browse unconditionally requires full_description IS NOT NULL
+            # (see queries._filter_clauses) -- without it every list_jobs()
+            # call below silently returns no rows.
+            " pay_max_hourly, eligible, full_description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (url, co, f"{co} Engineer", "Intern List - SWE", "2026-09-03T10:00:00",
-             fit, des, pres, tier, "new_grad", pay, "yes"),
+             fit, des, pres, tier, "new_grad", pay, "yes", f"{co} is hiring."),
         )
     conn.commit()
     return conn
@@ -162,8 +165,12 @@ def test_tier_only_narrows_to_big_tech(ranked_db):
     assert [r["url"] for r in res["rows"]] == ["meta"]
 
 
-def test_default_sort_is_the_tier_pin():
-    assert queries.DEFAULT_SORT == "top"
+def test_default_sort_is_newest_posted():
+    """DEFAULT_SORT moved from the tier-pinned "top" preset to "posted" once
+    sortable column headers shipped -- "top" is a preset a chip applies, not
+    a clickable column, and DayTable now opens on posting date, newest
+    first, by default (see DayTable.tsx and queries._SORT_COLUMNS)."""
+    assert queries.DEFAULT_SORT == "posted"
 
 
 # ---------------------------------------------------------------------------

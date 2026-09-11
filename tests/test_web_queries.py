@@ -31,9 +31,14 @@ def db(tmp_path):
         conn.execute(
             "INSERT INTO jobs (url, company, title, site, posted_date, discovered_at,"
             " fit_score, desirability_score, company_prestige, job_type, ats, eligible,"
-            " keywords) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            # Browse unconditionally requires full_description IS NOT NULL
+            # (see queries._filter_clauses) -- an unenriched row was never a
+            # real posting to begin with, but every fixture row here already
+            # stands in for an enriched one, so it needs a value or every
+            # query in this file silently returns nothing.
+            " keywords, full_description) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (url, co, f"{co} Engineer", "Intern List - SWE", posted, disc,
-             fit, des, pres, jt, ats, elig, "Python, Java"),
+             fit, des, pres, jt, ats, elig, "Python, Java", f"{co} is hiring an engineer."),
         )
     conn.commit()
     return conn
@@ -195,13 +200,15 @@ def test_posted_within_days_uses_real_now_not_fixture_dates(db):
     stale = (today - timedelta(days=30)).isoformat()
     db.execute(
         "INSERT INTO jobs (url, company, title, site, posted_date, fit_score,"
-        " desirability_score, company_prestige) VALUES (?,?,?,?,?,?,?,?)",
-        ("recent1", "Recent Co", "Engineer", "Intern List - SWE", recent, 8, 8.0, 8),
+        " desirability_score, company_prestige, full_description) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("recent1", "Recent Co", "Engineer", "Intern List - SWE", recent, 8, 8.0, 8,
+         "Recent Co is hiring an engineer."),
     )
     db.execute(
         "INSERT INTO jobs (url, company, title, site, posted_date, fit_score,"
-        " desirability_score, company_prestige) VALUES (?,?,?,?,?,?,?,?)",
-        ("stale1", "Stale Co", "Engineer", "Intern List - SWE", stale, 8, 8.0, 8),
+        " desirability_score, company_prestige, full_description) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("stale1", "Stale Co", "Engineer", "Intern List - SWE", stale, 8, 8.0, 8,
+         "Stale Co is hiring an engineer."),
     )
     db.commit()
     res = queries.list_jobs({"posted_within_days": 7}, conn=db)
@@ -241,7 +248,12 @@ def test_detail_of_a_missing_job_is_none(db):
 # ---------------------------------------------------------------------------
 
 def test_stats_counts_apply_states(db):
-    db.execute("UPDATE jobs SET apply_status='applied', apply_cost_usd=1.5 WHERE url='u1'")
+    # spend/priced_attempts are scoped to apply_backend='goose' (see
+    # queries.stats' docstring -- Claude-backend rows cost ~30x more and
+    # would skew the average), so a fixture row exercising them needs the
+    # backend set, not just the cost.
+    db.execute("UPDATE jobs SET apply_status='applied', apply_cost_usd=1.5, "
+               "apply_backend='goose' WHERE url='u1'")
     db.execute("UPDATE jobs SET apply_status='queued' WHERE url='u2'")
     db.commit()
     s = queries.stats(db)
@@ -255,7 +267,8 @@ def test_retrying_a_failed_job_does_not_change_priced_attempts(db):
     # Retry button flips apply_status back to 'queued' without touching the
     # historical apply_cost_usd). priced_attempts must stay the same so
     # avg-cost-per-attempt doesn't jump from a retry click alone.
-    db.execute("UPDATE jobs SET apply_status='failed', apply_cost_usd=0.9 WHERE url='u1'")
+    db.execute("UPDATE jobs SET apply_status='failed', apply_cost_usd=0.9, "
+               "apply_backend='goose' WHERE url='u1'")
     db.commit()
     before = queries.stats(db)
     assert before["priced_attempts"] == 1
