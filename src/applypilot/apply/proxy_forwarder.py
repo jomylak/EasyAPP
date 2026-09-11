@@ -47,6 +47,7 @@ async def _handle_client(
     upstream_host: str,
     upstream_port: int,
     auth_header: bytes,
+    required_incoming_auth: bytes | None = None,
 ) -> None:
     try:
         request_line = await client_reader.readline()
@@ -55,12 +56,31 @@ async def _handle_client(
             return
 
         headers = []
+        incoming_auth_ok = required_incoming_auth is None
         while True:
             line = await client_reader.readline()
             if line in (b"\r\n", b""):
                 break
-            if not line.lower().startswith(b"proxy-authorization"):
-                headers.append(line)
+            if line.lower().startswith(b"proxy-authorization"):
+                value = line.split(b":", 1)[1].strip() if b":" in line else b""
+                if required_incoming_auth is not None and value == required_incoming_auth:
+                    incoming_auth_ok = True
+                # Never forward the client's own auth header upstream -- the
+                # correct upstream credentials get appended separately below.
+                continue
+            headers.append(line)
+
+        if not incoming_auth_ok:
+            # Publicly reachable listener (see start_forwarder's require_auth) --
+            # anything without the right credentials must be rejected here, or
+            # this process is an open relay onto the upstream proxy.
+            client_writer.write(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b'Proxy-Authenticate: Basic realm="proxy-forwarder"\r\n\r\n'
+            )
+            await client_writer.drain()
+            client_writer.close()
+            return
 
         method = request_line.split(b" ", 1)[0]
         upstream_reader, upstream_writer = await asyncio.open_connection(
@@ -98,9 +118,27 @@ async def _handle_client(
 
 
 def start_forwarder(
-    local_port: int, upstream_host: str, upstream_port: str, user: str, passwd: str
+    local_port: int,
+    upstream_host: str,
+    upstream_port: str,
+    user: str,
+    passwd: str,
+    bind_host: str = "127.0.0.1",
+    require_auth: tuple[str, str] | None = None,
 ):
     """Start the local forwarding proxy on a background thread.
+
+    Args:
+        bind_host: Defaults to loopback-only, for the Chrome-facing case
+            where the OS/VM boundary itself is the trust boundary. Pass
+            "0.0.0.0" only for a deliberately publicly-reachable listener
+            (e.g. the VM-side relay CapSolver connects to) -- and pair it
+            with require_auth, or this becomes an open relay onto whatever
+            upstream it's configured with.
+        require_auth: (user, pass) the *incoming* connection must present via
+            Proxy-Authorization before anything gets relayed. None (default)
+            skips this check -- fine for a loopback-bound listener, required
+            for anything bound to 0.0.0.0.
 
     Returns a zero-arg stop() callable that shuts the forwarder down.
     """
@@ -108,13 +146,23 @@ def start_forwarder(
     auth_header = f"Proxy-Authorization: Basic {auth}\r\n".encode()
     upstream_port_int = int(upstream_port)
 
+    required_incoming_auth = None
+    if require_auth:
+        in_user, in_pass = require_auth
+        in_auth = base64.b64encode(f"{in_user}:{in_pass}".encode()).decode()
+        required_incoming_auth = f"Basic {in_auth}".encode()
+    elif bind_host != "127.0.0.1":
+        raise ValueError("require_auth is mandatory when bind_host is not loopback-only")
+
     loop = asyncio.new_event_loop()
     ready = threading.Event()
 
     async def _serve():
         server = await asyncio.start_server(
-            lambda r, w: _handle_client(r, w, upstream_host, upstream_port_int, auth_header),
-            "127.0.0.1",
+            lambda r, w: _handle_client(
+                r, w, upstream_host, upstream_port_int, auth_header, required_incoming_auth
+            ),
+            bind_host,
             local_port,
         )
         ready.set()

@@ -1,0 +1,15 @@
+[Unit]
+Description=ApplyPilot VM-side relay -- the one public hop CapSolver connects to, forwards to the Pi over Tailscale
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/ApplyPilot
+EnvironmentFile=/home/ubuntu/.applypilot/.env
+ExecStart=/home/ubuntu/ApplyPilot/.venv/bin/python3 /home/ubuntu/ApplyPilot/scripts/vm_capsolver_relay.py 18889
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

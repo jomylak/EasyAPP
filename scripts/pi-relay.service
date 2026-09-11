@@ -1,0 +1,16 @@
+[Unit]
+Description=ApplyPilot Pi relay (terminal hop for APPLY_PROXY -- egresses via this Pi's home connection)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust paths for wherever this repo lives on the Pi.
+WorkingDirectory=/home/pi/ApplyPilot
+EnvironmentFile=/home/pi/.applypilot/.env
+ExecStart=/usr/bin/python3 /home/pi/ApplyPilot/scripts/pi_relay.py 18888
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

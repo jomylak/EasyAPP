@@ -668,11 +668,22 @@ def get_apply_proxy(session_id: str) -> dict | None:
     discovery/jobspy.py's parse_proxy) but kept separate since this is a
     different concern -- apply-time browsing + CAPTCHA solving, not discovery.
     A literal "{session}" in the user field is substituted with session_id,
-    so a residential-proxy provider's sticky-session syntax (each provider
-    spells it differently, e.g. appending "-session-<id>" to the username)
-    can be configured without hardcoding any one vendor's format. Chrome and
-    CapSolver MUST share the same session_id for a given job -- that's the
-    whole point of routing both through the same egress IP.
+    so a provider's sticky-session syntax (each spells it differently, e.g.
+    appending "-session-<id>" to the username) can be configured without
+    hardcoding any one vendor's format.
+
+    "host" here is whatever Chrome's local forwarder (chrome.py, loopback
+    only) should connect to directly -- e.g. a home relay reachable over
+    Tailscale, so no vendor and no public exposure is needed for Chrome's
+    leg at all. CapSolver is a different story: it's a third party with no
+    access to a private network like Tailscale, so it needs a *publicly*
+    reachable endpoint. If APPLY_PROXY_PUBLIC_HOST is set (the one hop that
+    actually needs a port opened somewhere), CapSolver's field points there
+    instead of at "host" directly -- see scripts/vm_capsolver_relay.py, which
+    is what actually listens on that public address and relays on to "host"
+    itself. Without APPLY_PROXY_PUBLIC_HOST, CapSolver's field falls back to
+    "host" directly, which only makes sense if "host" is itself already
+    publicly reachable (e.g. a paid vendor's proxy).
 
     Returns None if APPLY_PROXY isn't set.
     """
@@ -689,16 +700,19 @@ def get_apply_proxy(session_id: str) -> dict | None:
         )
     host, port, user, passwd = parts
     user = user.replace("{session}", session_id)
+
     # CapSolver's "proxy" task field wants "type:ip:port:user:pass" -- verify
     # this against CapSolver's current docs before relying on it; "http" is
     # the common case but some providers require "socks5".
     proxy_type = os.environ.get("APPLY_PROXY_TYPE", "http").strip() or "http"
+    public_host = os.environ.get("APPLY_PROXY_PUBLIC_HOST", "").strip() or host
+    public_port = os.environ.get("APPLY_PROXY_PUBLIC_PORT", "").strip() or port
     return {
         "host": host,
         "port": port,
         "user": user,
         "pass": passwd,
-        "capsolver": f"{proxy_type}:{host}:{port}:{user}:{passwd}",
+        "capsolver": f"{proxy_type}:{public_host}:{public_port}:{user}:{passwd}",
     }
 
 
