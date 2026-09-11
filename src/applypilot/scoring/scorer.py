@@ -14,8 +14,9 @@ from datetime import datetime, timezone
 
 import httpx
 
-from applypilot.config import RESUME_PATH
+from applypilot.config import RESUME_PATH, normalize_company
 from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.dedup import check_duplicate
 from applypilot.llm import get_scoring_client
 
 # Ceiling, not a batch size -- fewer pending jobs than this just uses fewer
@@ -1725,6 +1726,7 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
                 )
             skipped += 1
             continue
+        company = r.get("company", "")
         conn.execute(
             "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
             "term = ?, requires_returning_student = ?, terminal_evidence_llm = ?, "
@@ -1732,6 +1734,10 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
             # Never let an "unknown" from the model erase a real name that
             # discovery already captured -- keep the existing value instead.
             "company = COALESCE(NULLIF(?, ''), company), "
+            # Kept in lockstep with `company` (same COALESCE-on-blank guard)
+            # so dedup.find_company_duplicate's indexed lookup is never stale
+            # relative to the company name it's supposed to mirror.
+            "company_normalized = COALESCE(NULLIF(?, ''), company_normalized), "
             "company_prestige = ?, eligible = ?, eligibility_reason = ?, "
             "keywords = ?, score_cost_usd = ? "
             "WHERE url = ?",
@@ -1740,7 +1746,8 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
              r.get("requires_returning_student", "no"),
              r.get("terminal_evidence_llm", "no"),
              r.get("pay_text", ""), r.get("pay_below_floor", "unknown"),
-             r.get("company", ""), r.get("company_prestige", 0),
+             company, normalize_company(company) if company else "",
+             r.get("company_prestige", 0),
              r.get("eligible", "unclear"), r.get("eligibility_reason", ""),
              r.get("keywords", ""), r.get("cost_usd"),
              r["url"]),
@@ -1758,6 +1765,14 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
                 "AND (location IS NULL OR location = '')",
                 (r["job_location"], r["url"]),
             )
+
+        # dedup.check_duplicate already ran once at enrichment time, before
+        # `company`/`company_normalized` existed -- its company-scoped
+        # checkpoint (find_company_duplicate) was necessarily a no-op then.
+        # Re-run now that this row's company is known; check_duplicate is
+        # idempotent, so this just adds the one signal that couldn't fire
+        # earlier without repeating the ats/exact-text checks unsafely.
+        check_duplicate(conn, r["url"])
     conn.commit()
     return skipped
 

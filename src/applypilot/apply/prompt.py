@@ -313,11 +313,19 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_captcha_section() -> str:
+def _build_captcha_section(proxy_string: str | None = None) -> str:
     """Build the CAPTCHA detection and solving instructions.
 
     Reads the CapSolver API key from environment. The CAPTCHA section
     contains no personal data -- it's the same for every user.
+
+    Args:
+        proxy_string: This job's CapSolver-format proxy ("type:host:port:
+            user:pass"), from chrome.get_worker_proxy() -- the same egress IP
+            this job's Chrome is browsing from. When set, CapSolver solves
+            through it instead of its own ProxyLess farm IP, so the token's
+            trust score is computed from a session that actually matches the
+            one submitting it. None reproduces today's ProxyLess behavior.
     """
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
@@ -335,6 +343,27 @@ CAPTCHAs programmatically. If one appears:
 Note that invisible CAPTCHAs (reCAPTCHA v3, Turnstile) show no widget but can
 silently block a submit. If a form submits with no error and no confirmation,
 suspect one and report RESULT:CAPTCHA rather than retrying indefinitely."""
+
+    if proxy_string:
+        task_type_table = """TASK_TYPE values (use EXACTLY these strings):
+  hcaptcha     -> HCaptchaTask
+  recaptchav2  -> ReCaptchaV2Task
+  recaptchav3  -> ReCaptchaV3Task
+  turnstile    -> AntiTurnstileTask
+  funcaptcha   -> FunCaptchaTask
+
+This job's Chrome browses through a residential proxy, so pass it to CapSolver
+too -- add "proxy": "{proxy}" to the task object (a sibling of "type", not
+nested). This makes CapSolver solve through the SAME IP your browser is using,
+instead of its own datacenter IP -- required for the trust score (reCAPTCHA
+v3 especially) to reflect the session actually submitting the form.""".format(proxy=proxy_string)
+    else:
+        task_type_table = """TASK_TYPE values (use EXACTLY these strings):
+  hcaptcha     -> HCaptchaTaskProxyLess
+  recaptchav2  -> ReCaptchaV2TaskProxyLess
+  recaptchav3  -> ReCaptchaV3TaskProxyLess
+  turnstile    -> AntiTurnstileTaskProxyLess
+  funcaptcha   -> FunCaptchaTaskProxyLess"""
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
@@ -430,12 +459,7 @@ browser_evaluate function: async () => {{{{
   return await r.json();
 }}}}
 
-TASK_TYPE values (use EXACTLY these strings):
-  hcaptcha     -> HCaptchaTaskProxyLess
-  recaptchav2  -> ReCaptchaV2TaskProxyLess
-  recaptchav3  -> ReCaptchaV3TaskProxyLess
-  turnstile    -> AntiTurnstileTaskProxyLess
-  funcaptcha   -> FunCaptchaTaskProxyLess
+{task_type_table}
 
 PAGE_URL = the url from detect result. SITE_KEY = the sitekey from detect result.
 For recaptchav3: add "pageAction": "submit" to the task object (or the actual action found in page scripts).
@@ -735,7 +759,8 @@ def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
                  email_override: str | None = None,
-                 password_override: str | None = None) -> str:
+                 password_override: str | None = None,
+                 proxy_string: str | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -752,6 +777,8 @@ def build_prompt(job: dict, tailored_resume: str,
             applicant instead of reusing a prior run's account and its
             already-populated Application Questions page.
         password_override: Same idea, for the account password.
+        proxy_string: This job's CapSolver-format proxy, from
+            chrome.get_worker_proxy(worker_id) -- see _build_captcha_section.
 
     Returns:
         Complete prompt string for the AI agent.
@@ -773,7 +800,7 @@ def build_prompt(job: dict, tailored_resume: str,
     blocked_sso = ctx["blocked_sso"]
     display_name = ctx["display_name"]
     STD_PASSWORD = ctx["std_password"]
-    captcha_section = _build_captcha_section()
+    captcha_section = _build_captcha_section(proxy_string)
 
     # Dry-run: override submit instruction
     if dry_run:

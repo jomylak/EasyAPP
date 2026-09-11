@@ -20,7 +20,7 @@ export function AtsBreakdown() {
   }, [])
 
   return (
-    <section className="day-panel">
+    <section className="day-panel dash-area-ats">
       <div className="dayhead">
         <span className="dayname">Success rate by ATS</span>
         <span className="daycount">{rows ? `${rows.length} combinations` : "loading…"}</span>
@@ -30,7 +30,7 @@ export function AtsBreakdown() {
         <div style={{ padding: 12, color: "var(--a-text-3)" }}>No completed apply runs yet.</div>
       )}
       {rows && rows.length > 0 && (
-        <div style={{ padding: "4px 16px 14px" }}>
+        <div className="dash-scroll" style={{ padding: "4px 16px 14px" }}>
           {rows.map((r) => (
             <div key={`${r.ats}-${r.backend}`} className="ats-row">
               <span className="ats-name" title={`${r.ats} · ${r.backend}`}>

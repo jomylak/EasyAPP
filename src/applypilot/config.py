@@ -661,6 +661,47 @@ def load_env():
     load_dotenv()
 
 
+def get_apply_proxy(session_id: str) -> dict | None:
+    """Parse APPLY_PROXY into one sticky-session proxy for a single job.
+
+    Format: host:port:user:pass, same as the scraping-only PROXY var (see
+    discovery/jobspy.py's parse_proxy) but kept separate since this is a
+    different concern -- apply-time browsing + CAPTCHA solving, not discovery.
+    A literal "{session}" in the user field is substituted with session_id,
+    so a residential-proxy provider's sticky-session syntax (each provider
+    spells it differently, e.g. appending "-session-<id>" to the username)
+    can be configured without hardcoding any one vendor's format. Chrome and
+    CapSolver MUST share the same session_id for a given job -- that's the
+    whole point of routing both through the same egress IP.
+
+    Returns None if APPLY_PROXY isn't set.
+    """
+    load_env()
+    raw = os.environ.get("APPLY_PROXY", "").strip()
+    if not raw:
+        return None
+
+    parts = raw.split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            f"APPLY_PROXY format not recognized: {raw!r}. "
+            "Expected host:port:user:pass (user may contain '{session}')."
+        )
+    host, port, user, passwd = parts
+    user = user.replace("{session}", session_id)
+    # CapSolver's "proxy" task field wants "type:ip:port:user:pass" -- verify
+    # this against CapSolver's current docs before relying on it; "http" is
+    # the common case but some providers require "socks5".
+    proxy_type = os.environ.get("APPLY_PROXY_TYPE", "http").strip() or "http"
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "pass": passwd,
+        "capsolver": f"{proxy_type}:{host}:{port}:{user}:{passwd}",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tier system — feature gating by installed dependencies
 # ---------------------------------------------------------------------------

@@ -286,6 +286,14 @@ _ALL_COLUMNS: dict[str, str] = {
     # 'in_progress' is a live lock held by a worker and carries agent_id.
     "apply_status": "TEXT",
     "apply_error": "TEXT",
+    # Canonical bucket for apply_error, via apply.failure_taxonomy.
+    # normalize_failure_reason -- collapses near-duplicate raw reason strings
+    # (e.g. an Indeed-specific site-block string vs. a generic one) into one
+    # stable key so the dashboard's failure-reasons breakdown can GROUP BY it
+    # directly instead of fragmenting on free text. NULL until the row's
+    # apply_error is set (or for rows written before this column existed --
+    # see failure_taxonomy.backfill_failure_categories).
+    "apply_error_category": "TEXT",
     "apply_attempts": "INTEGER DEFAULT 0",
     "agent_id": "TEXT",
     "last_attempted_at": "TEXT",
@@ -315,6 +323,12 @@ _ALL_COLUMNS: dict[str, str] = {
     # underlying posting as another row that IS proceeding.
     "duplicate_of": "TEXT",
     "duplicate_reason": "TEXT",
+    # config.normalize_company(company), stored rather than recomputed per
+    # lookup so dedup.find_company_duplicate can do an indexed equality
+    # match instead of a full-table Python-side normalize-and-scan. Written
+    # alongside `company` in scoring/scorer.py's per-row UPDATE, so it lags
+    # `company` by exactly the same amount (NULL until scored).
+    "company_normalized": "TEXT",
     "pay_text": "TEXT",
     "pay_below_floor": "TEXT",
     "apply_backend": "TEXT",
@@ -393,6 +407,14 @@ _ALL_INDEXES: dict[str, str] = {
     # The "already seen this row" lookup _scrape_airtable_button_grid does
     # once per site at the start of every discovery pass.
     "idx_jobs_site_airtable_record": "(site, airtable_record_id)",
+    # dedup.find_exact_text_duplicate's WHERE title = ? AND location IS ?
+    # (the text column itself isn't indexable usefully at arbitrary length,
+    # but title+location narrows the scan enough).
+    "idx_jobs_title_location": "(title, location)",
+    # dedup.find_ats_duplicate's WHERE ats_job_id = ?.
+    "idx_jobs_ats_job_id": "(ats_job_id)",
+    # dedup.find_company_duplicate's WHERE company_normalized = ?.
+    "idx_jobs_company_normalized": "(company_normalized)",
 }
 
 
@@ -667,7 +689,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
-    from applypilot.dedup import canonicalize_url, find_exact_text_duplicate
+    from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, normalize_location
 
     now = datetime.now(timezone.utc).isoformat()
     new = 0
@@ -678,9 +700,10 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         if not url:
             continue
         url = canonicalize_url(url)
+        location = normalize_location(job.get("location"))
 
         if find_exact_text_duplicate(
-            conn, job.get("title"), job.get("description"), job.get("location"),
+            conn, job.get("title"), job.get("description"), location,
             text_column="description",
         ):
             existing += 1
@@ -691,7 +714,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 location, site, strategy, now),
             )
             new += 1
         except sqlite3.IntegrityError:

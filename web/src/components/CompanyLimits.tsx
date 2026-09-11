@@ -21,7 +21,7 @@ export function CompanyLimits() {
   }, [])
 
   return (
-    <section className="day-panel">
+    <section className="day-panel dash-area-caps">
       <div className="dayhead">
         <span className="dayname">Company application caps</span>
         <span className="daycount">{rows ? `${rows.length} companies` : "loading…"}</span>
@@ -31,7 +31,7 @@ export function CompanyLimits() {
         <div style={{ padding: 12, color: "var(--a-text-3)" }}>No applications sent yet.</div>
       )}
       {rows && rows.length > 0 && (
-        <div style={{ padding: "4px 16px 14px" }}>
+        <div className="dash-scroll" style={{ padding: "4px 16px 14px" }}>
           {rows.map((r) => (
             <div key={r.company} className="cl-row">
               <span className="cl-name" title={r.company ?? undefined}>

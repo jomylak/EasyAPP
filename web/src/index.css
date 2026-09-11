@@ -222,11 +222,10 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
   gap: 18px;
 }
-/* These panels run about half the width of a day table, so the same
-   percentage widths leave Pay too narrow to read -- give it more of the
-   narrower container, taken from Location. */
-.attention-grid thead th.col-location { width: 11%; }
-.attention-grid thead th.col-pay { width: 20%; }
+/* These panels run about half the width of a day table, so the default
+   Pay/Location width reads cramped -- give the merged column more of the
+   narrower container. */
+.attention-grid thead th.col-paylocation { width: 31%; }
 
 /* ---- day divider --------------------------------------------------------- */
 .dayhead {
@@ -317,9 +316,9 @@ table {
 thead th.col-idx { width: 38px; }
 thead th.col-company { width: 22%; }
 thead th.col-title { width: 33%; }
-thead th.col-location { width: 16%; }
+/* Pay and Location stacked in one column -- see td.payloc below. */
+thead th.col-paylocation { width: 29%; }
 thead th.col-posted { width: 58px; }
-thead th.col-pay { width: 13%; }
 thead th.col-prestige,
 thead th.col-fit,
 thead th.col-desirability { width: 52px; }
@@ -353,9 +352,18 @@ thead th.sortable {
 thead th.sortable:hover {
   color: var(--a-text-2);
 }
+/* A composite header (Pay / Location) has two independently sortable halves
+   inside one <th> -- only the half itself is clickable, not the whole cell. */
+.hpart {
+  cursor: pointer;
+  user-select: none;
+}
+.hpart:hover {
+  color: var(--a-text-2);
+}
 tbody td {
   padding: 0 10px;
-  height: 34px;
+  height: 40px;
   border-bottom: 1px solid var(--a-line-soft);
   vertical-align: middle;
   color: var(--a-text-2);
@@ -368,6 +376,26 @@ tbody tr.row:hover td {
 }
 tbody tr.row.sel td {
   background: var(--a-sel-bg);
+}
+/* Presentational grouping only (cluster.ts) -- a summary row standing in for
+   several same-company/same-role postings collapsed together. Never hides
+   data: expanding it renders the same RowPair every ungrouped row uses.
+   Laid out in the same columns as a normal row (title left-aligned like
+   every other title cell) rather than one merged span, so Pres/Fit/Des
+   (averaged over the group) line up under their real headers. */
+tbody tr.cluster-row td {
+  background: var(--a-sel-bg);
+}
+.cluster-title {
+  font-weight: 600;
+}
+.cluster-arrow {
+  display: inline-block;
+  width: 14px;
+  color: var(--a-text-3);
+}
+.cluster-count {
+  color: var(--a-text-3);
 }
 /* Company and Title both truncate: under a fixed layout either one can
    overflow its track, and clipped text with no ellipsis reads as a bug. */
@@ -384,17 +412,34 @@ td.ti {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-td.loc,
-td.pay {
-  font-size: 12.5px;
+/* Pay and Location stacked in one cell -- next to each other before, now on
+   top of each other so both get full width instead of splitting it. */
+td.payloc {
+  padding-top: 3px;
+  padding-bottom: 3px;
+}
+.paylocation {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  overflow: hidden;
+}
+.pl-pay {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--a-text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-td.pay {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
+.pl-loc {
+  font-size: 11px;
+  color: var(--a-text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 td.num {
   text-align: right;
@@ -743,12 +788,47 @@ tr.exp.open > td {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 12px;
 }
+/* Outcomes and Failure reasons stack in the left column, each pinned to
+   --dash-box-h (Outcomes' own original height) via an explicit row track --
+   `auto` here would let a long failure-category list grow the row instead of
+   scrolling inside it. ATS and Company caps each span both rows, so a fixed
+   row track also fixes *their* total height at exactly 2x --dash-box-h + the
+   gap between -- "stop at the bottom of the two boxes on the left" -- with
+   .dash-scroll (flex:1 inside each flex-column panel) taking whatever's left
+   after that panel's own header. */
 .dash-grid {
+  --dash-box-h: 270px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  grid-template-columns: repeat(3, minmax(340px, 1fr));
+  grid-template-rows: var(--dash-box-h) var(--dash-box-h);
+  grid-template-areas:
+    "outcomes ats caps"
+    "failures ats caps";
   gap: 18px;
-  align-items: start;
 }
+@media (max-width: 1150px) {
+  .dash-grid {
+    grid-template-columns: 1fr;
+    grid-template-rows: repeat(4, var(--dash-box-h));
+    grid-template-areas:
+      "outcomes"
+      "failures"
+      "ats"
+      "caps";
+  }
+}
+.dash-area-outcomes,
+.dash-area-failures,
+.dash-area-ats,
+.dash-area-caps {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.dash-area-outcomes { grid-area: outcomes; }
+.dash-area-failures { grid-area: failures; }
+.dash-area-ats { grid-area: ats; }
+.dash-area-caps { grid-area: caps; }
 .donut-row {
   display: flex;
   gap: 28px;
@@ -1018,6 +1098,62 @@ tr.exp.open > td {
   font-size: 11px;
   color: var(--a-text-3);
   text-align: right;
+}
+
+.fr-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(80px, 2fr) 32px;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--a-line-soft);
+  font-size: 12.5px;
+}
+.fr-row:last-child { border-bottom: none; }
+.fr-name {
+  color: var(--a-text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fr-bar-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--a-line-soft);
+  overflow: hidden;
+}
+.fr-bar-fill {
+  height: 100%;
+  background: var(--a-bad);
+  border-radius: 3px;
+}
+.fr-n {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--a-text-2);
+  text-align: right;
+}
+
+/* Fills whatever's left of its panel after the header (.dash-area-ats/caps
+   are flex columns whose own height comes from the grid -- see .dash-grid --
+   so this ends up exactly as tall as Outcomes + Failure reasons combined,
+   with the row list scrolling internally past that instead of stretching the
+   grid taller than its neighbor column). Same overflow treatment as
+   .tablewrap, but these are div-based row lists (.ats-row/.cl-row), not
+   <table> markup, so there's no sticky header to carry over. */
+.dash-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.dash-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.dash-scroll::-webkit-scrollbar-thumb {
+  background: var(--a-line);
+  border-radius: 4px;
 }
 
 .placeholder-tab {

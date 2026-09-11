@@ -28,6 +28,8 @@ from rich.live import Live
 from applypilot import config
 from applypilot.database import get_connection
 from applypilot.apply import outcomes, prompt as prompt_mod
+from applypilot.apply.failure_taxonomy import normalize_failure_reason
+from applypilot.apply.ineligibility import sweep_company_siblings
 from applypilot.apply.backends import get_backend, interrupt_all_backends
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
@@ -167,6 +169,44 @@ def _is_blocked(site: str | None, url: str | None,
     lowered = (url or "").lower()
     return any(frag and frag in lowered
                for frag in map(_like_to_substring, blocked_patterns))
+
+
+def _live_duplicate_already_committed(conn, row) -> str | None:
+    """URL of a same-content sibling row that has already reached
+    'applied'/'in_progress'/'queued', or None.
+
+    row["duplicate_of"] only reflects what checkpoint 2/3 had computed the
+    last time they ran on this row -- a row queued before enrichment or
+    scoring ever touched it has duplicate_of NULL regardless of whether a
+    duplicate exists. This is a live, narrow recheck at claim time, not a
+    replacement for those checkpoints: it only fails the claim when the
+    matched sibling has already been acted on, never against a merely
+    similar row that's still pending (that could be a legitimately
+    different req, and wrongly failing it would cost an application for
+    nothing).
+    """
+    from applypilot.dedup import find_company_duplicate, find_exact_text_duplicate
+
+    candidate = None
+    if row["full_description"]:
+        candidate = find_exact_text_duplicate(
+            conn, row["title"], row["full_description"], row["location"],
+            text_column="full_description", exclude_url=row["url"],
+        )
+    if not candidate and row["company"] and row["full_description"]:
+        candidate = find_company_duplicate(
+            conn, row["company"], row["title"], row["full_description"], row["location"],
+            exclude_url=row["url"],
+        )
+    if not candidate:
+        return None
+
+    already = conn.execute(
+        "SELECT apply_status FROM jobs WHERE url = ?", (candidate,),
+    ).fetchone()
+    if already and already["apply_status"] in ("applied", "in_progress", "queued"):
+        return candidate
+    return None
 
 
 def _select_target(conn, target_url: str):
@@ -388,6 +428,18 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 # queued), so this is the last check before money is spent
                 # applying to a posting under two different URLs.
                 outcome = ("failed", f"duplicate_of:{row['duplicate_of']}")
+            elif (live_dupe := _live_duplicate_already_committed(conn, row)):
+                # duplicate_of was unset on this row -- either it was never
+                # enriched/scored yet (the gap window between discovery and
+                # checkpoint 2/3), or it genuinely isn't a duplicate of
+                # anything at those checkpoints' confidence bar. Catch the
+                # narrow case that matters here: a sibling row this content
+                # actually matches has ALREADY been applied to/claimed/queued
+                # -- not merely "looks similar," since a merely-similar
+                # pending row could be a legitimately different req and
+                # wrongly failing it would be worse than the rare double
+                # apply this guards against.
+                outcome = ("failed", f"duplicate_of:{live_dupe}")
             elif is_manual_ats(apply_url):
                 outcome = ("manual", "manual ATS")
             elif _is_blocked(row["site"], row["url"],
@@ -400,8 +452,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 status, reason = outcome
                 conn.execute(
                     "UPDATE jobs SET apply_status = ?, apply_error = ?, "
+                    "apply_error_category = ?, "
                     "agent_id = NULL, last_attempted_at = ? WHERE url = ?",
-                    (status, reason, now, row["url"]),
+                    (status, reason, normalize_failure_reason(reason), now, row["url"]),
                 )
                 conn.commit()
                 logger.info("Skipping %s (%s): %s", reason, status, row["url"][:80])
@@ -537,21 +590,19 @@ def _clear_terminal_flags_on_grad_date_mismatch(job_url: str, note: str = "") ->
             "requires_returning_student = 'yes' WHERE url = ?",
             (job_url,),
         )
+        conn.commit()
         row = conn.execute(
             "SELECT company, company_tier FROM jobs WHERE url = ?", (job_url,)
         ).fetchone()
         company = row["company"] if row else None
         if company:
+            company_tier = row["company_tier"] if "company_tier" in row.keys() else None
             sibling_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM jobs WHERE company = ? "
                 "AND job_type = 'internship' AND url != ?",
                 (company, job_url),
             ).fetchone()["n"]
-            is_tiered = bool(
-                row["company_tier"] if "company_tier" in row.keys() else None
-            )
-            broad_employer = is_tiered or sibling_count > _SIBLING_SWEEP_MAX
-
+            broad_employer = bool(company_tier) or sibling_count > _SIBLING_SWEEP_MAX
             note = (
                 "Sibling posting at this company confirmed a graduation-date "
                 "form mismatch (grad_date_mismatch)."
@@ -560,49 +611,7 @@ def _clear_terminal_flags_on_grad_date_mismatch(job_url: str, note: str = "") ->
                 "form mismatch (grad_date_mismatch) -- treating this posting "
                 "as requiring the same continued enrollment."
             )
-            if broad_employer:
-                # Flag for review, don't disqualify. Only ever softens a row
-                # that is currently 'yes' -- an existing 'no' from the
-                # scorer's own eligibility read is a real, separately
-                # established disqualifier and must not be undone here.
-                conn.execute(
-                    """
-                    UPDATE jobs SET
-                        eligible = 'unclear',
-                        eligibility_reason = CASE
-                            WHEN eligibility_reason IS NULL OR eligibility_reason = ''
-                            THEN ?
-                            ELSE eligibility_reason || ' ' || ?
-                        END
-                    WHERE company = ?
-                      AND job_type = 'internship'
-                      AND url != ?
-                      AND eligible = 'yes'
-                      AND (apply_status IS NULL OR apply_status = 'failed')
-                    """,
-                    (note, note, company, job_url),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE jobs SET
-                        is_terminal_internship = 'no',
-                        is_terminal_internship_likely = 'no',
-                        requires_returning_student = 'yes',
-                        eligible = 'no',
-                        eligibility_reason = CASE
-                            WHEN eligibility_reason IS NULL OR eligibility_reason = ''
-                            THEN ?
-                            ELSE eligibility_reason || ' ' || ?
-                        END
-                    WHERE company = ?
-                      AND job_type = 'internship'
-                      AND url != ?
-                      AND (apply_status IS NULL OR apply_status = 'failed')
-                    """,
-                    (note, note, company, job_url),
-                )
-        conn.commit()
+            sweep_company_siblings(job_url, company, company_tier, note, conn=conn)
     except Exception as e:
         logger.warning("Could not clear terminal flags after grad_date_mismatch: %s", e)
 
@@ -627,7 +636,8 @@ def mark_result(url: str, status: str, error: str | None = None,
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL,
+                           apply_error = NULL, apply_error_category = NULL,
+                           agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = NULL, apply_backend = ?,
                            apply_llm_requests = ?, apply_input_tokens = ?,
@@ -639,9 +649,11 @@ def mark_result(url: str, status: str, error: str | None = None,
               stats.get("cache_read_tokens"), stats.get("cost_usd"), url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        review_status = _classify_review_status(error or "")
+        error = error or "unknown"
+        review_status = _classify_review_status(error)
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
+                           apply_error_category = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = ?, apply_backend = ?,
@@ -649,7 +661,8 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_output_tokens = ?, apply_cache_read_tokens = ?,
                            apply_cost_usd = ?
             WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, review_status,
+        """, (status, error, normalize_failure_reason(error), duration_ms,
+              task_id, review_status,
               backend, llm_requests, stats.get("input_tokens"),
               stats.get("output_tokens"), stats.get("cache_read_tokens"),
               stats.get("cost_usd"), url))
@@ -742,15 +755,18 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
+                           apply_error = NULL, apply_error_category = NULL,
+                           agent_id = NULL
             WHERE url = ?
         """, (now, url))
     else:
+        reason = reason or "manual"
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
+                           apply_error_category = ?,
                            apply_attempts = 99, agent_id = NULL
             WHERE url = ?
-        """, (reason or "manual", url))
+        """, (reason, normalize_failure_reason(reason), url))
     conn.commit()
 
 
@@ -763,6 +779,7 @@ def reset_failed() -> int:
     conn = get_connection()
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                       apply_error_category = NULL,
                        apply_attempts = 0, agent_id = NULL
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'

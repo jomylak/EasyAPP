@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
+import type { RemovedUrls } from "@/App"
 import { ATTENTION_DEFAULT_BOX_HEIGHT, AttentionPanel } from "@/components/AttentionPanel"
 import { DayTable } from "@/components/DayTable"
 import { GlobalFilterBar } from "@/components/GlobalFilterBar"
@@ -17,9 +18,10 @@ interface Props {
   selected: Set<string>
   selectedTypes: Map<string, string | null>
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
+  removedUrls: RemovedUrls
 }
 
-export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
+export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls }: Props) {
   const [days, setDays] = useState<DayBucket[] | null>(null)
   const [facets, setFacets] = useState<Facets | null>(null)
   const [globalFilters, setGlobalFilters] = useState<GlobalFilters>(EMPTY_GLOBAL_FILTERS)
@@ -44,6 +46,28 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
       })
       .catch(() => {})
   }, [])
+
+  // Decrement the originating day's own `total` badge so it doesn't read one
+  // higher than the rows actually shown once DayTable drops the removed
+  // row(s) -- everything else (prestige/best_fit sub-counts) is left as
+  // acceptable staleness; correcting those would need each removed row's
+  // score data plumbed all the way up here just for secondary badges, and
+  // they self-correct on the next day switch or reload.
+  useEffect(() => {
+    if (!removedUrls.entries.length) return
+    setDays((prev) => {
+      if (!prev) return prev
+      const removedPerDay = new Map<string, number>()
+      for (const e of removedUrls.entries) {
+        removedPerDay.set(e.tableId, (removedPerDay.get(e.tableId) ?? 0) + 1)
+      }
+      return prev.map((d) => {
+        const n = removedPerDay.get(d.day)
+        return n ? { ...d, total: Math.max(0, d.total - n) } : d
+      })
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [removedUrls.token])
 
   const dayList = useMemo(() => days ?? [], [days])
   // Baseline "worth surfacing" floor for both attention panels -- a company
@@ -110,6 +134,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
             onToggleSelect={onToggleSelect}
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
+            removedUrls={removedUrls}
           />
           <AttentionPanel
             title="Top New Grad"
@@ -123,6 +148,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
             onToggleSelect={onToggleSelect}
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
+            removedUrls={removedUrls}
           />
         </div>
       </div>
@@ -146,6 +172,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect }: Props) {
             globalFilters={globalFilters}
             selected={selected}
             onToggleSelect={onToggleSelect}
+            removedUrls={removedUrls}
           />
         ))}
       </div>
