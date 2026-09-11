@@ -151,6 +151,21 @@ def load_sites_config() -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
+def load_terminal_company_policy() -> dict:
+    """Load researched/verified per-company post-grad-internship policy.
+
+    Populated by one-time external research (official FAQs, anecdotal
+    reports), not by the scorer -- see compute_company_pattern_terminal()
+    in scoring/scorer.py for how a company marked accepts_post_grad: true
+    here promotes that company's is_terminal_internship_likely rows.
+    """
+    import yaml
+    path = CONFIG_DIR / "terminal_company_policy.yaml"
+    if not path.exists():
+        return {}
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
 def is_manual_ats(url: str | None) -> bool:
     """Check if a URL routes through an ATS that requires manual application."""
     if not url:
@@ -289,8 +304,10 @@ DEFAULTS = {
     # run discovery more often (daily/hourly) with this same window and
     # near-duplicate postings are simply skipped by the url PRIMARY KEY, so
     # a wide window is safe to leave on permanently rather than needing a
-    # separate "sweep vs sync" mode.
-    "discovery_posted_within_days": 21,
+    # separate "sweep vs sync" mode. APPLYPILOT_DISCOVERY_DAYS overrides
+    # this for a single batch (e.g. a narrower one-week sweep) without
+    # touching the permanent default.
+    "discovery_posted_within_days": int(os.environ.get("APPLYPILOT_DISCOVERY_DAYS", 21)),
     # Extra pause after each Jobright Apply-flow click-through during
     # enrichment (see resolve_original_job_url). Unverified fix for a real
     # rate-limiting problem observed at batch volume -- adjust based on
@@ -315,6 +332,14 @@ DEFAULTS = {
     # heavily on browser_evaluate. Override with `goose_model` in settings.json.
     "goose_model": "xiaomi/mimo-v2.5",
     "goose_provider": "openrouter",
+    # Passed to Goose as GOOSE_THINKING_EFFORT, which Goose forwards to
+    # OpenRouter as reasoning:{"effort": ...} -- keeps reasoning ON (unlike
+    # llm.py's reasoning:{"enabled": False} for the scoring model) but caps
+    # how many thinking tokens MiMo spends per turn. "low" was measured to
+    # still set reasoning:true while trimming the thinking-token volume that
+    # was the main driver of the ~15s-per-action latency. Override with
+    # `goose_thinking_effort` in settings.json (off | low | medium | high | max).
+    "goose_thinking_effort": "low",
     # Healthy runs top out around 140 turns; this leaves headroom for a long
     # multi-page form without letting a lost model loop forever.
     "goose_max_turns": 300,
@@ -380,6 +405,18 @@ DEFAULT_SETTINGS: dict = {
     # back to True once LaTeX tailoring is wired up.
     "tailoring_enabled": False,
     "cover_letters_enabled": False,
+    # Per-install default for the Browse tab's "Eligible for me" filter
+    # (confirmed-terminal OR likely-terminal internships only). Not every
+    # user of this codebase is graduating soon -- a candidate who genuinely
+    # can only apply to terminal/likely-terminal internships wants this on
+    # by default every time they open the dashboard; a continuing student
+    # wants to see the full internship list by default. Purely a starting
+    # value for GlobalFilters.eligible_only on page load -- the pill in the
+    # UI still toggles it per-session same as any other filter, this just
+    # decides what state it starts in for THIS install (settings.json is
+    # per-~/.applypilot, so two people running their own installs set this
+    # independently).
+    "default_eligible_internships_only": False,
     # Apply-queue ordering blends two independent judgements: fit_score (how
     # well the resume matches the JD) and desirability_score (how much the
     # candidate actually wants the job -- prestige, pay, location). They're
@@ -465,6 +502,12 @@ DEFAULT_SETTINGS: dict = {
     # some terms.
     "graduation_date": "May 2027",
     "earliest_start_date": "August 2027",
+    # When the candidate actually started their degree program -- distinct
+    # from graduation_date/earliest_start_date above. Some ATS education
+    # sections ask for this explicitly; without a configured value the
+    # applying agent has to guess it off the resume (which only prints the
+    # expected graduation date), and has guessed wrong before.
+    "education_start_date": "August 2023",
 
     # Which resume file to attach, by scoring.router.route_resume_track's
     # output (swe | aiml | data) -- three hand-authored LaTeX resumes, one
@@ -474,10 +517,15 @@ DEFAULT_SETTINGS: dict = {
     # track's files aren't on disk yet, so this keeps working before all
     # three PDFs are exported from Overleaf.
     "default_resume_track": "swe",
+    # Filenames chosen deliberately plain -- browser_file_upload attaches
+    # the file by its literal path with no rename step, so whatever these
+    # are named is exactly what an ATS/reviewer sees as the attachment.
+    # "resume_swe.pdf" next to "resume_aiml.pdf"/"resume_data.pdf" reads as
+    # auto-generated; a name/year+number scheme doesn't.
     "resume_tracks": {
-        "swe": {"pdf": "resume_swe.pdf", "txt": "resume_swe.txt"},
-        "aiml": {"pdf": "resume_aiml.pdf", "txt": "resume_aiml.txt"},
-        "data": {"pdf": "resume_data.pdf", "txt": "resume_data.txt"},
+        "swe": {"pdf": "Jakub_Omylak_2026_Resume1.pdf", "txt": "Jakub_Omylak_2026_Resume1.txt"},
+        "aiml": {"pdf": "Jakub_Omylak_2026_Resume2.pdf", "txt": "Jakub_Omylak_2026_Resume2.txt"},
+        "data": {"pdf": "Jakub_Omylak_2026_Resume3.pdf", "txt": "Jakub_Omylak_2026_Resume3.txt"},
         # Legacy, pre-track. Fallback target only -- never routed to.
         "default": {"pdf": "resume.pdf", "txt": "resume.txt"},
     },

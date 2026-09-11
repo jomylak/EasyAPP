@@ -102,12 +102,6 @@ export function GlobalFilterBar({ facets, filters, onChange }: Props) {
         Above pay floor
       </span>
       <span
-        className={`pill${filters.unapplied_only ? " on" : ""}`}
-        onClick={() => set("unapplied_only", !filters.unapplied_only)}
-      >
-        Not yet applied
-      </span>
-      <span
         className={`pill${filters.terminal_only ? " on" : ""}`}
         onClick={() => set("terminal_only", !filters.terminal_only)}
         title="Confirmed terminal: posting explicitly welcomes an already-graduated candidate"
@@ -120,6 +114,13 @@ export function GlobalFilterBar({ facets, filters, onChange }: Props) {
         title="Strong matches whose posting never says either way about post-grad eligibility -- worth a manual look"
       >
         Likely-terminal review
+      </span>
+      <span
+        className={`pill${filters.eligible_only ? " on" : ""}`}
+        onClick={() => set("eligible_only", !filters.eligible_only)}
+        title="Confirmed terminal OR likely-terminal internships only -- for a candidate who can only honestly apply to grad-date-safe roles. Defaults from Settings."
+      >
+        Eligible for me
       </span>
 
       <input

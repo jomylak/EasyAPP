@@ -51,7 +51,6 @@ export interface JobsQuery {
   ats?: string | null
   q?: string
   above_pay_floor?: boolean
-  unapplied_only?: boolean
   terminal_only?: boolean
   likely_terminal_only?: boolean
   eligible_only?: boolean
@@ -107,6 +106,11 @@ export const api = {
     }),
 
   stats: () => request<{ stats: Stats; run: RunState | null; live: boolean }>("/api/stats"),
+
+  pendingBatches: () =>
+    request<{ batches: { batch: string; count: number; queued_at: string | null }[] }>(
+      "/api/queue/pending",
+    ),
 
   applications: (status?: string | null, limit = 500) =>
     request<{ rows: ApplicationRow[] }>(`/api/applications${qs({ status, limit })}`),

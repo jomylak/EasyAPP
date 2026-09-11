@@ -157,7 +157,6 @@ export interface GlobalFilters {
   // e.g. "Workday or Greenhouse, not Lever" in one filter.
   ats: string[]
   above_pay_floor: boolean
-  unapplied_only: boolean
   // Confirmed terminal: is_terminal_internship = 'yes' -- posting explicitly
   // welcomes an already-graduated candidate.
   terminal_only: boolean
@@ -200,6 +199,8 @@ export interface Stats {
   needs_review: number
   spend: number
   priced_attempts: number
+  scoring_spend: number
+  priced_scores: number
 }
 
 export interface ApplicationRow extends JobRow {
@@ -331,7 +332,6 @@ export const EMPTY_GLOBAL_FILTERS: GlobalFilters = {
   job_type: null,
   ats: [],
   above_pay_floor: false,
-  unapplied_only: false,
   terminal_only: false,
   likely_terminal_only: false,
   eligible_only: false,

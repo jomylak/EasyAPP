@@ -95,6 +95,24 @@ export function formatDayLabel(day: string): string {
   return `${weekday} · ${month} ${d.getDate()}`
 }
 
+// `posted` comes back from the API as an ISO timestamp (COALESCE(posted_date,
+// discovered_at) -- see queries.py), so this always has a value to parse.
+export function daysAgo(posted: string | null | undefined): number | null {
+  if (!posted) return null
+  const then = new Date(posted).getTime()
+  if (Number.isNaN(then)) return null
+  const diffMs = Date.now() - then
+  return Math.max(0, Math.floor(diffMs / 86_400_000))
+}
+
+export function formatDaysAgo(posted: string | null | undefined): string {
+  const d = daysAgo(posted)
+  if (d === null) return "—"
+  if (d === 0) return "today"
+  if (d === 1) return "1d"
+  return `${d}d`
+}
+
 export function formatPay(row: { pay_text?: string | null; salary?: number | null }): string {
   if (row.pay_text) return row.pay_text
   if (row.salary) return `$${Math.round(row.salary).toLocaleString()}`

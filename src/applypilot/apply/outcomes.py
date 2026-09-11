@@ -24,6 +24,13 @@ PERMANENT_FAILURES: set[str] = {
     # that identity was retired (single true grad date only), so there is no
     # honest resume left to retry with.
     "grad_date_mismatch",
+    # Same shape as grad_date_mismatch: the form needs a field (date of
+    # birth, for pre-employment verification) that isn't in the candidate
+    # profile at all, so a retry hits the identical wall. Confirmed for real
+    # against IBM's application form on 2026-09-10 -- the agent correctly
+    # refused to fabricate a DOB rather than risk the offer-rescission
+    # warning those forms carry.
+    "dob_required",
 }
 
 # Clean, understood reasons this job will never be applicable -- no human
@@ -32,7 +39,7 @@ DISQUALIFIED_REASONS: set[str] = {
     "not_eligible_location", "not_eligible_salary", "already_applied",
     "expired", "captcha", "account_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
-    "grad_date_mismatch",
+    "grad_date_mismatch", "dob_required",
 }
 
 # Reasons where something unusual happened -- worth a human glance rather
@@ -44,7 +51,14 @@ NEEDS_REVIEW_REASONS: set[str] = {
     "unsafe_permissions", "unsafe_verification", "timeout",
 }
 
-PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
+PERMANENT_PREFIXES: tuple[str, ...] = (
+    "site_blocked", "cloudflare", "blocked_by",
+    # The prompt asks the agent to append a one-line note to this same
+    # RESULT line (e.g. "grad_date_mismatch -- dropdown only offered 2028
+    # and 2029, no 2027 option"), so an exact match against the bare code
+    # would silently miss every real occurrence.
+    "grad_date_mismatch",
+)
 
 # Statuses the worker loop treats as terminal outcomes in their own right,
 # rather than as a `failed:<reason>` string.
@@ -54,7 +68,7 @@ PROMOTE_TO_STATUS: set[str] = {"captcha", "expired", "login_issue"}
 def classify_review_status(reason: str) -> str | None:
     """Bucket a failure reason into 'disqualified', 'needs_review', or None (retry as usual)."""
     reason = (reason or "").lower()
-    if reason in DISQUALIFIED_REASONS:
+    if reason in DISQUALIFIED_REASONS or any(reason.startswith(p) for p in PERMANENT_PREFIXES):
         return "disqualified"
     if reason in NEEDS_REVIEW_REASONS:
         return "needs_review"

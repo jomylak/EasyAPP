@@ -186,8 +186,21 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
             "(job_type != 'internship' "
             "OR is_terminal_internship = 'yes' OR is_terminal_internship_likely = 'yes')"
         )
-    if f.get("unapplied_only"):
-        clauses.append("(apply_status IS NULL OR apply_status = 'failed')")
+    # Unconditional, not opt-in: once a job is queued/in-flight/applied it
+    # must disappear from Browse everywhere, not just behind a pill the user
+    # has to remember to turn on -- otherwise the same row stays clickable
+    # and re-selectable while a batch is running or after it's done, which is
+    # how a job ends up queued twice. The Applications tab (queries.py's
+    # separate `applications()` query) is the only place these statuses are
+    # meant to be visible.
+    clauses.append("(apply_status IS NULL OR apply_status = 'failed')")
+    # Same reasoning for confirmed duplicates: fit_gate_sql() already excludes
+    # them from the ranked apply queue and from scoring/tailoring (see its
+    # docstring), so Browse must exclude them unconditionally too -- otherwise
+    # a duplicate posting can be selected and queued/applied to separately
+    # from its canonical row, even though nothing downstream re-checks
+    # duplicate_of once a human, rather than the ranker, picked the job.
+    clauses.append("duplicate_of IS NULL")
     if f.get("posted_within_days") is not None:
         # Matches the expression `idx_jobs_day` is built on byte-for-byte, so
         # this range scan can use that index instead of a full table scan.
@@ -350,7 +363,9 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
                COALESCE(SUM(apply_cost_usd) FILTER (WHERE apply_backend = 'goose'), 0)
                                                                           AS spend,
                SUM(apply_cost_usd IS NOT NULL AND apply_backend = 'goose')
-                                                                          AS priced_attempts
+                                                                          AS priced_attempts,
+               COALESCE(SUM(score_cost_usd), 0)                          AS scoring_spend,
+               SUM(score_cost_usd IS NOT NULL)                           AS priced_scores
         FROM jobs
     """).fetchone()
     return {k: (row[k] or 0) for k in row.keys()}
@@ -373,4 +388,25 @@ def applications(status: str | None = None, limit: int = 200,
             LIMIT ?""",
         params + [max(1, min(limit, 1000))],
     ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def pending_batches(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Queued batches nobody has launched yet, oldest first.
+
+    Exists so a queue attempt that raced a live run (POST /api/queue
+    succeeded, POST /api/launch then 409'd because a run was already going)
+    is recoverable from the Dashboard once that run ends, instead of only
+    from the batch id in a toast the user has to remember or the CLI
+    fallback (`applypilot apply --queued <batch>`) the error message points
+    at.
+    """
+    conn = conn or get_connection()
+    rows = conn.execute("""
+        SELECT queue_batch AS batch, COUNT(*) AS count, MIN(queued_at) AS queued_at
+        FROM jobs
+        WHERE apply_status = 'queued' AND queue_batch IS NOT NULL
+        GROUP BY queue_batch
+        ORDER BY MIN(queued_at) ASC
+    """).fetchall()
     return [dict(r) for r in rows]

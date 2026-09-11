@@ -78,7 +78,6 @@ export function AttentionPanel({
       page_size: CHUNK,
       min_prestige: minPrestige,
       min_pay: minPay,
-      unapplied_only: true,
       posted_within_days: postedWithinDays,
       q: globalFilters.q || undefined,
       job_type: jobType,

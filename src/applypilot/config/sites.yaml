@@ -38,6 +38,9 @@ blocked_sso:
 base_urls:
   "Intern List - SWE": "https://jobright.ai"
   "NewGrad Jobs - SWE": "https://www.newgrad-jobs.com"
+  "Intern List - AIML": "https://airtable.com"
+  "NewGrad Jobs - AIML": "https://airtable.com"
+  "NewGrad Jobs - DE": "https://airtable.com"
 
 sites:
   # ── Active targets ───────────────────────────────────────────────────
@@ -55,6 +58,30 @@ sites:
 
   - name: "NewGrad Jobs - SWE"
     url: "jobright-category:newgrad:us:swe"
+    type: static
+
+  # ── AIML / DE category tags ─────────────────────────────────────────
+  # Unlike the SWE category above, these category tags (?k=aiml, ?k=de on
+  # the site) are NOT additional slugs on Jobright's minisite API -- each
+  # is backed by its own genuine Airtable shared grid view (confirmed live:
+  # tab title is literally "Airtable - Grid view", not the Jobright-branded
+  # widget). That means these route through _scrape_airtable_button_grid
+  # (matched by "airtable.com/embed/" in the url below), NOT the API path.
+  # KNOWN LIMITATION: that scraper only reads whatever the virtualized grid
+  # has rendered on first load (~18-30 rows observed), not the full
+  # 600-972 records each of these grids actually holds -- it does not
+  # scroll/paginate. Every run still only nets a small, recency-biased
+  # slice of each category until that scraper gains real pagination.
+  - name: "Intern List - AIML"
+    url: "https://airtable.com/embed/appjSXAWiVF4d1HoZ/shrf04yGbrK3IebAl?viewControls=on"
+    type: static
+
+  - name: "NewGrad Jobs - AIML"
+    url: "https://airtable.com/embed/appoxNzAIRReFCzZV/shrmDBF1vNPtzNjzl?viewControls=on"
+    type: static
+
+  - name: "NewGrad Jobs - DE"
+    url: "https://airtable.com/embed/appqYfRGKpLQ8UsdH/shrFnvW20reJCEkYZ?viewControls=on"
     type: static
 
   # ── Everything below is disabled for this profile. ────────────────────

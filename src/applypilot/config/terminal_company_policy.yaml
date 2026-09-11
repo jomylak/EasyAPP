@@ -1,0 +1,467 @@
+# Researched, per-company post-grad-internship eligibility.
+#
+# Populated by one-time external research (official FAQs, careers pages,
+# anecdotal reports from people who've held these roles), not by the scorer.
+# See compute_company_pattern_terminal() in scoring/scorer.py: a company
+# with accepts_post_grad: true here gets its is_terminal_internship_likely
+# rows promoted to confirmed, same queue-jump priority as an explicit
+# per-posting "yes". accepts_post_grad: false is informational only right
+# now (nothing currently acts on it) -- it exists so a company already
+# researched and found to vary by team/role isn't re-researched later.
+#
+# `match` is matched case-insensitively as a substring against jobs.company,
+# so one entry covers every posted variant (e.g. "tiktok" matches
+# "TikTok (ByteDance)", "TikTok USDS Joint Venture", "TikTok").
+#
+# Researched 2026-09-07. Of the 16 companies researched (the highest-volume
+# is_terminal_internship_likely employers at the time), only Neuralink came
+# back a clean, decisive "yes" -- expected, since most internship programs
+# genuinely are enrollment-gated by design; that's the base rate this
+# registry should keep reflecting, not something to second-guess.
+companies:
+  neuralink:
+    accepts_post_grad: true
+    confidence: medium-high
+    note: >
+      Multiple postings explicitly say "currently pursuing OR RECENTLY
+      COMPLETED a degree" -- affirmative allowance, not silence. Others use
+      "pursuing a STEM degree or equivalent experience" with "6+ months
+      experience outside the classroom" as the real bar, not enrollment.
+      Small/fast-hiring-manager-driven company, unlike the centralized
+      university-relations programs most other researched companies run --
+      likely why it doesn't gate on enrollment the way they do. No direct
+      anecdote confirming a specific post-grad hire, but the posting
+      language itself is the most explicit "yes" found in this research
+      round. Had 0 confirmed is_terminal_internship rows internally before
+      this -- the internal auto-rule (needs >=2 confirmed) would never have
+      caught this one; only external research surfaced it.
+    source: "Neuralink job postings via Glassdoor/Built In/ZipRecruiter mirrors"
+
+  ibm:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Genuinely varies, not just unconfirmed -- IBM's own FAQ declines to
+      state a blanket policy ("requirements... can vary" by job/location).
+      Some US postings are strict ("must be enrolled... AND returning to
+      full-time studies upon completion"); IBM's APAC "Graduation Internship
+      Program" is explicitly for those who "recently completed their
+      Bachelor's" -- i.e. an internship-labeled program FOR post-grads. A
+      Blind commenter (self-identified IBM employee) said "You can totally
+      apply and be an intern after graduating... it's case by case." Pattern
+      looks region/program-name driven, not team/technical-track driven.
+      Do not blanket-promote -- matches the internal data's own
+      heterogeneity (13 confirmed-yes vs 14 requires-return postings).
+    source: "ibm.com/careers/blog/united-states-internship-faq; Blind"
+
+  tiktok:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Global FAQ is unambiguous for the mainstream program: "Internships are
+      only open to current students enrolled in an accredited academic
+      institution." Recent grads without full-time experience are
+      explicitly redirected to a separate "graduate opportunities" track.
+      BUT region-specific programs break this: India's GET program is
+      explicitly "offered to new graduates," China's targets students who
+      "finished a majority of their coursework." Split is geography/program
+      driven, matches internal data (109/364 postings explicitly require
+      returning to school). Do not blanket-promote.
+    source: "joinbytedance.com/earlycareers/faq; lifeattiktok.com/earlycareers/faq"
+
+  bytedance:
+    accepts_post_grad: false
+    confidence: high
+    note: "Same parent/program as tiktok above -- see that entry."
+    source: "joinbytedance.com/earlycareers/faq"
+
+  shure:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      Consistent "currently pursuing" / "in-process Bachelor's or Advanced
+      degree" / "currently enrolled" language across postings. No
+      anecdotal evidence found either way (low internship volume, thin
+      online coverage) -- verdict rests on official language, not a
+      confirmed exception search.
+    source: "Shure careers page and role postings"
+
+  qorvo:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Explicit: "designed for college students currently enrolled...
+      with plans to return to school." TRAP: Qorvo's "Internships & Recent
+      College Grads" page bundles two DIFFERENT populations (current-student
+      interns + separately-hired recent-grad full-timers) under one
+      recruiting page -- the branding could mislead a post-grad candidate
+      into thinking the internship itself is open to them. It isn't.
+    source: "careers.qorvo.com/go/Internships-&-Recent-College-Grads"
+
+  l3harris:
+    accepts_post_grad: false
+    confidence: low-medium
+    note: >
+      Official "New Grads and Interns" page states no blanket policy.
+      Some Software Engineering postings explicitly welcome candidates who
+      "completed their Master's degree within the last 12 months"; others
+      (undergrad-focused) imply current enrollment. Defense contractor --
+      most roles also gate on US citizenship + clearance eligibility,
+      which matters more than grad status for many roles. No anecdotal
+      evidence found. Check each posting's own text rather than trusting
+      a company-wide read.
+    source: "careers.l3harris.com/en/new-grads-and-interns"
+
+  zipline:
+    accepts_post_grad: false
+    confidence: low
+    note: >
+      No posting explicitly requires "currently enrolled" or "returning to
+      school" -- postings say "must have at least completed the second year
+      of your Undergraduate studies," which is silent on the post-grad
+      question rather than excluding it. Company's own general framing
+      describes internships as "for students or recent graduates," which
+      leans favorable but isn't a confirmed policy. No firsthand
+      Reddit/Blind account found of a post-grad actually hired in. Marked
+      false (not promoted) because the evidence is suggestive, not
+      decisive -- worth revisiting if a stronger source turns up.
+    source: "jobs.techstars.com/companies/zipline postings"
+
+  universal health services:
+    accepts_post_grad: false
+    confidence: low
+    note: >
+      No official eligibility/FAQ page found stating a policy either way;
+      specific postings returned blocked/403 on fetch. Program appears
+      much smaller/less documented than the other researched companies.
+      Essentially no anecdotal coverage exists (Glassdoor content is almost
+      entirely clinical/nursing staff, not corporate interns). Confirm
+      directly with a recruiter before assuming either way -- this is an
+      absence of evidence, not evidence of a policy.
+    source: "jobs.uhs.com/careers/corporate/culture"
+
+  johns hopkins university applied physics laboratory:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Clean, explicit, unambiguous: eligibility requires "Enrollment as a
+      full-time student for the semester following your internship." APL
+      runs a SEPARATE "New and Recent College Graduates" full-time career
+      track specifically for candidates who've already graduated -- an
+      already-graduated candidate should apply there, not to the
+      internship. Also requires US citizenship + Secret clearance
+      eligibility.
+    source: "jhuapl.edu/careers/internships; jhuapl.edu/careers/new-and-recent-college-graduates"
+
+  clearwater analytics:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Most explicit/restrictive language found in any researched company:
+      postings require "at least one semester of their degree program
+      remaining AFTER the internship ends" -- unambiguously excludes an
+      already-graduated candidate, no exceptions.
+    source: "builtinchicago.org and builtin.com job postings"
+
+  vanguard:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      College to Corporate (C2C) program eligibility: "currently enrolled
+      sophomores, juniors, or graduate/business school students." Grad
+      students are a separate enrolled category, not recent grads out of
+      school. No anecdotal exceptions found.
+    source: "vanguardjobs.com/students/"
+
+  siemens:
+    accepts_post_grad: false
+    confidence: low-medium
+    note: >
+      Genuinely mixed by posting: the general Student Programs page and
+      most postings require enrollment through the internship's duration,
+      but some postings use "must be enrolled in a university program OR A
+      RECENT GRADUATE." Eligibility looks set per-requisition, not
+      company-wide -- check the specific posting rather than trusting a
+      blanket read.
+    source: "sw.siemens.com/en-US/careers/student-programs-and-early-careers/"
+
+  amd:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Explicit and repeated: "must be currently enrolled... with at least
+      one semester or term remaining AFTER the internship concludes." One
+      of the strictest requirements found -- excludes even some final-
+      semester seniors, let alone graduates.
+    source: "amd.com/en/corporate/careers/student-programs.html"
+
+  tesla:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Most explicit of every company researched: postings state candidates
+      must have "an expected graduation date at least one semester after
+      the internship concludes," AND directly instruct: "Recent graduates
+      seeking employment after graduation and not returning to school
+      should apply for full-time positions, not internships." A Blind
+      thread confirms this in practice ("Tesla doesn't give an internship
+      offer to non-student"), with one unconfirmed counter-anecdote about a
+      recruiter suggesting otherwise -- treated as noise against the
+      explicit official language.
+    source: "tesla.com/careers/internships; teamblind.com"
+
+  national security agency:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Consistent across every official posting: "must be enrolled in a
+      degree-seeking program... at time of application." Also requires US
+      citizenship + TS/SCI clearance eligibility (background investigation,
+      polygraph, psych eval) -- separate hard gates unrelated to grad
+      status but worth knowing they eliminate many candidates regardless.
+    source: "intelligencecareers.gov/nsa/students-and-internships"
+
+  garmin:
+    accepts_post_grad: false
+    confidence: low
+    note: >
+      Weakest data point researched -- official pages returned generic
+      marketing content rather than eligibility text on fetch. General
+      framing leans "actively enrolled," one secondary summary described
+      Garmin internships as open to "students and recent graduates" without
+      a primary-source quote to back it. No anecdotal evidence found either
+      way. Recommend checking a live requisition's "Basic Qualifications"
+      section directly before trusting this entry.
+    source: "careers.garmin.com/college-internships (low confidence)"
+
+  # Researched 2026-09-08, second pass -- next-highest-volume
+  # is_terminal_internship_likely employers after the first 16 above. Same
+  # discipline: accepts_post_grad: false requires either explicit
+  # disqualifying language or a base-rate low-confidence read (see Zipline/
+  # Garmin precedent above); a company with no usable evidence found at all
+  # (Sedaro, Nuvo, Etched) was skipped entirely rather than guessed into
+  # this file. 17 of 20 researched companies got an entry.
+  textron:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Textron Systems' own FAQ is explicit and unambiguous: "Textron Systems'
+      internship program is designed to be completed prior to earning your
+      degree" -- graduates are directed to full-time roles instead. Textron
+      Aviation postings consistently require "currently enrolled" status
+      (e.g. a 2027 Avionics/Electrical internship: "currently enrolled in
+      Bachelor of Science in Engineering"); a secondary aggregator source
+      described an explicit "must return to school" requirement for Textron
+      Aviation but that specific phrase could not be independently confirmed
+      on an official page, hence medium-high rather than high. No positive
+      evidence found for any Textron business unit (Systems, Aviation,
+      Specialized Vehicles, Bell). Matching "textron" covers all variants
+      seen in the data ("Textron Systems", "Textron Aviation", "Textron
+      Specialized Vehicles", "Textron (Textron Aviation)", "Textron").
+    source: "textronsystems.com/careers/student-candidates; avianation.com Textron Aviation 2027 internship posting"
+
+  caci:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      Multiple postings (Electrical Engineering, Computer Science, Software
+      Engineer tracks) require current full-time enrollment in an
+      undergraduate or graduate program. The official Early Careers page
+      also shows the TRAP pattern seen elsewhere in this file: it says "if
+      you're a recent graduate, there's no better place to start your career
+      than CACI" directly under a section separate from the internship
+      listings -- a recent-grad-to-full-time pathway bundled on the same
+      page as, but distinct from, the internship program itself. Matching
+      "caci" covers both "CACI International Inc" and "CACI".
+    source: "careers.caci.com/global/en/early-career-internships; multiple CACI internship postings via Prosple/ZipRecruiter"
+
+  amtrak:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Official page is explicit: interns/co-ops must be "actively enrolled
+      in an undergraduate or graduate degree-granting program." Textbook
+      TRAP: Amtrak does have a track for those who "graduated college within
+      the last 3 years" -- but it's a separate "externship" program, not the
+      internship/co-op itself, which the same page confirms does not accept
+      recent graduates.
+    source: "careers.amtrak.com/content/Interns-and-Co-ops/?locale=en_US"
+
+  medpace:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      Postings across multiple functions (cybersecurity, finance, software
+      development, life sciences) consistently say "currently pursuing" /
+      "degree in progress." The official "New Graduates & Interns" page
+      describes internships and new-graduate hiring as separate tracks and
+      frames the internship as for "undergraduate students," without
+      addressing recent-graduate eligibility directly -- consistent
+      enrollment language across postings is the basis for medium (not
+      high) confidence, since no single explicit "must remain enrolled"
+      clause was found.
+    source: "medpace.com/careers/profiles/new-graduates-interns/; multiple Medpace internship postings"
+
+  fm global:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      Undergraduate interns must be juniors/seniors in an engineering or
+      science discipline; graduate interns must be enrolled in a master's or
+      doctorate program. General requirement found: "must be enrolled in a
+      participating college or university" with a current transcript
+      required. The official careers.fm.com/students page itself doesn't
+      spell out eligibility text, so this rests on aggregator-summarized
+      posting language rather than a directly confirmed official quote.
+    source: "structures.cee.illinois.edu FM Global internship listing; peer.berkeley.edu FM Global internship listing"
+
+  oracle:
+    accepts_post_grad: false
+    confidence: low-medium
+    note: >
+      Genuinely mixed, like Siemens/L3Harris elsewhere in this file: most US
+      internship postings require active enrollment with "expected
+      graduation 6 to 18 months after the internship concludes" (a lower-
+      bound graduation window that excludes an already-graduated
+      candidate), but some other Oracle program descriptions mention "recent
+      graduates (up to 2 years of experience)" as eligible -- likely a
+      different, possibly non-US, program. Oracle does not publish one
+      universal eligibility rule; check each posting rather than trusting
+      a blanket read.
+    source: "foundit.in Oracle internship eligibility summary; getsmartresume.com Oracle student/graduate programs guide"
+
+  amazon:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Confirmed directly on a live posting's Basic Qualifications: "a
+      minimum of one quarter/semester/trimester remaining in their studies
+      after their internship concludes" -- textbook TERMINAL_EXCLUDE_RE
+      language, straight from the source, not an aggregator paraphrase.
+      Same posting also gave an "Expected conferral date" window entirely
+      after the internship ends.
+    source: "amazon.jobs SDE Intern, AWS Data Services, Fall 2026 posting (Job ID 10412530), Basic Qualifications section"
+
+  western digital:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Confirmed directly on WD's official Students & Grads careers page:
+      "must still be enrolled in a university or equivalent-level school,"
+      plus "at least one term remaining after internship completion" --
+      i.e. cannot be in your final term. The same page states outright the
+      program "does not accept applicants who have already graduated," and
+      names a separate "Early Talent Program" for grads within the last 24
+      months -- the TRAP pattern again, but this time the source itself
+      names it as a separate program rather than leaving it ambiguous.
+    source: "westerndigital.com/careers/students-and-grads"
+
+  synopsys:
+    accepts_post_grad: false
+    confidence: high
+    note: >
+      Official careers page: "Undergraduate or graduate students (Masters or
+      PhD) who are enrolled at least part time at an accredited college or
+      university are qualified for internships." One specific posting goes
+      further: enrolled full-time AND "returning to university after the
+      completion of the internship" (entering third year or beyond). Page
+      title says "Students & Recent Graduates" but on inspection this reads
+      as marketing copy -- no separate recent-graduate eligibility track was
+      found anywhere in the content.
+    source: "synopsys.com/careers/internships.html"
+
+  simon property group:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Most explicit exclusion language found in this batch: "college
+      graduates will not be considered," candidates must be currently
+      enrolled in a 4-year college/university and able to receive academic
+      credit for the internship. Sourced via an aggregator FAQ mirror
+      rather than a directly-fetched official page (Simon's own site
+      redirected), hence medium-high rather than high.
+    source: "jobzmall.com/simon-property-group/faqs/are-there-internships-available-at-simon-property-group"
+
+  procter & gamble:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Consistently "currently enrolled" across programs: general internships
+      require students with "at least three semesters" completed or current
+      grad-program enrollment; the STEM BOLD program specifies graduation in
+      Fall 2026/Spring 2027/Fall 2027 (i.e. during or after the program, not
+      before); general roles specify "penultimate-year" standing. No
+      positive evidence found for any P&G internship track.
+    source: "P&G internship postings and program descriptions via graduatesfirst.com, globalsouthopportunities.com"
+
+  interdigital:
+    accepts_post_grad: false
+    confidence: low
+    note: >
+      Single data point: one posting summary requires being "currently
+      enrolled in a Bachelor's or Master's program." No official FAQ,
+      no explicit return-to-school language, and no anecdotal evidence
+      either way -- thin evidence, matching the low-confidence pattern used
+      elsewhere in this file (see Zipline/Garmin) rather than a confirmed
+      policy read.
+    source: "ZipRecruiter InterDigital internship posting summary"
+
+  intel:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Aggregator-summarized posting language gives an expected graduation
+      window of "December 2027 through June 2029" for a summer 2027 role --
+      entirely after the internship -- plus a standing half-time-enrollment
+      requirement. Directly fetching an official posting to confirm the
+      exact quote was blocked (403), so this rests on a consistent
+      secondary summary rather than a source I read myself verbatim.
+    source: "getsmartresume.com Intel Student Internship Program summary; 99jobs.org Intel Engineering Student Internship posting"
+
+  hp:
+    accepts_post_grad: false
+    confidence: medium
+    note: >
+      HP Inc.'s general internship requirement is "enrolled full time at an
+      accredited university," current undergrad pursuing a bachelor's, min.
+      60 credit hours, GPA 3.0+. "HP IQ" (matched by the same substring) is
+      HP's internal AI innovation lab, posting its own internship listings
+      (hp-iq.com) -- its specific eligibility text could not be fetched
+      (server error), so this entry assumes HP IQ follows the same general
+      HP eligibility framework rather than confirming it independently.
+      Matching "hp" covers "HP, Inc." and "HP IQ" as seen in the data.
+    source: "HP internship postings via ZipRecruiter/collegedunia aggregation; hp-iq.com (unconfirmed for HP IQ specifically)"
+
+  grant thornton:
+    accepts_post_grad: false
+    confidence: low-medium
+    note: >
+      Official careers page: internships "open to students in undergraduate
+      and graduate programs" -- enrollment-framed, no explicit exclusion of
+      graduates found, and the page doesn't address recent-graduate
+      eligibility either way. A lower-quality aggregator claimed "recently
+      graduated" is also accepted, but that could not be corroborated on
+      the official page, so this is marked false on the base-rate/silence
+      pattern (see Zipline/Garmin), not a confirmed policy.
+    source: "grantthornton.com/careers/students"
+
+  fifth third bank:
+    accepts_post_grad: false
+    confidence: low-medium
+    note: >
+      Multiple programs (Risk, Commercial & Credit) consistently require
+      "currently enrolled in a college or university pursuing a degree" in
+      the relevant field. No explicit return-to-school clause found, no
+      anecdotal evidence either way -- consistent but silent phrasing only.
+    source: "Fifth Third Bank internship postings (Risk Internship Program, Commercial & Credit Internship Program)"
+
+  bosch:
+    accepts_post_grad: false
+    confidence: medium-high
+    note: >
+      Confirmed directly on Bosch USA's official Students page: "currently
+      enrolled in an accredited university and pursuing a Bachelors or
+      Master's degree," GPA 3.0+, age 18+. Page doesn't explicitly address
+      recent graduates, but "currently enrolled" is stated as the
+      requirement itself, not merely implied.
+    source: "bosch.us/careers/start-your-career/students/"

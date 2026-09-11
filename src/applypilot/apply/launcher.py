@@ -66,7 +66,7 @@ if platform.system() != "Windows":
 _JOB_COLUMNS = """url, title, site, company, application_url,
                   tailored_resume_path, fit_score, location, full_description,
                   cover_letter_path, keywords, apply_status AS prior_status,
-                  applied_at AS prior_applied_at"""
+                  applied_at AS prior_applied_at, duplicate_of"""
 
 # How many unusable rows (manual ATS, blocked site) one acquire_job call will
 # set aside before giving up. Bounded so a selection made entirely of unusable
@@ -103,6 +103,48 @@ def _daily_cap_reason(conn, settings: dict) -> str | None:
         return f"daily spend cap reached (${spend:.2f} >= ${max_spend:.2f})"
     if max_count is not None and attempts >= max_count:
         return f"daily application cap reached ({attempts} >= {max_count})"
+    return None
+
+
+def _company_locked_reason(conn, company: str | None, worker_id: int) -> str | None:
+    """Whether another worker already has a job at this company in progress.
+
+    Two workers racing to create an account on the same employer's ATS at the
+    same time is exactly the kind of thing that produces a half-registered
+    account or a password reset neither of them expects -- so only one worker
+    may hold an in_progress row for a given company at a time. Scoped to
+    *other* workers' rows only: a worker re-entering this check for its own
+    in_progress row (there isn't one at claim time, but keeps this safe if
+    that ever changes) must never lock itself out.
+    """
+    from applypilot import company_limits
+    name = config.normalize_company(company)
+    if not name:
+        return None
+    this_agent = f"worker-{worker_id}"
+    rows = conn.execute(
+        "SELECT company FROM jobs WHERE apply_status = 'in_progress' "
+        "AND agent_id IS NOT NULL AND agent_id != ?",
+        (this_agent,),
+    ).fetchall()
+    for r in rows:
+        if company_limits._matches(config.normalize_company(r["company"]), name):
+            return f"{company} already being applied to by another worker"
+    return None
+
+
+def _company_cap_reason(conn, company: str | None) -> str | None:
+    """Whether `company` has already hit its per-period application cap (see
+    company_limits.py) -- a blanket default for most employers, tighter
+    confirmed caps for a few. Unlike the daily cap this resets on its own
+    once the period rolls over, so a capped row is deferred for this run
+    rather than given a terminal status."""
+    from applypilot import company_limits
+    status = company_limits.status_for(conn, company)
+    if status["at_cap"]:
+        period = "lifetime" if status["period"] == "total" else f"{status['period']}ly"
+        return (f"{company} at its {period} cap "
+                f"({status['applied']}/{status['limit']})")
     return None
 
 
@@ -148,6 +190,12 @@ def _select_queued(conn, queue_batch: str, deferred: set):
     looked at these rows and chose them, so their selection *is* the ranking,
     and re-filtering it here would silently drop jobs they explicitly picked
     and leave the batch permanently short of finishing.
+
+    Confirmed duplicates (duplicate_of) are still selected here rather than
+    excluded in SQL -- acquire_job turns them into a terminal 'failed' status
+    right after selection (same pattern as the manual-ATS/blocked-site
+    checks below), instead of leaving them stuck in 'queued' forever with no
+    row this query would ever return to let anyone clear them.
     """
     params = [queue_batch]
     skip_clause = ""
@@ -302,6 +350,26 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 conn.rollback()
                 return None
 
+            # A company cap only applies to rows this call picked on its own
+            # -- an explicit --url is the user overriding the queue by hand,
+            # and second-guessing that pick isn't this check's job.
+            if not target_url:
+                cap_reason = _company_cap_reason(conn, row["company"])
+                if cap_reason:
+                    conn.rollback()
+                    logger.info("Skipping (company cap): %s -- %s",
+                               row["url"][:80], cap_reason)
+                    deferred.add(row["url"])
+                    continue
+
+                locked_reason = _company_locked_reason(conn, row["company"], worker_id)
+                if locked_reason:
+                    conn.rollback()
+                    logger.info("Skipping (company locked): %s -- %s",
+                               row["url"][:80], locked_reason)
+                    deferred.add(row["url"])
+                    continue
+
             apply_url = row["application_url"] or row["url"]
             now = datetime.now(timezone.utc).isoformat()
 
@@ -311,7 +379,16 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # ran. The ranked branch filters blocked sites in SQL already, so
             # that check only ever fires for a queued or targeted row.
             from applypilot.config import is_manual_ats
-            if is_manual_ats(apply_url):
+            if row["duplicate_of"]:
+                # Only reachable via queue_batch/target_url: the ranked
+                # branch's fit_gate_sql() already excludes duplicate_of rows
+                # from selection. A human can still queue one from the web UI
+                # (Browse hides confirmed duplicates, but the flag can be set
+                # by the enrichment backfill after the row was already
+                # queued), so this is the last check before money is spent
+                # applying to a posting under two different URLs.
+                outcome = ("failed", f"duplicate_of:{row['duplicate_of']}")
+            elif is_manual_ats(apply_url):
                 outcome = ("manual", "manual ATS")
             elif _is_blocked(row["site"], row["url"],
                              blocked_sites, blocked_patterns):
@@ -357,8 +434,57 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 # program and a single form mismatch stops being evidence about the rest.
 _SIBLING_SWEEP_MAX = 8
 
+TERMINAL_FALSE_POSITIVES_PATH = config.LOG_DIR / "terminal_false_positives.jsonl"
 
-def _clear_terminal_flags_on_grad_date_mismatch(job_url: str) -> None:
+
+def _log_terminal_false_positive(job_url: str, note: str) -> None:
+    """Record a job the pipeline believed was terminal that a real apply
+    attempt just proved otherwise (a grad_date_mismatch).
+
+    Durable, append-only, JSON-lines -- one record per occurrence, meant to
+    accumulate until there's enough volume for a human (or a future pass) to
+    spot a recurring phrase that keeps fooling the scorer. `note` is the
+    agent's own one-line account of what the form actually required -- the
+    real ground truth here, since it's what the ATS itself asked, not a
+    re-read of the job description. `likely_sentences` is best-effort only
+    -- see scoring.scorer.GRAD_EVIDENCE_SENTENCE_RE's docstring.
+    """
+    from applypilot.scoring.scorer import GRAD_EVIDENCE_SENTENCE_RE
+
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT company, title, full_description, is_terminal_internship, "
+            "       is_terminal_internship_likely, terminal_source "
+            "FROM jobs WHERE url = ?", (job_url,),
+        ).fetchone()
+        if not row:
+            return
+        was_flagged = row["is_terminal_internship"] == "yes" or row["is_terminal_internship_likely"] == "yes"
+        if not was_flagged:
+            # Not a false positive -- the pipeline never thought this one was
+            # terminal, so there's nothing to learn from here.
+            return
+        sentences = GRAD_EVIDENCE_SENTENCE_RE.findall(row["full_description"] or "")
+        record = {
+            "logged_at": datetime.now(timezone.utc).isoformat(),
+            "url": job_url,
+            "company": row["company"],
+            "title": row["title"],
+            "was_confirmed": row["is_terminal_internship"] == "yes",
+            "was_likely": row["is_terminal_internship_likely"] == "yes",
+            "terminal_source": row["terminal_source"],
+            "agent_note": note,
+            "likely_sentences": [s.strip() for s in sentences][:5],
+        }
+        config.ensure_dirs()
+        with open(TERMINAL_FALSE_POSITIVES_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        logger.warning("Could not log terminal false positive for %s: %s", job_url, e)
+
+
+def _clear_terminal_flags_on_grad_date_mismatch(job_url: str, note: str = "") -> None:
     """A grad_date_mismatch means the form itself required a graduation
     timing the candidate's one true resume doesn't satisfy -- i.e. the job
     turned out not to be a "terminal" internship after all, even if it was
@@ -391,11 +517,24 @@ def _clear_terminal_flags_on_grad_date_mismatch(job_url: str) -> None:
     (apply_status IS NULL or 'failed', i.e. not 'applied' or 'in_progress')
     -- there's no reason to touch a job already submitted or mid-attempt.
     """
+    _log_terminal_false_positive(job_url, note)
     try:
         conn = get_connection()
+        # requires_returning_student = 'yes' here too, not just cleared
+        # terminal flags -- this is the single strongest evidence the
+        # pipeline ever gets that this employer's program is enrollment-
+        # gated (a live form actually rejected the candidate on it, not an
+        # LLM read of the posting text), and without recording it here it
+        # never counts toward compute_company_pattern_non_terminal()'s
+        # internal-evidence threshold for THIS row -- only the sibling
+        # postings below got that treatment, so the row that actually
+        # proved it was undercounting its own company's pattern by exactly
+        # the one data point that triggered this function in the first
+        # place.
         conn.execute(
             "UPDATE jobs SET is_terminal_internship = 'no', "
-            "is_terminal_internship_likely = 'no' WHERE url = ?",
+            "is_terminal_internship_likely = 'no', "
+            "requires_returning_student = 'yes' WHERE url = ?",
             (job_url,),
         )
         row = conn.execute(
@@ -819,8 +958,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                             permanent=_is_permanent_failure(result),
                             duration_ms=duration_ms, backend=used_backend,
                             llm_requests=llm_requests, stats=run_stats)
-                if reason == "grad_date_mismatch":
-                    _clear_terminal_flags_on_grad_date_mismatch(job["url"])
+                if reason.startswith("grad_date_mismatch"):
+                    note = reason[len("grad_date_mismatch"):].lstrip(" -:").strip()
+                    _clear_terminal_flags_on_grad_date_mismatch(job["url"], note)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

@@ -291,6 +291,22 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                   <td className="ti" title={r.title ?? undefined}>{r.title || "—"}</td>
                   <td>
                     <span className={`badge ${status}`}>{STATUS_LABEL[status] ?? status}</span>
+                    {status === "failed" && r.apply_error && (
+                      <div
+                        title={r.apply_error}
+                        style={{
+                          fontSize: 11,
+                          color: "var(--a-text-3)",
+                          marginTop: 2,
+                          maxWidth: 220,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {r.apply_error}
+                      </div>
+                    )}
                   </td>
                   <td className="loc">{formatWhen(r.applied_at)}</td>
                   <td className="num">{formatCost(r.apply_cost_usd)}</td>

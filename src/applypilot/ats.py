@@ -84,6 +84,64 @@ def detect_ats(url: str | None = None, html: str | None = None) -> str | None:
     return None
 
 
+# Per-ATS (tenant_pattern, job_id_pattern) pairs. `tenant` scopes the match
+# instead of the `company` DB column: company text isn't populated until
+# scoring (well after duplicate detection needs to run, see dedup.py), and
+# even once populated the same employer shows up under several spellings
+# ("BNY" vs "BNY (The Bank of New York Mellon)") that would need fuzzy
+# matching to unify. The URL's own tenant/org segment is available the
+# instant application_url resolves during enrichment and needs no
+# normalization -- each ATS scopes its own tenant namespace, so two
+# different real employers can never collide on (ats, tenant, job_id).
+#
+# Deliberately no generic "trailing numeric path segment" fallback for
+# unrecognized platforms: verified against production data that two
+# unrelated companies' career sites can coincidentally land on the same
+# bare number (an IBM and a Schneider Electric posting both ended in
+# "131307"). Only platforms below have a URL structure specific enough to
+# trust; everything else returns None and falls back to text-based dedup.
+_JOB_ID_PATTERNS: dict[str, tuple[str, str]] = {
+    "Workday":    (r"https?://([^./]+)\.[^/]*myworkday", r"_((?:JR|R)-?[\w-]*\d[\w-]*)(?:\?|$)"),
+    "Greenhouse": (r"[?&]for=([\w-]+)", r"[?&](?:token|gh_jid)=(\d+)"),
+    "Oracle HCM": (r"/sites/([\w-]+)/job/", r"/job/(\d+)|[?&]jobId=(\d+)"),
+    "iCIMS":      (r"https?://([^./]+)\.icims", r"/jobs/(\d+)|[?&]jobId=(\d+)"),
+    "Dayforce":   (r"/en-[\w-]+/([\w-]+)/CANDIDATEPORTAL", r"/jobs/(\d+)"),
+    "BambooHR":   (r"https?://([^./]+)\.bamboohr", r"/careers/(\d+)"),
+    "Lever":      (r"lever\.co/([\w-]+)/", r"/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"),
+    "Ashby":      (r"ashbyhq\.com/([\w-]+)/", r"/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"),
+    "SmartRecruiters": (r"/company/([\w-]+)/", r"/publication/([0-9a-fA-F-]{20,})"),
+    "Taleo":      (r"https?://([^./]+)\.taleo", r"[?&]job=(\d+)"),
+    "Paylocity":  (r"https?://([^./]+)\.paylocity", r"/Details/(\d+)"),
+    "Workable":   (r"workable\.com/([\w-]+)/", r"/j/([A-Za-z0-9]+)"),
+    "Jobvite":    (r"jobvite\.com/([\w-]+)/", r"/job/([A-Za-z0-9]+)"),
+    "BrassRing":  (r"[?&]siteid=(\d+)", r"[?&]jobid=(\d+)"),
+    "ADP":        (r"[?&]cid=([\w-]+)", r"[?&]jobId=(\d+)"),
+}
+
+
+def extract_job_id(ats: str | None, url: str | None) -> tuple[str, str] | None:
+    """(tenant, job_id) for a known, well-structured ATS platform's URL.
+
+    Returns None for unrecognized platforms/aggregators, or when a pattern
+    for a matched platform doesn't fire (e.g. a Greenhouse embed URL with
+    no `for=` slug). Callers should treat None as "can't safely dedupe by
+    ID here" and fall back to text-based matching, not as "not a duplicate".
+    """
+    if not ats or not url:
+        return None
+    patterns = _JOB_ID_PATTERNS.get(ats)
+    if not patterns:
+        return None
+    tenant_pat, id_pat = patterns
+    tenant_m = re.search(tenant_pat, url, re.I)
+    id_m = re.search(id_pat, url, re.I)
+    if not tenant_m or not id_m:
+        return None
+    tenant = tenant_m.group(1).lower()
+    job_id = next(g for g in id_m.groups() if g)
+    return tenant, job_id
+
+
 def is_hard_to_automate(ats: str | None) -> bool:
     """Whether this ATS is known to defeat generic form-filling.
 

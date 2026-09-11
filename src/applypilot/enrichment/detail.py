@@ -254,7 +254,7 @@ def extract_from_json_ld(intel: dict) -> dict | None:
             continue
 
         desc_clean = clean_description(desc)
-        if len(desc_clean) < 50:
+        if len(desc_clean) < 50 or is_aggregator_boilerplate(desc_clean):
             continue
 
         apply_url = None
@@ -370,6 +370,57 @@ def _extract_page_description(page) -> str | None:
         return None
 
 
+def _dismiss_tour_modal(page) -> None:
+    """Best-effort dismiss of Jobright's onboarding tour overlay.
+
+    Seen live on the newer AIML/DE category boards (not the established SWE
+    ones): a `div#___reactour` overlay (the react-tour library) sits on top
+    of the page and intercepts pointer events, so the "Original Job Post" /
+    Apply-button clicks below retry against it for their full 5s timeout and
+    then give up -- across ~900 jobs that adds up to hours. Couldn't
+    reproduce it live to pin down its exact close-button markup (the
+    profile used to check it didn't trigger the tour), so this tries
+    several generic, low-risk strategies rather than one guessed selector;
+    each is a no-op if the overlay isn't there. Never raises -- this must
+    never be the reason a resolution attempt fails.
+    """
+    try:
+        if not page.query_selector("#___reactour"):
+            return
+    except Exception:
+        return
+
+    for selector in (
+        '#___reactour button[aria-label="Close"]',
+        '#___reactour [aria-label*="close" i]',
+        '#___reactour button:has-text("Skip")',
+        '#___reactour button:has-text("Got it")',
+        '#___reactour button:has-text("Done")',
+        '#___reactour [class*="close" i]',
+    ):
+        try:
+            btn = page.query_selector(selector)
+            if btn:
+                btn.click(timeout=1500)
+                page.wait_for_timeout(300)
+                return
+        except Exception:
+            continue
+
+    # No recognizable close button -- react-tour closes on Escape by
+    # default, and clicking well outside the highlighted element's mask
+    # dismisses a plain click-outside overlay.
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+        if not page.query_selector("#___reactour"):
+            return
+        page.mouse.click(5, 5)
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
 def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
     """Primary strategy: click Jobright's "Original Job Post" toolbar link.
 
@@ -388,9 +439,18 @@ def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
     over), and it costs nothing extra -- this tab was already being opened
     and closed to get the URL.
     """
-    link = page.query_selector("text=Original Job Post")
+    # A wait, not an instant query: the link is fine on a fully-rendered
+    # page, but querying the instant scrape_detail_page's own navigation
+    # settles was seen to miss it on a slower-rendering layout, silently
+    # falling through to the Apply-flow strategy (or nothing) for a job that
+    # did have this link, just not yet.
+    try:
+        link = page.wait_for_selector("text=Original Job Post", timeout=4000)
+    except Exception:
+        link = None
     if not link:
         return None, None
+    _dismiss_tour_modal(page)
     pages_before = set(page.context.pages)
     link.click(timeout=5000)
     page.wait_for_timeout(2000)
@@ -426,6 +486,7 @@ def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
     if not apply_btn:
         return None, None
 
+    _dismiss_tour_modal(page)
     pages_before = set(page.context.pages)
     apply_btn.click(timeout=5000)
     page.wait_for_timeout(1200)
@@ -463,9 +524,13 @@ def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | Non
     back to the Apply button's own flow only if that link isn't present.
 
     Returns (resolved_url, description) -- either or both may be None.
-    Best-effort and silent on failure -- most jobs are not aggregator-
-    wrapped, a logged-out context can't get past the wall at all, and a page
-    layout neither strategy recognizes should not break enrichment.
+    Best-effort on failure -- most jobs are not aggregator-wrapped, a
+    logged-out context can't get past the wall at all, and a page layout
+    neither strategy recognizes should not break enrichment -- but every
+    failure is now logged rather than swallowed silently, since a silent
+    failure here is exactly what let 128 jobright.ai rows in the live DB
+    store the aggregator's own UI chrome as if it were the job posting (see
+    is_aggregator_boilerplate).
     """
     from applypilot.ats import _AGGREGATORS
 
@@ -484,8 +549,11 @@ def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | Non
         resolved, description = _resolve_via_original_job_post(page)
         if not resolved:
             resolved, description = _resolve_via_apply_flow(page)
+        if not resolved:
+            log.warning("Could not resolve original posting behind aggregator: %s", candidate_url)
         return resolved, description
-    except Exception:
+    except Exception as e:
+        log.warning("Original-posting resolution errored for %s: %s", candidate_url, e)
         return None, None
 
 
@@ -650,6 +718,31 @@ def clean_description(text: str) -> str:
     return text.strip()
 
 
+# Jobright.ai's own JSON-LD occasionally carries this promotional blurb --
+# "AI Tools / Customize Your Resume / Maximize your interview chances /
+# Build Cover Letter / Make your application stand out / Analyze How Well
+# You Fit / Understand your strength & weakness" -- as the JobPosting
+# `description` field itself, instead of the actual posting. It's short
+# enough (174 chars) to pass extract_from_json_ld's `len(desc_clean) < 50`
+# floor, so Tier 1 reported "ok" on 128 jobs in the live DB with no real
+# content at all: no company, no real requirements, and a fit_score computed
+# against nothing. Matched on a couple of its more distinctive phrases --
+# ones a real job posting has no reason to contain -- rather than the whole
+# string, so a near-identical repeat with different whitespace still catches.
+_JOBRIGHT_BOILERPLATE_MARKERS = (
+    "maximize your interview chances",
+    "understand your strength & weakness",
+)
+
+
+def is_aggregator_boilerplate(text: str | None) -> bool:
+    """True if `text` is the aggregator's own UI chrome, not a real posting."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _JOBRIGHT_BOILERPLATE_MARKERS)
+
+
 # -- Orchestration -----------------------------------------------------------
 
 SITE_DELAYS = {
@@ -801,6 +894,8 @@ def scrape_detail_page(page, url: str) -> dict:
 
     # Tier 2: Deterministic CSS
     desc = extract_description_deterministic(page)
+    if is_aggregator_boilerplate(desc):
+        desc = None
     apply = extract_apply_url_deterministic(page)
 
     if desc:
@@ -814,7 +909,8 @@ def scrape_detail_page(page, url: str) -> dict:
 
     # Tier 3: LLM
     llm_result = extract_with_llm(page, url)
-    result["full_description"] = llm_result.get("full_description")
+    llm_desc = llm_result.get("full_description")
+    result["full_description"] = None if is_aggregator_boilerplate(llm_desc) else llm_desc
     result["application_url"] = llm_result.get("application_url") or tier2_apply
     result["tier_used"] = 3
 
@@ -903,6 +999,11 @@ def scrape_site_batch(
                         (result.get("full_description"), result.get("application_url"),
                          now, detected, url),
                     )
+                    conn.commit()
+                    from applypilot.dedup import check_duplicate
+                    dup = check_duplicate(conn, url)
+                    if dup["duplicate_of"]:
+                        log.info("  duplicate of %s (%s)", dup["duplicate_of"], dup["reason"])
                 else:
                     stats["error"] += 1
                     err = result.get("error")
@@ -1182,3 +1283,36 @@ def run_enrichment(limit: int = 100, workers: int = 1) -> dict:
     stats = _run_detail_scraper(conn, max_per_site=limit, workers=workers)
 
     return stats
+
+
+def requeue_boilerplate_rows(conn: sqlite3.Connection | None = None) -> int:
+    """Find jobs whose stored full_description is actually the aggregator's
+    own UI chrome (see is_aggregator_boilerplate) and reset them back into
+    the enrichment queue.
+
+    Only clears detail_scraped_at/full_description/detail_attempts -- fit_score
+    etc. are left alone here; a subsequent `applypilot run score` (or
+    `rescore-stale`) naturally re-scores once real content lands, same as
+    any other row that comes back from enrichment with something new. This
+    just gets these 128-and-counting rows out of the "already scraped"
+    state so the next `applypilot run enrich` picks them back up -- with the
+    boilerplate-rejection fix in place, that pass now has a real chance of
+    reaching the actual posting instead of storing the same chrome again.
+    """
+    own_conn = conn is None
+    conn = conn or init_db()
+    rows = conn.execute(
+        "SELECT url, full_description FROM jobs WHERE full_description IS NOT NULL"
+    ).fetchall()
+    urls = [r["url"] for r in rows if is_aggregator_boilerplate(r["full_description"])]
+    if urls:
+        placeholders = ",".join("?" * len(urls))
+        conn.execute(
+            f"UPDATE jobs SET detail_scraped_at = NULL, full_description = NULL, "
+            f"detail_attempts = 0, detail_error = NULL WHERE url IN ({placeholders})",
+            urls,
+        )
+        conn.commit()
+    if own_conn:
+        conn.close()
+    return len(urls)

@@ -221,6 +221,19 @@ export function SettingsTab() {
             onChange={(e) => set("goose_writes_quirks", e.target.checked)}
           />
         </div>
+        <div className="setting-row">
+          <label>Browse defaults to "Eligible for me" only</label>
+          <input
+            type="checkbox"
+            checked={settings.default_eligible_internships_only}
+            onChange={(e) => set("default_eligible_internships_only", e.target.checked)}
+          />
+          <span className="setting-note">
+            on = Browse opens showing only confirmed/likely-terminal internships (for a candidate who
+            can only honestly apply to grad-date-safe roles); off = shows every internship, same as
+            today. Per-install -- each person running their own copy sets this independently.
+          </span>
+        </div>
         <div className="setting-actions">
           <button
             className="btn"
@@ -234,6 +247,7 @@ export function SettingsTab() {
                   tailoring_enabled: settings.tailoring_enabled,
                   cover_letters_enabled: settings.cover_letters_enabled,
                   goose_writes_quirks: settings.goose_writes_quirks,
+                  default_eligible_internships_only: settings.default_eligible_internships_only,
                 },
                 "backend",
               )

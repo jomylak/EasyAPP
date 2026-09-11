@@ -172,6 +172,26 @@ def test_blocked_row_is_failed_not_silently_skipped(db):
     assert err == "site_blocked"
 
 
+def test_duplicate_row_is_failed_not_applied_to(db):
+    """A confirmed duplicate (dedup.check_duplicate) must never be applied
+    to, even in queue_batch mode where the ranked branch's gates are
+    deliberately skipped -- this one isn't a ranking gate, it's "don't apply
+    to the same posting twice under two URLs." A canonical row not flagged
+    as a duplicate of anything is unaffected and still gets claimed."""
+    _insert(db, "https://a.example/2", queue_position=0,
+            duplicate_of="https://a.example/1")
+    _insert(db, "https://a.example/3", queue_position=1)
+
+    job = launcher.acquire_job(queue_batch="batch-1")
+
+    assert job["url"] == "https://a.example/3", "batch stalled on the duplicate row"
+    status, err = db.execute(
+        "SELECT apply_status, apply_error FROM jobs WHERE url = 'https://a.example/2'"
+    ).fetchone()
+    assert status == "failed"
+    assert err == "duplicate_of:https://a.example/1"
+
+
 def test_empty_batch_returns_none(db):
     assert launcher.acquire_job(queue_batch="batch-1") is None
 
@@ -242,3 +262,57 @@ def test_acquire_job_stops_once_daily_cap_hit(db, monkeypatch):
     monkeypatch.setattr(launcher.config, "load_settings", lambda: {"max_daily_applications": 5})
     job = launcher.acquire_job(queue_batch="batch-1")
     assert job["url"] == "https://a.example/2"
+
+
+# ---------------------------------------------------------------------------
+# Per-company caps: some employers won't consider more than N in a period
+# ---------------------------------------------------------------------------
+
+def test_company_cap_reason_is_none_below_the_limit(db):
+    _insert(db, "https://a.example/1", company="Wayne Enterprises",
+            apply_status="applied", applied_at="2026-09-01T10:00:00")
+    assert launcher._company_cap_reason(db, "Wayne Enterprises") is None
+
+
+def test_company_cap_reason_fires_at_the_blanket_default(db):
+    """Six is the blanket default for any company with no confirmed number."""
+    for i in range(6):
+        _insert(db, f"https://a.example/{i}", company="Wayne Enterprises",
+                apply_status="applied", applied_at="2026-09-01T10:00:00")
+    reason = launcher._company_cap_reason(db, "Wayne Enterprises")
+    assert reason is not None and "6/6" in reason
+
+
+def test_company_cap_matches_name_variants(db):
+    """'Google LLC' and 'Google' must be recognized as the same employer, or
+    the cap never fires for the exact spelling a given posting happens to use."""
+    for i in range(3):
+        _insert(db, f"https://a.example/{i}", company="Google LLC",
+                apply_status="applied", applied_at="2026-09-01T10:00:00")
+    assert launcher._company_cap_reason(db, "Google") is not None
+
+
+def test_company_cap_does_not_apply_to_a_targeted_url(db):
+    """--url is the user overriding the queue by hand; the cap shouldn't
+    second-guess an explicit pick."""
+    for i in range(6):
+        _insert(db, f"https://a.example/applied-{i}", company="Wayne Enterprises",
+                apply_status="applied", applied_at="2026-09-01T10:00:00")
+    _insert(db, "https://a.example/target", company="Wayne Enterprises",
+            apply_status=None, tailored_resume_path="/tmp/resume.txt")
+
+    job = launcher.acquire_job(target_url="https://a.example/target")
+    assert job is not None
+    assert job["url"] == "https://a.example/target"
+
+
+def test_acquire_job_skips_a_queued_row_at_its_company_cap(db):
+    for i in range(6):
+        _insert(db, f"https://a.example/applied-{i}", company="Wayne Enterprises",
+                apply_status="applied", applied_at="2026-09-01T10:00:00")
+    _insert(db, "https://a.example/capped", company="Wayne Enterprises",
+            queue_position=0)
+    _insert(db, "https://a.example/ok", company="Other Co", queue_position=1)
+
+    job = launcher.acquire_job(queue_batch="batch-1")
+    assert job["url"] == "https://a.example/ok"
