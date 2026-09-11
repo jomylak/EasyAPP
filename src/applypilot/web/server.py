@@ -171,7 +171,6 @@ def api_jobs(
     ats: str | None = None,
     q: str | None = None,
     above_pay_floor: bool = False,
-    unapplied_only: bool = False,
     terminal_only: bool = False,
     likely_terminal_only: bool = False,
     eligible_only: bool = False,
@@ -188,10 +187,11 @@ def api_jobs(
     param is simpler than a repeated-key list param on both ends for
     something that's just an OR over a handful of strings.
 
-    Eligibility and the Spring/Summer-only internship term are enforced
-    unconditionally inside queries._filter_clauses, not as opt-in flags here
-    -- there's no reason this table should ever surface a job you can't
-    honestly take or a term you can't work.
+    Eligibility, the Spring/Summer-only internship term, and whether a job is
+    already decided (queued/in-flight/applied) or a confirmed duplicate are
+    all enforced unconditionally inside queries._filter_clauses, not as
+    opt-in flags here -- there's no reason this table should ever surface a
+    job you can't honestly take, can't work, or shouldn't be re-selecting.
 
     `tier_only` narrows to big-tech postings; `include_tier` instead exempts
     them from the min_* bars, so a prestige-10 posting with a fit of 3 still
@@ -204,7 +204,7 @@ def api_jobs(
             "job_type": job_type, "site": site,
             "ats": [a for a in ats.split(",") if a] if ats else None,
             "q": q,
-            "above_pay_floor": above_pay_floor, "unapplied_only": unapplied_only,
+            "above_pay_floor": above_pay_floor,
             "terminal_only": terminal_only,
             "likely_terminal_only": likely_terminal_only,
             "eligible_only": eligible_only,
@@ -240,6 +240,11 @@ def api_stats() -> dict:
 @app.get("/api/applications")
 def api_applications(status: str | None = None, limit: int = 200) -> dict:
     return {"rows": queries.applications(status=status, limit=limit)}
+
+
+@app.get("/api/queue/pending")
+def api_queue_pending() -> dict:
+    return {"batches": queries.pending_batches()}
 
 
 @app.get("/api/ats-stats")
@@ -304,14 +309,16 @@ def api_queue(payload: dict = Body(...)) -> dict:
     queued = 0
     with conn:
         for position, url in enumerate(urls):
-            # Never re-queue something already applied or in flight; the UI
-            # can be looking at a stale page.
+            # Never re-queue something already applied or in flight, or a
+            # confirmed duplicate of another row; the UI can be looking at a
+            # stale page.
             cur = conn.execute("""
                 UPDATE jobs
                    SET apply_status = 'queued', queue_batch = ?,
                        queue_position = ?, queued_at = ?, apply_error = NULL
                  WHERE url = ?
                    AND (apply_status IS NULL OR apply_status IN ('failed', 'queued'))
+                   AND duplicate_of IS NULL
             """, (batch, position, now, url))
             queued += cur.rowcount
 

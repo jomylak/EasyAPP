@@ -80,6 +80,9 @@ def _build_profile_summary(profile: dict, start_date_override: str = "") -> str:
         lines.append(f"Years Experience: {exp['years_of_experience_total']}")
     if exp.get("education_level"):
         lines.append(f"Education: {exp['education_level']}")
+    education_start_date = config.load_settings().get("education_start_date", "")
+    if education_start_date:
+        lines.append(f"Education Start Date: {education_start_date}")
 
     # Availability -- variant-specific start_date takes priority; see docstring
     lines.append(f"Available: {start_date_override or avail.get('earliest_start_date', 'Immediately')}")

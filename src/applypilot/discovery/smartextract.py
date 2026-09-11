@@ -30,7 +30,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from applypilot import config
 from applypilot.config import CONFIG_DIR
-from applypilot.database import init_db, get_stats
+from applypilot.database import init_db, get_stats, get_connection
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -197,6 +197,7 @@ def _store_jobs_filtered(
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
+    reposted = 0
     filtered = 0
     too_old = 0
     job_type = _classify_job_type(site)
@@ -214,20 +215,41 @@ def _store_jobs_filtered(
         row_job_type = job_type
         if row_job_type == "internship" and title_suggests_new_grad(job.get("title")):
             row_job_type = "new_grad"
+        normalized_posted = _normalize_posted_date(job.get("posted_date"))
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date, airtable_record_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
                  job.get("location"), site, strategy, now, row_job_type,
-                 _normalize_posted_date(job.get("posted_date"))),
+                 normalized_posted,
+                 job.get("airtable_record_id")),
             )
             new += 1
         except sqlite3.IntegrityError:
             existing += 1
+            # Jobright (and presumably other sources) re-touch a listing's
+            # posted date when an employer renews/re-runs it -- same job_id,
+            # newer postedAt. Bump our posted_date to match so the job
+            # resurfaces under today's day-view bucket instead of staying
+            # filed under whenever we first saw it, which is what makes a
+            # real repost look identical to "we never re-checked this job."
+            # Guarded to only move forward in time (never backward) so a
+            # stale/unparsable posted_date on one pass can't regress a job
+            # that already has a newer one recorded.
+            if normalized_posted:
+                cur = conn.execute(
+                    "UPDATE jobs SET posted_date = ? WHERE url = ? "
+                    "AND (posted_date IS NULL OR posted_date < ?)",
+                    (normalized_posted, url, normalized_posted),
+                )
+                if cur.rowcount:
+                    reposted += 1
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
+    if reposted:
+        log.info("Bumped posted_date on %d reposted/renewed jobs", reposted)
     if too_old:
         log.info("Filtered %d jobs (posted more than %d days ago)",
                  too_old, config.DEFAULTS["discovery_posted_within_days"])
@@ -967,9 +989,35 @@ def execute_css_selectors(intel: dict) -> tuple[dict, list[dict]]:
     return selectors, jobs
 
 
-def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
+_AIRTABLE_RECORD_ID_RE = re.compile(r"(rec[A-Za-z0-9]{14,})/?$")
+
+
+def _extract_airtable_record_id(href: str | None) -> str | None:
+    """Pull the trailing `rec...` record id off an expand-row href.
+
+    e.g. ".../viwz0pLEKnH0F4Hno/recAmG8jEMzAf50nq" -> "recAmG8jEMzAf50nq".
+    This id is readable straight off the unexpanded grid row (the href is
+    already on the DOM's `[data-testid="expandRowWrapper"]` anchor) -- no
+    click/expand needed -- and is stable across re-crawls, which is what lets
+    _scrape_airtable_button_grid skip the ~0.5s expand-and-read cost for a
+    row it has already resolved on a previous pass.
+    """
+    if not href:
+        return None
+    m = _AIRTABLE_RECORD_ID_RE.search(href)
+    return m.group(1) if m else None
+
+
+def _scrape_airtable_button_grid(
+    url: str,
+    headless: bool = True,
+    known_record_ids: set[str] | None = None,
+    on_job=None,
+    stats: dict | None = None,
+) -> list[dict]:
     """Bespoke scraper for Airtable-embedded job boards with a Button-field
-    apply link (newgrad-jobs.com's structure).
+    apply link (newgrad-jobs.com's structure, and the AIML/DE category tags
+    on both newgrad-jobs.com and intern-list.com).
 
     The generic two-phase LLM strategy correctly finds row titles from the
     virtualized grid, but a Button field's real <a href> only exists in the
@@ -978,6 +1026,46 @@ def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
     expands each row, reads the href directly, and closes the modal before
     moving on: one extra step per row, but a stable direct DOM read instead
     of guessing at virtualized cell selectors that come and go with scroll.
+
+    Full-grid pagination: Airtable's grid is canvas-rendered with a fixed-size
+    pool of `[data-testid="expandRowWrapper"]` overlay elements (observed
+    ~21-27 regardless of scroll position) that get REPOSITIONED to track
+    whatever's currently visible -- it's not a hard cap on how much data
+    exists, just how much is mounted at once. All ~600-4700 records are
+    already loaded client-side (confirmed live: no network request fires on
+    scroll), so getting the rest is purely a matter of scrolling the grid's
+    own scroll container (`.antiscroll-inner.keyboard-accessible-grid-container`,
+    found live -- NOT the page/iframe scroll) and re-reading that same pool
+    of overlays at each position. Scrolls by one full viewport height per
+    round (some overlap at the edges is expected and handled by `seen_urls`
+    dedup) until scrollTop stops advancing. Verified live (2026-09): the
+    scroll loop itself does reach the bottom of a 600+ record grid in ~25
+    rounds -- it is not actually capped at the first screenful, contrary to
+    an earlier (stale) assumption in config/sites.yaml. The real cost is
+    time: expanding every row to read its Button-field href, one at a time,
+    measured at ~0.5s/row live -- see `known_record_ids` below for how that's
+    avoided on steady-state re-crawls.
+
+    Args:
+        known_record_ids: Record ids (see _extract_airtable_record_id)
+            already stored for this site from a previous pass. Every row's
+            href is read cheaply (no click) and checked against this set
+            first -- a match skips the expand/read/close cycle entirely, so
+            a re-crawl only pays the real per-row cost for genuinely new
+            rows. On an already-caught-up board that turns a several-minute
+            scrape into a ~10-20s scroll-through that expands nothing. None
+            (or empty) expands every row, same as the original behavior.
+        on_job: Optional callback invoked with each newly-resolved job dict
+            the moment it's read, so the caller can store it in the database
+            immediately instead of waiting for the whole grid to finish --
+            the freshest posting (found first, since the grid reads newest-
+            first) no longer sits unstored for the several minutes a full
+            scrape of an uncached board can take.
+        stats: Optional dict, populated with "skipped_known" and
+            "rows_examined" (jobs found + skipped) counts. A steady-state
+            re-crawl legitimately returns zero NEW jobs once caught up --
+            the caller needs rows_examined, not just len(jobs), to tell that
+            apart from the scrape having failed to read the grid at all.
 
     Deliberately extracts ONLY title and url. These rows link to jobright.ai
     detail pages -- the same backing source Intern List uses -- so the normal
@@ -990,6 +1078,9 @@ def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
     jobs: list[dict] = []
+    seen_urls: set[str] = set()
+    seen_record_ids: set[str] = set(known_record_ids or ())
+    skipped_known = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         page = browser.new_page(user_agent=UA, viewport={"width": 1400, "height": 900})
@@ -1001,66 +1092,132 @@ def _scrape_airtable_button_grid(url: str, headless: bool = True) -> list[dict]:
             except Exception:
                 pass
 
-            row_count = len(page.query_selector_all('[data-testid="expandRowWrapper"]'))
-            log.info("Airtable grid: %d rows found", row_count)
+            scroll_container = page.query_selector(
+                ".antiscroll-inner.keyboard-accessible-grid-container"
+            )
+            total_label = page.query_selector(".selectionCount.summaryCell")
+            log.info(
+                "Airtable grid: %s (scroll container %s)",
+                total_label.inner_text() if total_label else "record count unknown",
+                "found" if scroll_container else "NOT FOUND -- only first-view rows will be read",
+            )
 
-            for i in range(row_count):
-                try:
-                    expand_links = page.query_selector_all('[data-testid="expandRowWrapper"]')
-                    if i >= len(expand_links):
-                        break
-                    target = expand_links[i]
-                    target.scroll_into_view_if_needed(timeout=3000)
-                    target.click(timeout=5000)
-                    page.wait_for_selector('[role="dialog"]', timeout=5000)
-                    dialog = page.query_selector('[role="dialog"]')
-                    if not dialog:
-                        continue
+            # Safety cap, not an expected stopping point -- a real board
+            # tops out around 4700 records (Jobright's own ceiling), and one
+            # viewport of virtualized rows is roughly 25-30, so 400 rounds
+            # covers ~10-12k rows before this gives up.
+            MAX_ROUNDS = 400
+            stable_rounds = 0
+            last_scroll_top = -1
 
-                    # The record's primary field (Position Title for this
-                    # base) is always the dialog's first line of text.
-                    full_text = dialog.inner_text()
-                    title = full_text.split("\n")[0].strip() if full_text else None
-
-                    link_el = dialog.query_selector('a[data-button-field-button="true"]')
-                    apply_url = link_el.get_attribute("href") if link_el else None
-
-                    if title and apply_url:
-                        jobs.append({
-                            "title": title,
-                            "url": apply_url,
-                            "salary": None,
-                            "description": None,
-                            "location": None,
-                            "posted_date": None,
-                        })
-                except Exception as e:
-                    log.debug("Row %d extraction failed: %s", i, e)
-                finally:
-                    # Escape leaves the dialog's outer container mounted in
-                    # the DOM (a stale, invisible copy that intercepts the
-                    # NEXT row's click), even though it looks fully closed --
-                    # clicking the dialog's own close button does a complete
-                    # teardown instead. Without this, every other row failed.
+            for round_num in range(MAX_ROUNDS):
+                row_count = len(page.query_selector_all('[data-testid="expandRowWrapper"]'))
+                for i in range(row_count):
+                    opened_dialog = False
                     try:
+                        expand_links = page.query_selector_all('[data-testid="expandRowWrapper"]')
+                        if i >= len(expand_links):
+                            break
+                        target = expand_links[i]
+
+                        # Cheap pre-check: the record id is already sitting on
+                        # this row's own href, no click needed. A row we've
+                        # already resolved (this pass or a previous one) is
+                        # skipped entirely -- this is what makes a steady-
+                        # state re-crawl fast instead of re-paying the ~0.5s
+                        # expand cost for every one of hundreds of old rows.
+                        record_id = _extract_airtable_record_id(target.get_attribute("href"))
+                        if record_id and record_id in seen_record_ids:
+                            skipped_known += 1
+                            continue
+
+                        target.scroll_into_view_if_needed(timeout=3000)
+                        target.click(timeout=5000)
+                        opened_dialog = True
+                        page.wait_for_selector('[role="dialog"]', timeout=5000)
                         dialog = page.query_selector('[role="dialog"]')
-                        close_btn = dialog.query_selector(
-                            'button[aria-label="Close"], [data-tutorial-selector-id="detailViewCloseButton"]'
-                        ) if dialog else None
-                        if close_btn:
-                            close_btn.click(timeout=2000)
-                        else:
-                            page.keyboard.press("Escape")
-                    except Exception:
+                        if not dialog:
+                            continue
+
+                        # The record's primary field (Position Title for this
+                        # base) is always the dialog's first line of text.
+                        full_text = dialog.inner_text()
+                        title = full_text.split("\n")[0].strip() if full_text else None
+
+                        link_el = dialog.query_selector('a[data-button-field-button="true"]')
+                        apply_url = link_el.get_attribute("href") if link_el else None
+
+                        if record_id:
+                            seen_record_ids.add(record_id)
+                        if title and apply_url and apply_url not in seen_urls:
+                            seen_urls.add(apply_url)
+                            job = {
+                                "title": title,
+                                "url": apply_url,
+                                "salary": None,
+                                "description": None,
+                                "location": None,
+                                "posted_date": None,
+                                "airtable_record_id": record_id,
+                            }
+                            jobs.append(job)
+                            if on_job:
+                                on_job(job)
+                    except Exception as e:
+                        log.debug("Round %d row %d extraction failed: %s", round_num, i, e)
+                    finally:
+                        if not opened_dialog:
+                            continue
+                        # Escape leaves the dialog's outer container mounted in
+                        # the DOM (a stale, invisible copy that intercepts the
+                        # NEXT row's click), even though it looks fully closed --
+                        # clicking the dialog's own close button does a complete
+                        # teardown instead. Without this, every other row failed.
                         try:
-                            page.keyboard.press("Escape")
+                            dialog = page.query_selector('[role="dialog"]')
+                            close_btn = dialog.query_selector(
+                                'button[aria-label="Close"], [data-tutorial-selector-id="detailViewCloseButton"]'
+                            ) if dialog else None
+                            if close_btn:
+                                close_btn.click(timeout=2000)
+                            else:
+                                page.keyboard.press("Escape")
                         except Exception:
-                            pass
-                    page.wait_for_timeout(300)
+                            try:
+                                page.keyboard.press("Escape")
+                            except Exception:
+                                pass
+                        page.wait_for_timeout(300)
+
+                if not scroll_container:
+                    break
+
+                scroll_top = scroll_container.evaluate(
+                    "el => { const before = el.scrollTop; "
+                    "el.scrollTop += el.clientHeight; "
+                    "el.dispatchEvent(new Event('scroll', {bubbles: true})); "
+                    "return el.scrollTop; }"
+                )
+                page.wait_for_timeout(400)
+                log.info(
+                    "Airtable grid: round %d done, %d unique rows so far (scrollTop=%s)",
+                    round_num, len(jobs), scroll_top,
+                )
+                if scroll_top <= last_scroll_top:
+                    stable_rounds += 1
+                    if stable_rounds >= 2:
+                        break
+                else:
+                    stable_rounds = 0
+                last_scroll_top = scroll_top
         finally:
             browser.close()
 
-    log.info("Airtable grid: extracted %d of %d rows with a usable url", len(jobs), row_count)
+    log.info("Airtable grid: extracted %d new rows with a usable url, skipped %d already-known",
+              len(jobs), skipped_known)
+    if stats is not None:
+        stats["skipped_known"] = skipped_known
+        stats["rows_examined"] = len(jobs) + skipped_known
     return jobs
 
 
@@ -1076,7 +1233,7 @@ _JOBRIGHT_EXCLUDE_TITLES = [
 ]
 
 
-def _scrape_jobright_minisite_api(category: str) -> list[dict]:
+def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
     """Pull jobs directly from Jobright's own public minisite JSON API.
 
     Found by watching network traffic on the embedded widget both
@@ -1098,10 +1255,26 @@ def _scrape_jobright_minisite_api(category: str) -> list[dict]:
     Args:
         category: Jobright's own category slug, e.g. "intern:us:swe" or
             "newgrad:us:swe". Determines which board this pulls.
+        on_job: Optional callback invoked with each job dict as its page
+            comes back, so the caller can store it immediately rather than
+            waiting for the whole (usually single-request) response to
+            finish -- the earliest, freshest postings no longer sit unstored
+            for however long the rest of the fetch takes.
     """
     jobs: list[dict] = []
     position = 0
-    count = 50
+    # Large enough to pull the whole list (observed range: ~3900-4700) in a
+    # single request. Used to be 50, which meant ~80-95 sequential requests
+    # per pass -- and this list isn't static while we page through it:
+    # Jobright re-touches postedAt on existing listings continuously (an
+    # employer renewal, apparently), so items shift position mid-crawl.
+    # Confirmed missing a job that was live on the site because it drifted
+    # across a page boundary between two of those ~80 requests. A single
+    # request sees one consistent snapshot, so there's no boundary for
+    # anything to drift across. The while loop below still repages if a
+    # future `total` ever exceeds this, so nothing silently truncates if the
+    # list outgrows it.
+    count = 10000
     total: int | None = None
     headers = {
         "User-Agent": UA,
@@ -1153,14 +1326,17 @@ def _scrape_jobright_minisite_api(category: str) -> list[dict]:
                 if salary in (None, "N/A", ""):
                     salary = None
 
-                jobs.append({
+                job = {
                     "title": props.get("title"),
                     "salary": salary,
                     "description": props.get("qualifications"),
                     "location": props.get("location"),
                     "url": f"https://jobright.ai/jobs/info/{job_id}",
                     "posted_date": posted_date,
-                })
+                }
+                jobs.append(job)
+                if on_job:
+                    on_job(job)
 
             position += count
 
@@ -1170,10 +1346,64 @@ def _scrape_jobright_minisite_api(category: str) -> list[dict]:
 
 # -- Main per-site extraction ------------------------------------------------
 
-def _run_one_site(name: str, url: str) -> dict:
-    """Run full smart extraction pipeline on one site URL."""
+def _make_streaming_sink(
+    conn: sqlite3.Connection, name: str, strategy: str,
+    accept_locs: list[str], reject_locs: list[str], flush_every: int = 1,
+):
+    """Build an on_job callback that stores each job to the DB as a scraper
+    finds it, instead of the caller buffering an entire site's results in
+    memory and storing them all in one shot once the whole (possibly
+    several-minutes-long) scrape finishes. Cheap to do per-job here: WAL
+    mode + a 10s busy_timeout (see init_db()) make each commit fast and
+    tolerant of the enrich/score loops writing to the same DB concurrently.
+    Returns (on_job, flush, stats) -- call flush() once after the scraper
+    returns to write out anything still sitting in the buffer (a no-op at
+    flush_every=1 unless a caller raises it back up).
+    """
+    buffer: list[dict] = []
+    stats = {"new": 0, "existing": 0}
+
+    def flush() -> None:
+        if not buffer:
+            return
+        n, e = _store_jobs_filtered(conn, buffer, name, strategy, accept_locs, reject_locs)
+        stats["new"] += n
+        stats["existing"] += e
+        buffer.clear()
+
+    def on_job(job: dict) -> None:
+        buffer.append(job)
+        if len(buffer) >= flush_every:
+            flush()
+
+    return on_job, flush, stats
+
+
+def _run_one_site(
+    name: str, url: str,
+    accept_locs: list[str] | None = None,
+    reject_locs: list[str] | None = None,
+) -> dict:
+    """Run full smart extraction pipeline on one site URL.
+
+    Args:
+        accept_locs, reject_locs: When given (not None), the two fast-path
+            scrapers below (Jobright minisite API, Airtable button-grid)
+            store each job to the database as they find it rather than
+            returning one big list for the caller to store after the whole
+            site finishes -- see _make_streaming_sink. Deliberately opens
+            its own connection via get_connection() rather than accepting
+            one as an argument: this runs inside a ThreadPoolExecutor worker
+            in parallel mode, and this codebase's connections are
+            thread-local (see database.get_connection) -- a connection
+            created on the calling thread isn't safe to use here. When
+            accept_locs is None (e.g. a caller just wants the raw scrape
+            results), both fall back to the original buffer-then-return-
+            everything behavior with no DB access at all.
+    """
     log.info("=" * 60)
     log.info("%s: %s", name, url)
+    conn = get_connection() if accept_locs is not None else None
 
     # Jobright's own public minisite API -- see _scrape_jobright_minisite_api.
     # Supersedes both the Jobright-iframe CSS scraper (Intern List) and the
@@ -1184,6 +1414,20 @@ def _run_one_site(name: str, url: str) -> dict:
     # "jobright-category:intern:us:swe" or "jobright-category:newgrad:us:swe".
     if url.startswith("jobright-category:"):
         category = url[len("jobright-category:"):]
+        strategy = "jobright_minisite_api"
+        if conn is not None:
+            on_job, flush, store_stats = _make_streaming_sink(
+                conn, name, strategy, accept_locs or [], reject_locs or [])
+            jobs = _scrape_jobright_minisite_api(category, on_job=on_job)
+            flush()
+            return {
+                "name": name, "url": url,
+                "status": "PASS" if jobs else "FAIL",
+                "jobs": [], "already_stored": True,
+                "stored_new": store_stats["new"], "stored_existing": store_stats["existing"],
+                "total": len(jobs), "titles": len(jobs),
+                "strategy": strategy,
+            }
         jobs = _scrape_jobright_minisite_api(category)
         return {
             "name": name,
@@ -1192,7 +1436,7 @@ def _run_one_site(name: str, url: str) -> dict:
             "jobs": jobs,
             "total": len(jobs),
             "titles": len(jobs),
-            "strategy": "jobright_minisite_api",
+            "strategy": strategy,
         }
 
     # Airtable-embedded job boards (Button-field apply links) need the
@@ -1202,6 +1446,36 @@ def _run_one_site(name: str, url: str) -> dict:
     # Kept as a fallback for any future site with this same structure; the
     # jobright-category path above is what NewGrad Jobs actually uses now.
     if "airtable.com/embed/" in url:
+        strategy = "airtable_button_expand"
+        if conn is not None:
+            known_ids = {
+                r["airtable_record_id"] for r in conn.execute(
+                    "SELECT airtable_record_id FROM jobs "
+                    "WHERE site = ? AND airtable_record_id IS NOT NULL",
+                    (name,),
+                ).fetchall()
+            }
+            on_job, flush, store_stats = _make_streaming_sink(
+                conn, name, strategy, accept_locs or [], reject_locs or [])
+            scrape_stats: dict = {}
+            jobs = _scrape_airtable_button_grid(
+                url, known_record_ids=known_ids, on_job=on_job, stats=scrape_stats)
+            flush()
+            # A caught-up steady-state pass legitimately finds zero NEW jobs
+            # -- that's success, not failure. Only call it FAIL when the
+            # scrape examined nothing at all (grid didn't load, selector
+            # changed, etc), using rows_examined rather than len(jobs) to
+            # tell the two apart.
+            examined = scrape_stats.get("rows_examined", len(jobs))
+            return {
+                "name": name, "url": url,
+                "status": "PASS" if (jobs or examined or known_ids) else "FAIL",
+                "jobs": [], "already_stored": True,
+                "stored_new": store_stats["new"], "stored_existing": store_stats["existing"],
+                "total": len(jobs), "titles": len(jobs),
+                "skipped_known": scrape_stats.get("skipped_known", 0),
+                "strategy": strategy,
+            }
         jobs = _scrape_airtable_button_grid(url)
         return {
             "name": name,
@@ -1210,7 +1484,7 @@ def _run_one_site(name: str, url: str) -> dict:
             "jobs": jobs,
             "total": len(jobs),
             "titles": len(jobs),
-            "strategy": "airtable_button_expand",
+            "strategy": strategy,
         }
 
     # Step 1: Collect intelligence
@@ -1395,6 +1669,17 @@ def _run_all(
 
     def _process_result(r: dict, target: dict) -> None:
         nonlocal total_new, total_existing
+        # The Jobright-API and Airtable-grid fast paths in _run_one_site
+        # already stored their own results as they were found (see
+        # _make_streaming_sink) -- storing "jobs" again here would just
+        # re-insert (harmlessly, since url is the PRIMARY KEY, but it would
+        # double-count total_new/total_existing and pay a wasted query).
+        if r.get("already_stored"):
+            total_new += r.get("stored_new", 0)
+            total_existing += r.get("stored_existing", 0)
+            log.info("DB: +%d new, %d already existed (stored incrementally during scrape)",
+                     r.get("stored_new", 0), r.get("stored_existing", 0))
+            return
         jobs = r.get("jobs", [])
         if jobs:
             new, existing = _store_jobs_filtered(conn, jobs, target["name"],
@@ -1408,7 +1693,8 @@ def _run_all(
         # Parallel mode
         with ThreadPoolExecutor(max_workers=min(workers, len(targets))) as pool:
             future_to_target = {
-                pool.submit(_run_one_site, target["name"], target["url"]): target
+                pool.submit(_run_one_site, target["name"], target["url"],
+                            accept_locs, reject_locs): target
                 for target in targets
             }
             for future in as_completed(future_to_target):
@@ -1424,7 +1710,7 @@ def _run_all(
                 label = f"{target['name']} [{target['query']}]"
             log.info("[%d/%d] %s", i + 1, len(targets), label)
 
-            r = _run_one_site(target["name"], target["url"])
+            r = _run_one_site(target["name"], target["url"], accept_locs, reject_locs)
             results.append(r)
             _process_result(r, target)
 

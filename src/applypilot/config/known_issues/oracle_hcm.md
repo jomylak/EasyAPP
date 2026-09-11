@@ -1,0 +1,2 @@
+- Gmail API OAuth token expired (`invalid_grant` on every search_emails call). The Oracle HCM application flow requires a 6-digit email verification code, and without Gmail access, I cannot retrieve it to proceed.
+- Oracle HCM Candidate Experience site is applying rate limiting on the email authentication screen — returns "Too Many Attempts. Try Again Later. Try again in 30 minutes" after submitting the email address, preventing access to the actual application form. This is a platform-level IP/session block that cannot be bypassed.

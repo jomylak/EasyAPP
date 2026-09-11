@@ -177,6 +177,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     # Don't let an inherited Claude Code session identity leak into the child.
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    # See goose_thinking_effort in config.py: keeps reasoning on but caps its
+    # token spend, since that's the main driver of per-action latency here.
+    env["GOOSE_THINKING_EFFORT"] = str(
+        settings.get("goose_thinking_effort") or config.DEFAULTS["goose_thinking_effort"]
+    )
 
     worker_dir = reset_worker_dir(worker_id)
 

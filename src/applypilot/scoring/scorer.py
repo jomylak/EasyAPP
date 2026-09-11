@@ -16,7 +16,7 @@ import httpx
 
 from applypilot.config import RESUME_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from applypilot.llm import get_scoring_client
 
 # Ceiling, not a batch size -- fewer pending jobs than this just uses fewer
 # threads. Scoring is pure LLM API calls (no browser, no per-provider
@@ -155,18 +155,24 @@ excluded downstream regardless of how ELIGIBLE below is answered.
 
 TERMINAL EVIDENCE CHECK:
 Independent of the two checks above: does this posting itself, in its own words,
-affirmatively welcome a candidate who has ALREADY graduated (or will graduate before
-the role starts), with nothing requiring further enrollment? Read for substance, not
-one fixed phrase -- "recently graduated", "graduating seniors welcome", "must have
-attained a Bachelor's degree (not currently enrolled)", "within one year of
-graduation", and similar all count; so does language you have to read past awkward
-phrasing or a run-on sentence to understand correctly. A posting whose ONLY
-requirement is a bare "pursuing a degree in X" states no opinion either way -- answer
-no for that; that silence is a separate, softer signal the pipeline handles on its
-own, not something to force a yes on here. A role structured as an ongoing co-op
-(alternating terms with school, "must have N years of school completed before this
-begins") is a NO here even if it never uses exclusionary wording -- its whole design
-presumes the candidate returns to school between terms.
+affirmatively welcome a candidate who has ALREADY graduated, with nothing requiring
+further enrollment? Read for substance, not one fixed phrase -- "recently graduated",
+"graduating seniors welcome", "must have attained a Bachelor's degree (not currently
+enrolled)", "within one year of graduation", and similar all count; so does language
+you have to read past awkward phrasing or a run-on sentence to understand correctly.
+A posting whose ONLY requirement is a bare "pursuing a degree in X" states no opinion
+either way -- answer no for that; that silence is a separate, softer signal the
+pipeline handles on its own, not something to force a yes on here. A role structured
+as an ongoing co-op (alternating terms with school, "must have N years of school
+completed before this begins") is a NO here even if it never uses exclusionary
+wording -- its whole design presumes the candidate returns to school between terms.
+A bare "must graduate before/by [some future date]" is NOT enough on its own -- answer
+no unless that date is at or before THIS role's own term (from the TERM CHECK above),
+which is the only case that actually describes someone who'll already hold the degree
+when the role starts. A bound stated for a year or more after the role's own term
+(e.g. "must graduate before Summer 2028" on a Summer 2027 posting) describes an
+ordinary still-enrolled junior/senior, not a post-grad welcome -- audited real
+postings phrased exactly this way turned out to be false positives, not evidence.
 
 ELIGIBILITY CHECK:
 Separately from fit, decide whether the candidate is even allowed to apply. This is a
@@ -557,7 +563,7 @@ def score_job(resume_text: str, job: dict) -> dict:
     ]
 
     try:
-        client = get_client()
+        client = get_scoring_client()
         # 640 was sized for Gemini's original six-then-ten output lines, but
         # reasoning-style free/OpenRouter models (MiMo, GLM-flash, whatever
         # openrouter/free routes to) spend 600-4000+ tokens on hidden
@@ -573,13 +579,14 @@ def score_job(resume_text: str, job: dict) -> dict:
         # spend at all since it never needs anywhere close to this budget.
         response = client.chat(messages, max_tokens=6000, temperature=0.2)
         parsed = _parse_score_response(response)
+        parsed["cost_usd"] = client.get_last_cost_usd()
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
         return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}",
                 "requires_returning_student": "no",
                 "pay_text": "", "pay_below_floor": "unknown",
                 "company": "", "job_location": "", "company_prestige": 0,
-                "eligible": "unclear", "eligibility_reason": ""}
+                "eligible": "unclear", "eligibility_reason": "", "cost_usd": None}
 
     # Where discovery gave us a real range, arithmetic beats the model's
     # judgement: the floor comparison is exact, and it's the verdict that gates
@@ -774,18 +781,23 @@ TERMINAL_ACCEPT_RE = re.compile(
     r"|(?:open|available) to graduating"
     r"|within (?:six|6|three|3|nine|9|twelve|12) months of (?:your |their )?graduation"
     r"|final semester"
-    r"|have graduated within"
-    # An UPPER bound on graduation ("must graduate before December 2027",
-    # "open to students graduating by June 2027") is safe to match without
-    # any date arithmetic: an earlier graduate satisfies an upper bound by
-    # definition, and a role you must graduate *before* is one you do not
-    # return to school after. Contrast the LOWER bounds in
-    # TERMINAL_EXCLUDE_RE ("December 2027 and beyond", "or later"), which
-    # are the opposite and are vetoed there.
-    # A year must follow, so "graduate by the application deadline" doesn't
-    # count; the gap allows "graduating from undergraduate or Master's
-    # programs by June 2027".
-    r"|graduat\w*[^.]{0,45}\b(?:before|by)\s+(?:the\s+end\s+of\s+)?(?:\w+\s+)?20\d\d)", re.I)
+    r"|have graduated within)", re.I)
+
+# An UPPER bound on graduation ("must graduate before December 2027", "open
+# to students graduating by June 2027") used to be its own TERMINAL_ACCEPT_RE
+# alternative, on the reasoning that an earlier graduate trivially satisfies
+# an upper bound and a role you must graduate *before* is one you don't
+# return to school after. Retired 2026-09-08: that reasoning only holds when
+# the bound is at or before the ROLE'S OWN TERM, which neither this regex nor
+# the scoring prompt ever checked -- a bound stated a full year or more after
+# the role (Notion's "must graduate before Summer 2028" on a *Summer 2027*
+# posting; Verkada's "graduating by June 2028" on a summer/winter 2027 role)
+# describes an ordinary still-enrolled junior/senior, not a post-grad welcome,
+# and both real postings this branch had promoted to CONFIRMED (top-of-queue,
+# not merely "likely") turned out to be exactly that -- 2 of 2 audited hits
+# were false positives, 0 were real. No safe way to compare the bound against
+# the role's own term from a regex alone, so this whole class of evidence
+# is retired rather than patched.
 
 # Deliberately NOT matched: any pattern keyed on a graduation YEAR. A first
 # attempt accepted "expected graduation ... 2027", which then matched
@@ -825,6 +837,21 @@ TERMINAL_EXCLUDE_RE = re.compile(
     # alternatives above mean, just phrased without those words.
     r"|planning (?:on |to )?graduat\w+[^.]{0,30}\b20\d\d\b"
     r"|final internship before graduat\w+)", re.I)
+
+
+# Loose, human-facing recall net -- NOT a detector. Finds any sentence that
+# so much as mentions grad-timing/enrollment language, whether or not it
+# actually disqualifies anything (TERMINAL_EXCLUDE_RE above is the strict,
+# audited veto that does that job). Used to give a human reviewer a
+# starting point when skimming an is_terminal_internship_likely posting --
+# by construction those rows never trip TERMINAL_EXCLUDE_RE, so this is
+# deliberately broader/noisier, not a second copy of the same check.
+GRAD_EVIDENCE_SENTENCE_RE = re.compile(
+    r"[^.\n]*\b(?:graduat\w*|enroll\w*|return(?:ing)? to school|"
+    r"currently pursuing|class of \d{4}|rising (?:senior|junior)|"
+    r"degree (?:completion|conferral))\b[^.\n]*[.\n]",
+    re.IGNORECASE,
+)
 
 
 def terminal_evidence(description: str | None) -> str:
@@ -949,7 +976,23 @@ def recompute_eligibility_for_unwanted_term(conn=None) -> int:
     return changed
 
 
-def recompute_job_type_from_title(conn=None) -> int:
+def _url_scope_clause(urls: list[str] | None) -> tuple[str, tuple]:
+    """SQL fragment + params restricting a query to `urls`, or no-op if None.
+
+    `url` is the jobs table's PRIMARY KEY, so an `IN (...)` lookup here is an
+    indexed point-lookup, not a scan -- this is what lets run_scoring() pass
+    just the batch it scored instead of paying a full-table cost on every
+    recompute call. Callers outside run_scoring (the `applypilot recompute`
+    CLI command, tests) pass urls=None to keep the original full-table
+    behavior.
+    """
+    if not urls:
+        return "", ()
+    placeholders = ",".join("?" for _ in urls)
+    return f" AND url IN ({placeholders})", tuple(urls)
+
+
+def recompute_job_type_from_title(conn=None, urls: list[str] | None = None) -> int:
     """Fix job_type for rows Jobright's own "intern" feed mislabeled.
 
     _classify_job_type() (discovery/smartextract.py) trusts the source site
@@ -970,8 +1013,10 @@ def recompute_job_type_from_title(conn=None) -> int:
 
     if conn is None:
         conn = get_connection()
+    scope_sql, scope_params = _url_scope_clause(urls)
     rows = conn.execute(
-        "SELECT url, title FROM jobs WHERE job_type = 'internship'"
+        "SELECT url, title FROM jobs WHERE job_type = 'internship'" + scope_sql,
+        scope_params,
     ).fetchall()
 
     changed = 0
@@ -987,7 +1032,7 @@ def recompute_job_type_from_title(conn=None) -> int:
     return changed
 
 
-def compute_terminal_internships(conn=None) -> int:
+def compute_terminal_internships(conn=None, urls: list[str] | None = None) -> int:
     """Recompute `is_terminal_internship` for every scored job. No LLM calls.
 
     A terminal internship -- one that affirmatively accepts candidates who
@@ -1030,44 +1075,54 @@ def compute_terminal_internships(conn=None) -> int:
     min_fit = settings.get("terminal_min_fit", 6)
     min_prestige = settings.get("terminal_min_prestige", 6)
 
+    scope_sql, scope_params = _url_scope_clause(urls)
     rows = conn.execute(
         "SELECT url, job_type, fit_score, company_prestige, pay_below_floor, "
         "       requires_returning_student, terminal_evidence_llm, eligible, "
-        "       full_description, is_terminal_internship FROM jobs "
-        "WHERE fit_score IS NOT NULL"
+        "       full_description, is_terminal_internship, terminal_source FROM jobs "
+        "WHERE fit_score IS NOT NULL" + scope_sql,
+        scope_params,
     ).fetchall()
 
     changed = 0
     for r in rows:
         llm_ev = r["terminal_evidence_llm"]
         evidence = llm_ev if llm_ev in ("yes", "no") else terminal_evidence(r["full_description"])
-        want = "yes" if (
-            r["job_type"] == "internship"
-            # A flag that means "apply to this, it's safe and worth it" has
-            # no business being true for a role the apply queue would never
-            # actually pick up -- pay_below_floor is a hard, unconditional
-            # exclusion everywhere else in the pipeline, so it has to be one
-            # here too, regardless of how high prestige happens to be.
-            and r["pay_below_floor"] != "yes"
-            # Necessary, not sufficient. This is the only field that compares
-            # the candidate's graduation dates against a window the posting
-            # states; the evidence check above adds the "explicitly says so"
-            # requirement it lacks.
-            and r["requires_returning_student"] == "no"
-            # Explicit disqualifiers (e.g. "requires a PhD in progress") must
-            # never be overridden by a high fit/prestige score -- eligibility
-            # is enforced here directly rather than relying on fit_score
-            # happening to be low for the same row.
-            and r["eligible"] != "no"
-            and (r["fit_score"] or 0) >= min_fit
-            and (r["company_prestige"] or 0) >= min_prestige
-            and evidence == "yes"
-            and not TERMINAL_EXCLUDE_RE.search(r["full_description"] or "")
-        ) else "no"
-        if r["is_terminal_internship"] != want:
+        # Hard vetoes: real, per-posting evidence the row is NOT terminal.
+        # These override everything, including a prior company_pattern
+        # promotion -- a company's general reputation never trumps this
+        # specific posting's own pay floor, grad-date conflict, or explicit
+        # disqualifier.
+        hard_veto = (
+            r["job_type"] != "internship"
+            or r["pay_below_floor"] == "yes"
+            or r["requires_returning_student"] == "yes"
+            or r["eligible"] == "no"
+            or (r["fit_score"] or 0) < min_fit
+            or (r["company_prestige"] or 0) < min_prestige
+            or bool(TERMINAL_EXCLUDE_RE.search(r["full_description"] or ""))
+        )
+        if hard_veto:
+            want, source = "no", None
+        elif evidence == "yes":
+            want, source = "yes", "llm"
+        elif r["terminal_source"] == "company_pattern":
+            # No new per-posting evidence either way, and no hard veto --
+            # preserve a prior company-pattern promotion rather than
+            # reverting it every recompute just because this function only
+            # ever sees LLM/regex evidence, not the company-level signal
+            # compute_company_pattern_terminal() already promoted this row
+            # on. That function re-runs right after this one anyway and
+            # would just re-promote it, so reverting here would only ever
+            # be pointless churn, not a real correction.
+            want, source = "yes", "company_pattern"
+        else:
+            want, source = "no", None
+        if r["is_terminal_internship"] != want or (want == "yes" and r["terminal_source"] != source):
             conn.execute(
-                "UPDATE jobs SET is_terminal_internship = ? WHERE url = ?",
-                (want, r["url"]),
+                "UPDATE jobs SET is_terminal_internship = ?, "
+                "terminal_source = ? WHERE url = ?",
+                (want, source, r["url"]),
             )
             changed += 1
     conn.commit()
@@ -1075,7 +1130,7 @@ def compute_terminal_internships(conn=None) -> int:
     return changed
 
 
-def compute_remote_spring_internships(conn=None) -> int:
+def compute_remote_spring_internships(conn=None, urls: list[str] | None = None) -> int:
     """Recompute `is_remote_spring_internship` for every scored job.
 
     A Spring-term internship that's fully remote needs no grad-date evidence
@@ -1116,10 +1171,12 @@ def compute_remote_spring_internships(conn=None) -> int:
     min_fit = settings.get("remote_spring_min_fit", 5)
     min_prestige = settings.get("remote_spring_min_prestige", 5)
 
+    scope_sql, scope_params = _url_scope_clause(urls)
     rows = conn.execute(
         "SELECT url, job_type, fit_score, company_prestige, term, "
         "       location, pay_below_floor, is_remote_spring_internship FROM jobs "
-        "WHERE fit_score IS NOT NULL"
+        "WHERE fit_score IS NOT NULL" + scope_sql,
+        scope_params,
     ).fetchall()
 
     changed = 0
@@ -1143,7 +1200,7 @@ def compute_remote_spring_internships(conn=None) -> int:
     return changed
 
 
-def compute_likely_terminal_internships(conn=None) -> int:
+def compute_likely_terminal_internships(conn=None, urls: list[str] | None = None) -> int:
     """Recompute `is_terminal_internship_likely` for every scored job.
 
     Sibling of compute_terminal_internships() for the postings that never
@@ -1185,24 +1242,39 @@ def compute_likely_terminal_internships(conn=None) -> int:
     min_fit = settings.get("terminal_min_fit", 6)
     min_prestige = settings.get("terminal_min_prestige", 6)
 
+    scope_sql, scope_params = _url_scope_clause(urls)
     rows = conn.execute(
         "SELECT url, job_type, fit_score, company_prestige, pay_below_floor, "
         "       requires_returning_student, is_terminal_internship, "
-        "       full_description, is_terminal_internship_likely FROM jobs "
-        "WHERE fit_score IS NOT NULL"
+        "       full_description, is_terminal_internship_likely, terminal_source "
+        "FROM jobs WHERE fit_score IS NOT NULL" + scope_sql,
+        scope_params,
     ).fetchall()
 
     changed = 0
     for r in rows:
-        want = "yes" if (
-            r["job_type"] == "internship"
-            and r["pay_below_floor"] != "yes"
-            and r["is_terminal_internship"] == "no"
-            and r["requires_returning_student"] == "no"
-            and (r["fit_score"] or 0) >= min_fit
-            and (r["company_prestige"] or 0) >= min_prestige
-            and not TERMINAL_EXCLUDE_RE.search(r["full_description"] or "")
-        ) else "no"
+        # A prior company_pattern_excluded verdict (compute_company_pattern_
+        # non_terminal()) is sticky, same as a company_pattern promotion is
+        # sticky in compute_terminal_internships() -- without this check,
+        # this function runs automatically after every scoring pass and has
+        # no idea that verdict exists, so it silently re-derives 'yes' from
+        # the raw per-posting criteria alone and undoes the demotion within
+        # the next scoring batch. Caught by the very TikTok/Tesla rows the
+        # demotion was built for: both kept flipping back to 'yes' with
+        # terminal_source still reading 'company_pattern_excluded' every
+        # time the live pipeline scored a fresh batch in between recomputes.
+        if r["terminal_source"] == "company_pattern_excluded":
+            want = "no"
+        else:
+            want = "yes" if (
+                r["job_type"] == "internship"
+                and r["pay_below_floor"] != "yes"
+                and r["is_terminal_internship"] == "no"
+                and r["requires_returning_student"] == "no"
+                and (r["fit_score"] or 0) >= min_fit
+                and (r["company_prestige"] or 0) >= min_prestige
+                and not TERMINAL_EXCLUDE_RE.search(r["full_description"] or "")
+            ) else "no"
         if r["is_terminal_internship_likely"] != want:
             conn.execute(
                 "UPDATE jobs SET is_terminal_internship_likely = ? WHERE url = ?",
@@ -1211,6 +1283,254 @@ def compute_likely_terminal_internships(conn=None) -> int:
             changed += 1
     conn.commit()
     log.info("Likely-terminal-internship flags recomputed: %d changed.", changed)
+    return changed
+
+
+# Below this, a company's evidence is too thin to trust as a pattern -- one
+# or two "yes" postings could just as easily be one recruiter's phrasing as
+# an actual company-wide policy. Two is the bar because it's the first point
+# a repeat isn't a fluke.
+_COMPANY_PATTERN_MIN_CONFIRMED = 2
+
+
+def compute_company_pattern_terminal(conn=None) -> int:
+    """Promote is_terminal_internship_likely rows for companies whose OWN
+    evidence -- internal (this employer's other postings) or externally
+    researched (terminal_company_policy.yaml) -- says post-grad candidates
+    are welcome, so a posting's individual silence stops mattering.
+
+    Two independent sources of "this company is safe":
+      1. Internal: >= _COMPANY_PATTERN_MIN_CONFIRMED postings at this
+         employer already read as explicit-yes (is_terminal_internship LLM
+         evidence, not this function), AND zero of its internship postings
+         anywhere require continued enrollment (requires_returning_student
+         == 'yes'). One contradicting posting is enough to disqualify the
+         whole company -- see TikTok/Booz Allen/IBM in the data this was
+         built against, all high-"likely" companies that also have real
+         requires_returning_student='yes' postings, meaning the silent ones
+         are genuinely ambiguous, not silently-fine.
+      2. Researched: terminal_company_policy.yaml's accepts_post_grad: true,
+         from one-time external research (official FAQ, anecdotal reports).
+         Only ever adds -- accepts_post_grad: false is informational, not an
+         active exclusion; a row already excluded from the 'likely' bucket
+         (requires_returning_student, TERMINAL_EXCLUDE_RE, pay floor, fit/
+         prestige bars) stays excluded regardless of company reputation.
+
+    Only ever moves is_terminal_internship_likely='yes' rows to
+    is_terminal_internship='yes' -- never touches a row already 'no' from
+    real per-posting evidence (a requires_returning_student mismatch,
+    TERMINAL_EXCLUDE_RE, or an explicit LLM "no"), since the 'likely' bucket
+    by construction excludes all of those already.
+
+    Must run after compute_terminal_internships() and
+    compute_likely_terminal_internships(). A grad_date_mismatch discovered
+    later during an actual apply attempt still resets is_terminal_internship
+    back to 'no' regardless of terminal_source -- see
+    _clear_terminal_flags_on_grad_date_mismatch() in apply/launcher.py.
+
+    Returns the number of rows changed.
+    """
+    from applypilot import config as _config
+
+    if conn is None:
+        conn = get_connection()
+
+    stats = conn.execute("""
+        SELECT company,
+               SUM(CASE WHEN is_terminal_internship = 'yes' THEN 1 ELSE 0 END) AS confirmed,
+               SUM(CASE WHEN requires_returning_student = 'yes' THEN 1 ELSE 0 END) AS requires_return
+        FROM jobs
+        WHERE job_type = 'internship' AND company IS NOT NULL AND company != ''
+        GROUP BY company
+    """).fetchall()
+    internal_safe = {
+        r["company"] for r in stats
+        if r["confirmed"] >= _COMPANY_PATTERN_MIN_CONFIRMED and r["requires_return"] == 0
+    }
+
+    researched = _config.load_terminal_company_policy().get("companies", {}) or {}
+    researched_safe_substrings = [
+        key.lower() for key, entry in researched.items()
+        if (entry or {}).get("accepts_post_grad") is True
+    ]
+
+    rows = conn.execute(
+        "SELECT url, company FROM jobs WHERE is_terminal_internship_likely = 'yes' "
+        "AND is_terminal_internship != 'yes'"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        company = r["company"] or ""
+        company_lower = company.lower()
+        safe = company in internal_safe or any(s in company_lower for s in researched_safe_substrings)
+        if safe:
+            # Clear the 'likely' flag too -- once promoted this is confirmed,
+            # not still-just-likely, and leaving both 'yes' would double-list
+            # the row in a "likely, needs review" view even though it no
+            # longer needs one.
+            conn.execute(
+                "UPDATE jobs SET is_terminal_internship = 'yes', "
+                "is_terminal_internship_likely = 'no', "
+                "terminal_source = 'company_pattern' WHERE url = ?",
+                (r["url"],),
+            )
+            changed += 1
+    conn.commit()
+    log.info("Company-pattern terminal promotions: %d changed.", changed)
+    return changed
+
+
+# Below this, a company's requires_returning_student='yes' evidence is too
+# thin to trust as a program-wide pattern -- same reasoning as
+# _COMPANY_PATTERN_MIN_CONFIRMED, just for the opposite conclusion. One
+# enrollment-gated posting could be a single recruiter's phrasing; two is the
+# first point it reads as the company's own house style, not a fluke.
+_COMPANY_PATTERN_MIN_REQUIRES_RETURN = 2
+
+
+def compute_company_pattern_non_terminal(conn=None) -> int:
+    """Demote is_terminal_internship_likely rows for companies whose OWN
+    evidence says post-grad candidates are NOT welcome, so a posting's
+    individual silence stops earning the benefit of the doubt.
+
+    Mirror image of compute_company_pattern_terminal() above -- same two
+    evidence sources, opposite conclusion:
+      1. Internal: >= _COMPANY_PATTERN_MIN_REQUIRES_RETURN of this employer's
+         OTHER internship postings already require continued enrollment
+         (requires_returning_student == 'yes'). A company that gates some of
+         its own postings on enrollment isn't one where a differently-worded,
+         silent posting can be assumed to be an oversight in the candidate's
+         favor.
+      2. Researched: terminal_company_policy.yaml's accepts_post_grad: false,
+         from one-time external research (official FAQ, anecdotal reports).
+         Most researched companies land here -- most internship programs
+         genuinely are enrollment-gated by design (see that file's header).
+
+    Only ever moves is_terminal_internship_likely='yes' rows to 'no'. Never
+    touches is_terminal_internship -- a posting with real per-posting
+    positive evidence (explicit "recently graduated OK" language caught by
+    compute_terminal_internships) is never in the 'likely' bucket to begin
+    with (that bucket requires is_terminal_internship == 'no'), so company-
+    level evidence here can never override or hide a confirmed-terminal
+    posting at the same company. IBM and TikTok both have real confirmed
+    terminal internships coexisting with a 'false' company-policy verdict --
+    that's expected, not a contradiction: the verdict says "silence at this
+    company isn't safe," not "nothing here is ever terminal."
+
+    Must run after compute_terminal_internships() and
+    compute_likely_terminal_internships(), same as
+    compute_company_pattern_terminal(). Order relative to that function
+    doesn't matter -- the two operate on disjoint company sets (an
+    accepts_post_grad entry is either true or false, never both, and a
+    company can't simultaneously clear the >= 2 confirmed-yes/zero-
+    requires-return bar above AND the >= 2 requires-return bar here).
+
+    Returns the number of rows changed.
+    """
+    from applypilot import config as _config
+
+    if conn is None:
+        conn = get_connection()
+
+    stats = conn.execute("""
+        SELECT company,
+               SUM(CASE WHEN requires_returning_student = 'yes' THEN 1 ELSE 0 END) AS requires_return
+        FROM jobs
+        WHERE job_type = 'internship' AND company IS NOT NULL AND company != ''
+        GROUP BY company
+    """).fetchall()
+    internal_unsafe = {
+        r["company"] for r in stats
+        if r["requires_return"] >= _COMPANY_PATTERN_MIN_REQUIRES_RETURN
+    }
+
+    researched = _config.load_terminal_company_policy().get("companies", {}) or {}
+    researched_unsafe_substrings = [
+        key.lower() for key, entry in researched.items()
+        if (entry or {}).get("accepts_post_grad") is False
+    ]
+
+    rows = conn.execute(
+        "SELECT url, company FROM jobs WHERE is_terminal_internship_likely = 'yes' "
+        "AND is_terminal_internship != 'yes'"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        company = r["company"] or ""
+        company_lower = company.lower()
+        unsafe = company in internal_unsafe or any(s in company_lower for s in researched_unsafe_substrings)
+        if unsafe:
+            conn.execute(
+                "UPDATE jobs SET is_terminal_internship_likely = 'no', "
+                "terminal_source = 'company_pattern_excluded' WHERE url = ?",
+                (r["url"],),
+            )
+            changed += 1
+    conn.commit()
+    log.info("Company-pattern terminal exclusions: %d changed.", changed)
+    return changed
+
+
+def compute_terminal_evidence_hints(conn=None) -> int:
+    """Tag every is_terminal_internship_likely='yes' row 'silent' or
+    'mentions_enrollment', purely to help a human skim the likely-terminal
+    review list faster -- NOT a ranking, filtering, or apply-queue input.
+
+    Uses GRAD_EVIDENCE_SENTENCE_RE, the same loose recall net the module
+    already documents as "NOT a detector" -- deliberately not repurposed
+    into an automatic exclusion. A "currently pursuing a degree in X" /
+    "currently enrolled" mention is universal internship-posting boilerplate
+    (it's how a posting describes its typical candidate, not a stated
+    requirement), and the scoring prompt already treats it as non-
+    disqualifying on purpose -- a graduating senior satisfies it too. Auto-
+    demoting on it would reintroduce exactly the failure mode
+    is_terminal_internship_likely was built to fix: an earlier, cruder
+    version of this flag was audited at 77.5% false-flagged on silence
+    alone (see compute_likely_terminal_internships' docstring). So this is a
+    label, not a gate.
+
+    Must run after compute_company_pattern_non_terminal(), since a row that
+    function just demoted out of 'likely' should not still carry a hint.
+    Clears the hint (sets NULL) on any row that isn't currently 'likely',
+    so a promoted/demoted row doesn't carry a stale tag.
+
+    Only regex-scans rows that don't already have a hint. This runs on
+    every scoring pass now (see run_scoring), including a batch of one job,
+    and a job's full_description never changes once enrichment writes it --
+    so an existing hint is never stale, and re-scanning the whole likely
+    bucket's description text on every call (a real cost: ~6.5s measured
+    against a few hundred rows once regex overhead is added up) would be
+    pure waste on every call after the first. Only a row newly entering the
+    'likely' bucket since the last pass needs a fresh regex scan.
+
+    Returns the number of rows whose hint changed.
+    """
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute(
+        "SELECT url, full_description FROM jobs "
+        "WHERE is_terminal_internship_likely = 'yes' AND terminal_evidence_hint IS NULL"
+    ).fetchall()
+
+    changed = 0
+    for r in rows:
+        want = "mentions_enrollment" if GRAD_EVIDENCE_SENTENCE_RE.search(r["full_description"] or "") else "silent"
+        conn.execute(
+            "UPDATE jobs SET terminal_evidence_hint = ? WHERE url = ?",
+            (want, r["url"]),
+        )
+        changed += 1
+
+    stale = conn.execute(
+        "UPDATE jobs SET terminal_evidence_hint = NULL "
+        "WHERE terminal_evidence_hint IS NOT NULL AND is_terminal_internship_likely != 'yes'"
+    )
+    changed += stale.rowcount
+    conn.commit()
+    log.info("Terminal-evidence hints recomputed: %d changed.", changed)
     return changed
 
 
@@ -1270,7 +1590,7 @@ def compute_company_tiers(conn=None) -> int:
     return updated
 
 
-def compute_desirability(conn=None) -> int:
+def compute_desirability(conn=None, urls: list[str] | None = None) -> int:
     """Recompute `desirability_score` for every scored job. No LLM calls.
 
     Desirability is "how much does he actually want this job" -- company
@@ -1313,9 +1633,11 @@ def compute_desirability(conn=None) -> int:
     housing_bonus = _float_or_zero(settings.get("housing_bonus", 0.5))
     remote_bonus = _float_or_zero(settings.get("remote_bonus", 0.5))
 
+    scope_sql, scope_params = _url_scope_clause(urls)
     rows = conn.execute(
         "SELECT url, location, salary, company_prestige, job_type, full_description "
-        "FROM jobs WHERE scored_at IS NOT NULL"
+        "FROM jobs WHERE scored_at IS NOT NULL" + scope_sql,
+        scope_params,
     ).fetchall()
 
     updated = 0
@@ -1368,11 +1690,12 @@ def compute_desirability(conn=None) -> int:
 
 
 def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
-    """Write a batch of score_job() results to the DB. Returns count skipped.
+    """Write score_job() results to the DB. Returns count skipped.
 
-    Called once per chunk from run_scoring() rather than once for an entire
-    (possibly huge) batch, so progress is visible and durable incrementally
-    instead of all landing -- or all being lost to a crash -- at the very end.
+    Called once per completed LLM call from run_scoring() (a single-item
+    list) rather than once for an entire (possibly huge) batch, so progress
+    is visible and durable the instant each job finishes instead of all
+    landing -- or all being lost to a crash -- at the very end.
     """
     now = datetime.now(timezone.utc).isoformat()
     skipped = 0
@@ -1410,7 +1733,7 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
             # discovery already captured -- keep the existing value instead.
             "company = COALESCE(NULLIF(?, ''), company), "
             "company_prestige = ?, eligible = ?, eligibility_reason = ?, "
-            "keywords = ? "
+            "keywords = ?, score_cost_usd = ? "
             "WHERE url = ?",
             (r["score"], f"{r['keywords']}\n{r['reasoning']}", now,
              r.get("term", "unclear"),
@@ -1419,7 +1742,7 @@ def _write_score_results(conn: sqlite3.Connection, results: list[dict]) -> int:
              r.get("pay_text", ""), r.get("pay_below_floor", "unknown"),
              r.get("company", ""), r.get("company_prestige", 0),
              r.get("eligible", "unclear"), r.get("eligibility_reason", ""),
-             r.get("keywords", ""),
+             r.get("keywords", ""), r.get("cost_usd"),
              r["url"]),
         )
 
@@ -1509,10 +1832,9 @@ def run_scoring(limit: int = 0, rescore: bool = False,
     total_skipped = 0
 
     # score_job is pure I/O (an LLM API call, no browser involved) so this
-    # parallelizes safely: get_client() returns one shared LLMClient whose
-    # pacing lock and fallback-switch flag were already built for concurrent
-    # callers (discovery/apply already run with --workers > 1 against the
-    # same client).
+    # parallelizes safely: get_scoring_client() returns one shared LLMClient
+    # (GLM, separate from enrichment/discovery's client) whose pacing lock
+    # was already built for concurrent callers.
     #
     # Processed in chunks of _SCORE_WORKERS, written to the DB right after
     # each chunk finishes -- not accumulated into one big list and written
@@ -1526,7 +1848,6 @@ def run_scoring(limit: int = 0, rescore: bool = False,
     # job 4 and job 400 could get counted as the same incident.
     for chunk_start in range(0, len(jobs), _SCORE_WORKERS):
         chunk = jobs[chunk_start:chunk_start + _SCORE_WORKERS]
-        chunk_results: list[dict] = []
         chunk_errors = 0
         with ThreadPoolExecutor(max_workers=len(chunk)) as pool:
             future_to_job = {pool.submit(score_job, resume_text, job): job for job in chunk}
@@ -1545,14 +1866,18 @@ def run_scoring(limit: int = 0, rescore: bool = False,
                     errors += 1
                     chunk_errors += 1
 
-                chunk_results.append(result)
+                # Written the moment this one call finishes, not batched
+                # until every other in-flight call in this chunk of up to
+                # _SCORE_WORKERS also finishes -- a fast call no longer
+                # waits behind a slow/retrying sibling before landing in the
+                # DB. Concurrency is unchanged (still up to _SCORE_WORKERS
+                # requests in flight); only the write timing moved.
+                total_skipped += _write_score_results(conn, [result])
 
                 log.info(
                     "[%d/%d] score=%d  %s",
                     completed, len(jobs), result["score"], job.get("title", "?")[:60],
                 )
-
-        total_skipped += _write_score_results(conn, chunk_results)
 
         # 2+ errors in one concurrent chunk means this isn't one flaky call
         # -- it's a real outage (score_job already retries transient
@@ -1563,13 +1888,26 @@ def run_scoring(limit: int = 0, rescore: bool = False,
             if not _wait_for_connectivity():
                 break
 
+    # Every job actually scored in this call (including ones _write_score_
+    # results skipped as an error, harmlessly -- their derived columns are
+    # untouched either way since fit_score/scored_at were never written for
+    # them). Restricting the recompute chain below to just these rows turns
+    # each of them from an O(whole table) scan into an O(batch) indexed
+    # lookup on the `url` primary key -- the fixed ~3.7s/call tax these were
+    # costing (measured against ~6-7k rows) was paid in full on every batch
+    # regardless of size, including a batch of one job. A separate full
+    # recompute (all rows, urls=None) is still available via `applypilot
+    # recompute` for after a settings/prompt change that needs every row
+    # re-derived, not just the ones just scored.
+    batch_urls = [job["url"] for job in jobs]
+
     # Desirability is derived from what scoring just wrote (prestige) plus two
     # columns that were already there (location, salary), so it's recomputed
     # once at the end rather than needing a separate command.
-    compute_desirability(conn=conn)
+    compute_desirability(conn=conn, urls=batch_urls)
     # Must precede the terminal computations below -- both filter on
     # job_type == 'internship'.
-    recompute_job_type_from_title(conn=conn)
+    recompute_job_type_from_title(conn=conn, urls=batch_urls)
     # No ordering dependency on the others; tightens eligibility wherever
     # requires_returning_student says the candidate's one true grad date
     # can't satisfy the posting.
@@ -1578,11 +1916,25 @@ def run_scoring(limit: int = 0, rescore: bool = False,
     # timing grounds, not grad-date grounds.
     recompute_eligibility_for_unwanted_term(conn=conn)
     # Must follow compute_desirability -- it reads desirability_score.
-    compute_terminal_internships(conn=conn)
+    compute_terminal_internships(conn=conn, urls=batch_urls)
     # Must follow compute_terminal_internships -- it reads is_terminal_internship.
-    compute_likely_terminal_internships(conn=conn)
+    compute_likely_terminal_internships(conn=conn, urls=batch_urls)
+    # Must follow compute_likely_terminal_internships -- both promote/demote
+    # out of its 'likely' bucket, and both need to run every scoring pass
+    # (not just from a manual `applypilot recompute`): compute_likely_
+    # terminal_internships re-derives every scored row's flag from scratch
+    # on every call, so a company-pattern verdict from a previous pass would
+    # get silently overwritten by the next batch's plain per-posting result
+    # if these weren't run again right after it. (This bit a real run: two
+    # company_pattern_excluded companies kept flipping back to 'likely'
+    # between manual recompute calls because this loop wasn't yet closed.)
+    compute_company_pattern_terminal(conn=conn)
+    compute_company_pattern_non_terminal(conn=conn)
+    # Review-aid label only; must follow the two calls above so a row they
+    # just promoted/demoted doesn't carry a stale hint.
+    compute_terminal_evidence_hints(conn=conn)
     # Independent of the above -- a separate route to the same priority tier.
-    compute_remote_spring_internships(conn=conn)
+    compute_remote_spring_internships(conn=conn, urls=batch_urls)
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec), %d skipped (kept existing score after an error)",

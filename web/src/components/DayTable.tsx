@@ -214,7 +214,6 @@ export function DayTable({
       site: globalFilters.site,
       ats: globalFilters.ats.length ? globalFilters.ats.join(",") : undefined,
       above_pay_floor: globalFilters.above_pay_floor,
-      unapplied_only: globalFilters.unapplied_only,
       terminal_only: globalFilters.terminal_only,
       likely_terminal_only: globalFilters.likely_terminal_only,
       eligible_only: globalFilters.eligible_only,

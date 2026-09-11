@@ -217,6 +217,26 @@ _ALL_COLUMNS: dict[str, str] = {
     # see compute_likely_terminal_internships(). Informational only: unlike
     # is_terminal_internship, this does NOT jump the apply queue.
     "is_terminal_internship_likely": "TEXT",
+    # Review-aid only for is_terminal_internship_likely='yes' rows -- 'silent'
+    # (the description never mentions graduation/enrollment at all) or
+    # 'mentions_enrollment' (it describes a "currently pursuing"/"currently
+    # enrolled" candidate profile without ever stating that as a requirement
+    # -- boilerplate the scoring prompt already treats as non-disqualifying,
+    # see TERMINAL EVIDENCE CHECK, but which reads less clean-cut to a human
+    # skimming the likely-terminal review list than true silence does). Does
+    # NOT drive ranking, filtering, or the apply queue -- see
+    # compute_terminal_evidence_hints() in scoring/scorer.py for why folding
+    # this into an automatic exclusion would reintroduce the same
+    # silence-as-evidence failure mode is_terminal_internship_likely itself
+    # was built to correct for. NULL for every other row.
+    "terminal_evidence_hint": "TEXT",
+    # Why is_terminal_internship is 'yes' for this row: 'llm' (the posting's
+    # own TERMINAL EVIDENCE CHECK or the terminal_evidence() regex fallback),
+    # or 'company_pattern' (compute_company_pattern_terminal() -- promoted
+    # from is_terminal_internship_likely because this employer has enough
+    # one-sided evidence, internal or researched, to trust silence). NULL for
+    # 'no' rows and for every row scored before this column existed.
+    "terminal_source": "TEXT",
     # ATS keywords from the job description that match or could match the
     # candidate, extracted at scoring time (same Gemini call, no extra cost).
     # Was previously folded into score_reasoning as an unstructured first
@@ -283,6 +303,18 @@ _ALL_COLUMNS: dict[str, str] = {
     # and re-detected at apply time when the real URL is known -- job boards
     # front the ATS behind redirects.
     "ats": "TEXT",
+    # (ats, tenant, job_id) from ats.extract_job_id, as "ats:tenant:job_id" --
+    # set alongside `ats` once application_url resolves. NULL when the ATS
+    # wasn't one of the well-structured platforms extract_job_id trusts.
+    "ats_job_id": "TEXT",
+    # URL of the canonical row this one duplicates, or NULL. Set by
+    # dedup.check_duplicate right after enrichment writes ats/full_description,
+    # and read by get_jobs_by_stage("pending_score") to keep duplicates out
+    # of scoring (and therefore out of tailoring/apply) entirely. Distinct
+    # from review_status: a duplicate isn't "rejected", it's the same
+    # underlying posting as another row that IS proceeding.
+    "duplicate_of": "TEXT",
+    "duplicate_reason": "TEXT",
     "pay_text": "TEXT",
     "pay_below_floor": "TEXT",
     "apply_backend": "TEXT",
@@ -310,6 +342,24 @@ _ALL_COLUMNS: dict[str, str] = {
     "queued_at": "TEXT",
     "queue_batch": "TEXT",
     "queue_position": "INTEGER",
+    # The Airtable record id (the trailing `rec...` segment of each row's own
+    # expand-link href, e.g. "recAmG8jEMzAf50nq") for jobs discovered via
+    # _scrape_airtable_button_grid. Stable and readable straight off the
+    # unexpanded grid row -- no click needed -- so a re-crawl can tell "this
+    # exact row, already stored" apart from every other row without paying
+    # the ~0.5s expand-and-read cost that resolving a real job URL requires.
+    # NULL for every job discovered any other way.
+    "airtable_record_id": "TEXT",
+    # Real per-job scoring cost, read straight from OpenRouter's own `usage.cost`
+    # (requires opting in with `usage: {include: true}` on the request -- see
+    # llm.py's _chat_compat). Never existed before: the scoring LLM call's
+    # prompt/completion/cached token counts were only ever logged as text
+    # (LLM usage: ... in the log file), not persisted anywhere, so every
+    # dashboard cost figure silently covered apply spend only. That made
+    # switching the scoring default to a new model (see _SCORING_MODEL_DEFAULT)
+    # invisible to any cost tracking even though it now runs against every
+    # job in the DB, not just the ~20/day that go through apply.
+    "score_cost_usd": "REAL",
 }
 
 
@@ -340,6 +390,9 @@ _ALL_INDEXES: dict[str, str] = {
     "idx_jobs_pay": "(pay_max_hourly)",
     # Big-tech postings are pinned above the ranking in every browse view.
     "idx_jobs_day_tier": f"({_DAY_EXPR}, company_tier)",
+    # The "already seen this row" lookup _scrape_airtable_button_grid does
+    # once per site at the start of every discovery pass.
+    "idx_jobs_site_airtable_record": "(site, airtable_record_id)",
 }
 
 
@@ -479,9 +532,14 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL"
     ).fetchone()[0]
 
+    # Must match the "pending_score" stage query in get_jobs_by_stage()
+    # (duplicate_of IS NULL) -- without it this counts duplicate rows
+    # applypilot run score will never touch as "pending" forever, which
+    # read as a stuck backlog (159 duplicates) when the real number was 0.
     stats["unscored"] = conn.execute(
         "SELECT COUNT(*) FROM jobs "
-        "WHERE full_description IS NOT NULL AND fit_score IS NULL"
+        "WHERE full_description IS NOT NULL AND fit_score IS NULL "
+        "AND duplicate_of IS NULL"
     ).fetchone()[0]
 
     # Score distribution
@@ -588,7 +646,17 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
 def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
                site: str, strategy: str) -> tuple[int, int]:
-    """Store discovered jobs, skipping duplicates by URL.
+    """Store discovered jobs, skipping duplicates by URL or by content.
+
+    Two dedup passes before a row is inserted: the URL is canonicalized
+    (stripping tracking params, so campaign-tagged re-shares of the same
+    listing collapse) and, failing that, an exact (title, description,
+    location) match against an existing row also counts as a duplicate --
+    `company` isn't populated at discovery time, so it can't be part of
+    this key; see dedup.py's module docstring. Only the light stuff runs
+    here -- text similarity, ATS req-id matching and everything needing
+    the full post-enrichment description happens in dedup.check_duplicate,
+    right after enrichment.
 
     Args:
         conn: Database connection.
@@ -599,6 +667,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
     Returns:
         Tuple of (new_count, duplicate_count).
     """
+    from applypilot.dedup import canonicalize_url, find_exact_text_duplicate
+
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
@@ -607,6 +677,15 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         url = job.get("url")
         if not url:
             continue
+        url = canonicalize_url(url)
+
+        if find_exact_text_duplicate(
+            conn, job.get("title"), job.get("description"), job.get("location"),
+            text_column="description",
+        ):
+            existing += 1
+            continue
+
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
@@ -637,6 +716,12 @@ def fit_gate_sql(min_score: int) -> tuple[str, list]:
     Shared by the tailor stage and the apply queue deliberately: if only the
     queue knew about the override, the extra jobs would never get a resume
     attached and so could never actually be picked up.
+
+    Also excludes confirmed duplicates (dedup.check_duplicate) here rather
+    than in each caller separately: a job can pick up a duplicate_of after
+    it was already scored (the dedup backfill, or a same-req repost that
+    resolves its ATS id later than this one did), so fit_score IS NOT NULL
+    is not proof a row is still safe to tailor/apply to.
     """
     from applypilot.config import load_settings
 
@@ -650,7 +735,7 @@ def fit_gate_sql(min_score: int) -> tuple[str, list]:
         clauses.append("(company_prestige >= ? AND fit_score >= ?)")
         params.extend([min_prestige, min_fit])
 
-    return "(" + " OR ".join(clauses) + ")", params
+    return "((" + " OR ".join(clauses) + ") AND duplicate_of IS NULL)", params
 
 
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
@@ -675,7 +760,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL",
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "

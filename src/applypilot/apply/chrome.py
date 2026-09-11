@@ -138,47 +138,57 @@ def setup_worker_profile(worker_id: int) -> Path:
     if (profile_dir / "Default").exists():
         return profile_dir  # Already initialized
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
+    # Find a source: prefer existing worker (has session cookies), else user profile.
+    # Chrome is always launched with --profile-directory=Default (see below), so only
+    # that one profile's contents are ever needed -- cloning the whole user-data root
+    # (which holds every other Chrome profile the user has) wastes gigabytes per worker.
     source: Path | None = None
     for wid in range(10):
         if wid == worker_id:
             continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}" / "Default"
+        if candidate.exists():
             source = candidate
             break
     if source is None:
-        source = config.get_chrome_user_data()
+        source = config.get_chrome_user_data() / "Default"
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    dst_default = profile_dir / "Default"
+    dst_default.mkdir(parents=True, exist_ok=True)
 
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
+    if source.exists():
+        logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
+                    worker_id, source)
 
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+        # Copy essential profile dirs -- skip caches and heavy transient data
+        skip = {
+            "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
+            "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
+            "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
+            "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
+            "SingletonLock", "SingletonSocket", "SingletonCookie",
+            # Chrome is launched with --disable-extensions, so extension
+            # data is never read -- skip it to avoid wasting space.
+            "Extensions", "Local Extension Settings", "Extension State",
+            "Sync Extension Settings",
+        }
+
+        for item in source.iterdir():
+            if item.name in skip:
+                continue
+            dst = dst_default / item.name
+            try:
+                if item.is_dir():
+                    shutil.copytree(
+                        str(item), str(dst), dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns(
+                            "Cache", "Code Cache", "GPUCache", "Service Worker",
+                        ),
+                    )
+                else:
+                    shutil.copy2(str(item), str(dst))
+            except (PermissionError, OSError):
+                pass  # skip locked files
 
     return profile_dir
 

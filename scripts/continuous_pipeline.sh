@@ -1,5 +1,5 @@
 #!/bin/bash
-# The pipeline daemon: discovery, enrichment, and scoring as three
+# The pipeline daemon: discovery, enrichment, scoring, and tailoring as four
 # INDEPENDENT loops, meant to run permanently (not a one-shot batch job).
 # Restarted automatically if it dies -- see supervisor_pipeline.sh, which
 # a launchd agent runs every few minutes to check this is still alive.
@@ -39,6 +39,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 DB="$HOME/.applypilot/applypilot.db"
 LOG="$HOME/.applypilot/logs/continuous_$(date +%Y%m%d_%H%M%S).log"
 STOP_FLAG="/tmp/applypilot_continuous_stop_$$"
+# Independent of STOP_FLAG: touch/rm this to pause just the score loop (e.g.
+# swapping the LLM model without tearing down discover/enrich too). Not
+# per-PID -- deliberately a fixed path so it survives this script restarting.
+SCORE_PAUSE_FLAG="/tmp/applypilot_score_paused"
 IDLE_POLL=30       # seconds between idle re-checks in enrich/score loops
 DISCOVER_INTERVAL=300  # seconds between discovery passes (a full re-crawl of
                         # both sites costs ~16s, so this is cheap even tight)
@@ -52,6 +56,31 @@ rm -f "$STOP_FLAG"
 trap 'touch "$STOP_FLAG"' TERM INT
 
 echo "Continuous pipeline started: $(date)" | tee -a "$LOG"
+
+tailor_loop() {
+    while [ ! -f "$STOP_FLAG" ]; do
+        # Coarse over-count on purpose (real fit gate blends prestige tiers,
+        # too fiddly to replicate correctly in SQL here -- see score_loop's
+        # comment on why an exact-match predicate matters for the busy-loop
+        # case, not for this one): `applypilot run tailor` re-applies the
+        # real gate itself and just no-ops quickly if nothing qualifies.
+        pending=$(sqlite3 "$DB" "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5;")
+        if [ "$pending" -eq 0 ]; then
+            sleep "$IDLE_POLL"
+            continue
+        fi
+        echo "--- $(date) [tailor]: $pending jobs pending ---" | tee -a "$LOG"
+        applypilot run tailor >> "$LOG" 2>&1 || echo "tailor batch failed (see above), continuing" | tee -a "$LOG"
+        # The coarse count above over-counts (see comment): jobs it thinks
+        # are pending but that fail the real fit gate will never actually
+        # get tailored, so `applypilot run tailor` no-ops in ~0.1s and this
+        # loop would otherwise spin the CLI at ~1 iteration/sec forever with
+        # nothing to show for it. Sleep unconditionally, same as the
+        # idle branch, so a real batch (which takes far longer than
+        # IDLE_POLL anyway) isn't meaningfully delayed but a busy-loop is.
+        sleep "$IDLE_POLL"
+    done
+}
 
 discover_loop() {
     while [ ! -f "$STOP_FLAG" ]; do
@@ -80,7 +109,18 @@ enrich_loop() {
 
 score_loop() {
     while [ ! -f "$STOP_FLAG" ]; do
-        pending=$(sqlite3 "$DB" "SELECT COUNT(*) FROM jobs WHERE fit_score IS NULL AND full_description IS NOT NULL;")
+        if [ -f "$SCORE_PAUSE_FLAG" ]; then
+            sleep "$IDLE_POLL"
+            continue
+        fi
+        # Must match database.py's "pending_score" stage query exactly
+        # (full_description IS NOT NULL AND fit_score IS NULL AND
+        # duplicate_of IS NULL) -- missing the duplicate_of exclusion here
+        # once caused this to count 164 duplicate rows `applypilot run score`
+        # would never touch as "pending" forever, busy-looping this whole
+        # while-loop with no sleep (the pending>0 branch has none) at
+        # hundreds of iterations/sec until something killed the process.
+        pending=$(sqlite3 "$DB" "SELECT COUNT(*) FROM jobs WHERE fit_score IS NULL AND full_description IS NOT NULL AND duplicate_of IS NULL;")
         if [ "$pending" -eq 0 ]; then
             sleep "$IDLE_POLL"
             continue
@@ -96,8 +136,10 @@ enrich_loop &
 ENRICH_PID=$!
 score_loop &
 SCORE_PID=$!
+tailor_loop &
+TAILOR_PID=$!
 
-wait "$DISCOVER_PID" "$ENRICH_PID" "$SCORE_PID"
+wait "$DISCOVER_PID" "$ENRICH_PID" "$SCORE_PID" "$TAILOR_PID"
 rm -f "$STOP_FLAG"
 
 echo "=== CONTINUOUS PIPELINE STOPPED: $(date) ===" | tee -a "$LOG"

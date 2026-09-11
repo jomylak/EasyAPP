@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
 import { ApplicationsTable } from "@/components/ApplicationsTable"
 import { AtsBreakdown } from "@/components/AtsBreakdown"
+import { CompanyLimits } from "@/components/CompanyLimits"
 import { Donut } from "@/components/Donut"
 import { api } from "@/lib/api"
 import type { Stats } from "@/lib/types"
@@ -29,6 +30,13 @@ export function DashboardTab() {
   const [statsError, setStatsError] = useState<string | null>(null)
   const { run, live } = useRunStream()
   const [stopping, setStopping] = useState(false)
+  // Batches someone queued (from Browse, or a Launch that queued fine but
+  // then 409'd because a run was already going) that nobody has launched
+  // yet -- the recovery path for that race, so the batch id in a toast
+  // isn't the only way back to it.
+  const [pending, setPending] = useState<{ batch: string; count: number; queued_at: string | null }[]>([])
+  const [launchingBatch, setLaunchingBatch] = useState<string | null>(null)
+  const [pendingError, setPendingError] = useState<string | null>(null)
 
   function refreshStats() {
     api
@@ -40,9 +48,17 @@ export function DashboardTab() {
       .catch((e) => setStatsError(String(e)))
   }
 
+  function refreshPending() {
+    api.pendingBatches().then((res) => setPending(res.batches)).catch(() => {})
+  }
+
   useEffect(() => {
     refreshStats()
-    const id = setInterval(refreshStats, 4000)
+    refreshPending()
+    const id = setInterval(() => {
+      refreshStats()
+      refreshPending()
+    }, 4000)
     return () => clearInterval(id)
   }, [])
 
@@ -53,6 +69,20 @@ export function DashboardTab() {
     } finally {
       setStopping(false)
       refreshStats()
+    }
+  }
+
+  async function launchPending(batch: string) {
+    setLaunchingBatch(batch)
+    setPendingError(null)
+    try {
+      await api.launch(batch, { workers: 1 })
+      refreshPending()
+      refreshStats()
+    } catch (e) {
+      setPendingError(String(e))
+    } finally {
+      setLaunchingBatch(null)
     }
   }
 
@@ -79,8 +109,16 @@ export function DashboardTab() {
             <div className="tile-value">{stats.queued}</div>
           </div>
           <div className="tile">
-            <div className="tile-label">Spend</div>
+            <div className="tile-label">Apply spend</div>
             <div className="tile-value">${stats.spend.toFixed(2)}</div>
+          </div>
+          <div className="tile">
+            {/* Scoring cost never used to be tracked at all -- only apply
+                (goose) spend was persisted, so switching the scoring model
+                to something that runs against every job in the DB (not just
+                the handful that go through apply) was invisible here. */}
+            <div className="tile-label">Scoring spend</div>
+            <div className="tile-value">${stats.scoring_spend.toFixed(2)}</div>
           </div>
           <div className="tile">
             <div className="tile-label">Scored</div>
@@ -120,6 +158,7 @@ export function DashboardTab() {
             </div>
           </section>
           <AtsBreakdown />
+          <CompanyLimits />
         </div>
       )}
 
@@ -143,7 +182,31 @@ export function DashboardTab() {
           </div>
         </div>
 
-        {!live && <div className="runpanel-empty">Launch a queued batch from the terminal to see it here live.</div>}
+        {!live && pending.length === 0 && (
+          <div className="runpanel-empty">Launch a queued batch from the terminal to see it here live.</div>
+        )}
+
+        {!live &&
+          pending.map((b) => (
+            <div className="worker-row" key={b.batch}>
+              <span className="worker-job" style={{ fontFamily: "var(--mono)" }}>
+                {b.count} job(s) queued as <b>{b.batch}</b>
+              </span>
+              <button
+                className="btn"
+                disabled={launchingBatch === b.batch}
+                onClick={() => launchPending(b.batch)}
+              >
+                {launchingBatch === b.batch ? "Launching…" : "Launch"}
+              </button>
+            </div>
+          ))}
+
+        {pendingError && (
+          <div style={{ color: "var(--a-bad)", fontSize: 12, padding: "4px 0" }}>
+            Failed to launch: {pendingError}
+          </div>
+        )}
 
         {live &&
           run?.workers.map((w) => (

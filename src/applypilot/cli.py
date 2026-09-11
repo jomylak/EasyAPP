@@ -350,9 +350,11 @@ def serve(
 ) -> None:
     """Open the web UI for browsing jobs and choosing which to apply to.
 
-    Always bound to 127.0.0.1. There is no --host flag: this serves your
+    Bound to 127.0.0.1 by default. There is no --host flag: this serves your
     resumes and drives Chrome profiles holding your logged-in sessions, so it
-    is not something to expose on a network.
+    is not something to expose on a network. Set APPLYPILOT_HOST to bind to a
+    private overlay-network interface (e.g. a Tailscale IP) instead -- never
+    to 0.0.0.0 or a public interface.
     """
     _bootstrap()
 
@@ -567,7 +569,34 @@ def recompute() -> None:
     typer.echo(f"term elig:      {scorer.recompute_eligibility_for_unwanted_term()}")
     typer.echo(f"terminal:       {scorer.compute_terminal_internships()}")
     typer.echo(f"likely terminal:{scorer.compute_likely_terminal_internships()}")
+    typer.echo(f"company pattern:{scorer.compute_company_pattern_terminal()}")
+    typer.echo(f"company excl:   {scorer.compute_company_pattern_non_terminal()}")
+    typer.echo(f"evidence hints: {scorer.compute_terminal_evidence_hints()}")
     typer.echo(f"remote spring:  {scorer.compute_remote_spring_internships()}")
+
+
+@app.command(name="requeue-boilerplate")
+def requeue_boilerplate() -> None:
+    """Re-queue jobs whose stored description is an aggregator's UI chrome,
+    not the actual posting.
+
+    A Jobright.ai bug: its own JSON-LD occasionally carries a promotional
+    blurb ("Customize Your Resume... Analyze How Well You Fit...") as the
+    JobPosting `description` field instead of real content. Enrichment used
+    to accept that at face value -- short but over the 50-char floor -- and
+    the scorer would then compute a fit_score against nothing, with no
+    company extracted either. The extraction cascade now rejects that text
+    at every tier and prefers the real employer page when Jobright's own
+    "Original Job Post" link resolves, but rows already scraped before that
+    fix need to be reset to pick it up. Only clears detail_scraped_at,
+    full_description and detail_attempts; run `applypilot run enrich`
+    afterwards to actually re-scrape them.
+    """
+    _bootstrap()
+    from applypilot.enrichment.detail import requeue_boilerplate_rows
+
+    n = requeue_boilerplate_rows()
+    typer.echo(f"Re-queued {n} job(s) for re-enrichment. Run `applypilot run enrich` to fetch them.")
 
 
 @app.command()

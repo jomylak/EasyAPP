@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { api } from "@/lib/api"
 import type { JobDetail, JobRow } from "@/lib/types"
-import { formatPay, sanitizeDescription } from "@/lib/utils"
+import { formatDaysAgo, formatPay, sanitizeDescription } from "@/lib/utils"
 
 interface Props {
   row: JobRow
@@ -100,6 +100,10 @@ export function JobExpansion({ row, open }: Props) {
           </dd>
           <dt>Title</dt>
           <dd>{row.title || "—"}</dd>
+          <dt>Posted</dt>
+          <dd title={row.posted ? new Date(row.posted).toLocaleString() : undefined}>
+            {formatDaysAgo(row.posted)}
+          </dd>
           <dt>Pay</dt>
           <dd>{formatPay(row)}</dd>
           <dt>Location</dt>
@@ -122,10 +126,19 @@ export function JobExpansion({ row, open }: Props) {
           <dd style={{ color: payFloorColor(payBelowFloor) }}>{payFloorLabel(payBelowFloor)}</dd>
           <dt>Applied</dt>
           <dd>{row.apply_status || "no"}</dd>
+          {detail?.company_limit && (
+            <>
+              <dt>Company cap</dt>
+              <dd style={{ color: detail.company_limit.at_cap ? "var(--a-bad)" : "var(--a-text)" }}>
+                {detail.company_limit.applied}/{detail.company_limit.limit} {periodLabel(detail.company_limit.period)}
+                {detail.company_limit.at_cap ? " · at cap" : ""}
+              </dd>
+            </>
+          )}
         </dl>
-        {row.url && (
+        {(detail?.application_url || row.url) && (
           <a
-            href={row.url}
+            href={detail?.application_url || row.url}
             target="_blank"
             rel="noreferrer"
             style={{
@@ -141,6 +154,11 @@ export function JobExpansion({ row, open }: Props) {
       </div>
     </div>
   )
+}
+
+function periodLabel(period: "total" | "month" | "season"): string {
+  if (period === "total") return "overall"
+  return `this ${period}`
 }
 
 function payFloorLabel(v: JobRow["pay_below_floor"]): string {

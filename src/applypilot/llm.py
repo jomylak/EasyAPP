@@ -1,20 +1,27 @@
 """
 Unified LLM client for ApplyPilot.
 
-Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-3.1-flash-lite)
+Auto-detects provider from environment. GEMINI_API_KEY is authoritative
+whenever present -- it wins even if LLM_URL/LLM_MODEL are also set, so a
+stale local/OpenRouter override left in .env can't silently steal traffic
+(and cost money) from the free Gemini tier:
+  GEMINI_API_KEY  -> Google Gemini (default: gemini-3.1-flash-lite)  [always wins if set]
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
+  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint (or any
+                      other OpenAI-compat endpoint), only used when
+                      GEMINI_API_KEY and OPENAI_API_KEY are both unset.
 
 LLM_MODEL env var overrides the model name for any provider.
 
 If OPENROUTER_API_KEY is also set, a Gemini client falls back to a free
 OpenRouter model once Gemini's retries are truly exhausted (see
-_OPENROUTER_FALLBACK_MODEL below) -- this only fires after 429/503 survives
+_OPENROUTER_FALLBACK_MODELS below) -- this only fires after 429/503 survives
 every retry, which in practice means the daily quota is gone, not a
 transient per-minute limit (those already resolve via the existing
-backoff). The fallback model is hardcoded, not configurable, specifically
-so this can never silently switch to a paid model.
+backoff). The fallback models are hardcoded, not configurable, specifically
+so this can never silently switch to a paid model. If the first fallback
+model itself gets rate-limited, the client walks to the next one in the
+list rather than giving up.
 """
 
 import logging
@@ -41,7 +48,11 @@ def _detect_provider() -> tuple[str, str, str]:
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
-    if gemini_key and not local_url:
+    # Gemini wins unconditionally when configured -- previously this was
+    # gated on `and not local_url`, which let a leftover LLM_URL (e.g. a
+    # temporary OpenRouter paid-model override) silently and permanently
+    # shadow Gemini even after the reason for the override was gone.
+    if gemini_key:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_override or "gemini-3.1-flash-lite",
@@ -90,14 +101,25 @@ _GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 # Hardcoded, not read from any env var -- this is the one thing standing
 # between "fall back automatically" and "silently start spending money".
-# "openrouter/free" is OpenRouter's own auto-router scoped to free models
-# only (unlike "openrouter/auto", which can pick paid ones) -- it picks
-# whichever free model is best available/least saturated at request time,
-# so this rides out any single free model's daily cap instead of pinning to
-# one (verified with a live 200 response, cost=0, this session). If this
-# ever needs to change, change the literal here, not a config value someone
-# could accidentally point at a paid model.
-_OPENROUTER_FALLBACK_MODEL = "openrouter/free"
+# Every entry here must be a genuine ":free" (or the free auto-router)
+# model -- never point this at a paid one.
+#
+# Tried in order; if one gets rate-limited too, the client walks to the
+# next rather than giving up. google/gemma-4-31b-it:free goes first: same
+# family/lineage as Gemini (Google DeepMind), dense instruct model with a
+# 256K context window and a switchable thinking mode we turn off below, so
+# behavior should track Gemini flash-lite reasonably closely. "openrouter/free"
+# is last -- it's OpenRouter's own auto-router across ALL free models, so it
+# rides out any single model's daily cap, but it can land on an unpredictable
+# reasoning model that eats max_tokens on invisible thinking (this bit a
+# previous run -- see llm.py history), which is why it's the fallback of
+# last resort rather than the first choice. Verified against a live pull of
+# https://openrouter.ai/api/v1/models (2026-09-08): both entries were
+# zero-cost and available.
+_OPENROUTER_FALLBACK_MODELS = [
+    "google/gemma-4-31b-it:free",
+    "openrouter/free",
+]
 
 
 class LLMClient:
@@ -117,49 +139,59 @@ class LLMClient:
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
-        # GLM burns hidden chain-of-thought tokens before its visible answer
-        # (a worst-case call measured 4027 reasoning tokens alone -- see
-        # scoring/scorer.py:score_job) even for short structured-extraction
-        # prompts that don't need it. Model-scoped, not call-site-scoped: this
-        # only ever matches the GLM model configured for scoring/enrichment,
-        # never Gemini/OpenAI, and never reaches the apply backends at all --
-        # Claude Code and Goose run as separate CLI subprocesses that don't
-        # go through this client.
-        self._suppress_reasoning: bool = "glm" in model.lower()
         # Proactive pacing (Gemini free tier = 15 RPM = one call per 4s).
         # Shared across threads since discovery/apply can run with --workers > 1
         # and all of them share this one client instance.
         self._pace_lock = threading.Lock()
         self._last_call_at: float = 0.0
-        # True once Gemini's retries have been exhausted and we've switched
-        # to the free OpenRouter fallback for the rest of this process.
-        self._openrouter_fallback_active: bool = False
+        # -1 = still on the primary provider. Once we switch to the free
+        # OpenRouter fallback chain this becomes the index (into
+        # _OPENROUTER_FALLBACK_MODELS) of the model currently in use, so a
+        # second exhaustion walks to the next candidate instead of giving up.
+        self._openrouter_fallback_index: int = -1
+        # Real per-call cost from OpenRouter's `usage.cost` (see
+        # _handle_compat_response), stashed per-thread rather than on `self`
+        # directly. Callers like scoring's ThreadPoolExecutor share one
+        # LLMClient across concurrent threads, so a plain instance attribute
+        # would let one thread's chat() call read back a different thread's
+        # cost if two calls finished close together.
+        self._cost_local = threading.local()
+
+    @property
+    def _on_openrouter_fallback(self) -> bool:
+        return self._openrouter_fallback_index >= 0
 
     def _switch_to_openrouter_fallback(self) -> bool:
-        """Switch this client to the free OpenRouter fallback, once.
+        """Advance to the next free OpenRouter fallback model.
 
-        Returns False (does nothing) if no OPENROUTER_API_KEY is configured
-        or we're not on Gemini in the first place -- callers should re-raise
+        Returns False (does nothing) if no OPENROUTER_API_KEY is configured,
+        we're not on Gemini and not already in the fallback chain, or every
+        fallback candidate has already been tried -- callers should re-raise
         the original error in that case, exactly like before this existed.
         """
-        if self._openrouter_fallback_active or not self._is_gemini:
+        if not self._is_gemini and not self._on_openrouter_fallback:
+            return False
+        next_index = self._openrouter_fallback_index + 1
+        if next_index >= len(_OPENROUTER_FALLBACK_MODELS):
             return False
         key = os.environ.get("OPENROUTER_API_KEY", "").strip()
         if not key:
             return False
 
+        model = _OPENROUTER_FALLBACK_MODELS[next_index]
         log.warning(
-            "Gemini retries exhausted -- likely the daily free-tier quota, "
-            "not a transient rate limit. Falling back to OpenRouter's free "
+            "%s exhausted -- likely the daily free-tier quota, not a "
+            "transient rate limit. Falling back to OpenRouter's free "
             "'%s' for the rest of this run.",
-            _OPENROUTER_FALLBACK_MODEL,
+            "Gemini retries" if not self._on_openrouter_fallback else f"Fallback model '{self.model}'",
+            model,
         )
         self.base_url = _OPENROUTER_BASE
-        self.model = _OPENROUTER_FALLBACK_MODEL
+        self.model = model
         self.api_key = key
         self._is_gemini = False
         self._use_native_gemini = False
-        self._openrouter_fallback_active = True
+        self._openrouter_fallback_index = next_index
         return True
 
     # -- Native Gemini API --------------------------------------------------
@@ -240,8 +272,23 @@ class LLMClient:
         # this codebase asks for (JSON, SCORE:/KEYWORDS: lines, etc).
         if self._is_gemini:
             payload["reasoning_effort"] = "minimal"
-        elif self._suppress_reasoning:
-            payload["reasoning"] = {"effort": "none"}
+        # Any other OpenRouter model (the free fallback chain, or a directly
+        # configured scoring model like xiaomi/mimo-v2.5) gets the same
+        # treatment via OpenRouter's unified `reasoning` object rather than
+        # `reasoning_effort` -- measured on mimo-v2.5, completion tokens ran
+        # 1000-4200/call (most of it hidden chain-of-thought) for a task that
+        # only needs a short structured answer, so this is real spend, not
+        # theoretical. Harmless no-op if a given model ignores it.
+        elif self.base_url == _OPENROUTER_BASE:
+            payload["reasoning"] = {"enabled": False}
+
+        # OpenRouter only includes real per-call `usage.cost` (its own
+        # post-billing number, not a token-count estimate) when explicitly
+        # asked for it via this flag -- otherwise `usage` has token counts
+        # only. Harmless no-op against any other OpenAI-compat endpoint that
+        # doesn't recognize the field.
+        if self.base_url == _OPENROUTER_BASE:
+            payload["usage"] = {"include": True}
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
@@ -256,11 +303,25 @@ class LLMClient:
 
         return self._handle_compat_response(resp)
 
-    @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
+    def _handle_compat_response(self, resp: httpx.Response) -> str:
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"].get("content")
+        # Real per-call token accounting, not an estimate -- logged so actual
+        # spend (and whether prompt caching is landing) can be read back out
+        # of the log instead of guessed from prompt length. `cached_tokens`
+        # lives under prompt_tokens_details on providers that report it
+        # (OpenAI-schema convention); absent means either no cache hit or the
+        # provider doesn't report it, not necessarily "no caching happened".
+        usage = data.get("usage") or {}
+        self._cost_local.last_cost_usd = usage.get("cost")
+        if usage:
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            log.info(
+                "LLM usage: model=%s prompt=%s completion=%s cached=%s cost=%s",
+                self.model, usage.get("prompt_tokens"), usage.get("completion_tokens"), cached,
+                usage.get("cost"),
+            )
         if not content:
             finish_reason = data["choices"][0].get("finish_reason", "?")
             raise RuntimeError(
@@ -269,6 +330,14 @@ class LLMClient:
                 f"overhead -- raise it or check the reasoning_effort setting."
             )
         return content
+
+    def get_last_cost_usd(self) -> float | None:
+        """Real cost (OpenRouter's own `usage.cost`) of the calling thread's
+        most recent chat() call, or None if the response didn't include one
+        (non-OpenRouter endpoint, or the native Gemini path, which has no
+        such field). Thread-local -- see __init__ for why.
+        """
+        return getattr(self._cost_local, "last_cost_usd", None)
 
     # -- public API ---------------------------------------------------------
 
@@ -400,17 +469,85 @@ class _GeminiCompatForbidden(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Singleton
+# Singletons
 # ---------------------------------------------------------------------------
 
 _instance: LLMClient | None = None
 
 
 def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton."""
+    """Return (or create) the shared LLMClient singleton (Gemini -> free
+    OpenRouter fallback chain). Used by enrichment and discovery.
+
+    Scoring does NOT use this -- see get_scoring_client() below.
+    """
     global _instance
     if _instance is None:
         base_url, model, api_key = _detect_provider()
         log.info("LLM provider: %s  model: %s", base_url, model)
         _instance = LLMClient(base_url, model, api_key)
     return _instance
+
+
+_scoring_instance: LLMClient | None = None
+
+# 2026-09-08: scoring was pinned to paid GLM (z-ai/glm-5.3-flash via
+# OpenRouter) rather than sharing the free Gemini/OpenRouter-fallback client
+# enrichment and discovery use, pending an A/B test to decide whether that
+# was worth keeping.
+#
+# 2026-09-10, round 1: 6 jobs with tricky grad-date/eligibility edge cases,
+# scored by GLM, gpt-oss-120b, deepseek-v4-flash-0731, and paid Gemini 3.1
+# Flash Lite. deepseek-v4-flash-0731 failed outright on 2/6 (ran the full
+# 6000-token budget out on hidden reasoning before writing an answer).
+# gpt-oss-120b worked but took 15-102s/call. Gemini was fastest and had no
+# failures, so scoring moved to it first.
+#
+# 2026-09-10, round 2: with real per-call token usage now logged (see
+# _handle_compat_response below -- `LLM usage: model=... prompt=...
+# completion=... cached=...`, read straight from the API response, not
+# estimated), an 11-job re-test measured real $/job: GLM $0.00118 (and
+# failed 3/11 calls on its own re-run), Gemini $0.00153, xiaomi/mimo-v2.5
+# $0.00088 with ZERO failures -- and OpenRouter reported real cache hits
+# for MiMo (~4224 of ~4800 prompt tokens cached from the 2nd call on,
+# automatically -- the static system-prompt+resume prefix), something GLM
+# never showed despite advertising a cache-read price tier. MiMo's
+# eligibility reads roughly tracked GLM/Gemini's (small sample, and GLM
+# disagreed with its own stored values almost as often as MiMo did, so
+# "agrees with GLM" isn't a clean bar either). Per explicit preference,
+# cost now wins over latency -- switched to MiMo. Override with
+# SCORING_LLM_MODEL if a future test says to switch again.
+_SCORING_MODEL_DEFAULT = "xiaomi/mimo-v2.5"
+
+
+def get_scoring_client() -> LLMClient:
+    """Return (or create) the scoring-only LLMClient singleton.
+
+    Deliberately a separate LLMClient instance from get_client() (own rate
+    pacing), so a future change to one (a different model, a provider swap)
+    never silently affects the other. Routes to Gemini native when
+    SCORING_LLM_MODEL names a bare Gemini model (no "/"), OpenRouter
+    otherwise (OpenRouter model ids are always "vendor/model").
+    """
+    global _scoring_instance
+    if _scoring_instance is None:
+        model = os.environ.get("SCORING_LLM_MODEL", "").strip() or _SCORING_MODEL_DEFAULT
+        if "/" in model:
+            key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+            if not key:
+                raise RuntimeError(
+                    "OPENROUTER_API_KEY not set -- required for scoring model "
+                    f"'{model}'."
+                )
+            base_url = _OPENROUTER_BASE
+        else:
+            key = os.environ.get("GEMINI_API_KEY", "").strip()
+            if not key:
+                raise RuntimeError(
+                    "GEMINI_API_KEY not set -- required for scoring model "
+                    f"'{model}'."
+                )
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+        log.info("Scoring LLM provider: %s  model: %s", base_url, model)
+        _scoring_instance = LLMClient(base_url, model, key)
+    return _scoring_instance

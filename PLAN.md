@@ -1046,3 +1046,48 @@ against Gemini directly.
   that SQL `LIKE` can't do safely.
 - **Unstated pay is neutral (5.0), not zero.** Missing information is not bad
   news, and treating it as bad news silently buries big tech.
+
+## Per-company application caps — 2026-09-08
+
+Some employers cap how many applications they'll actually consider from one
+candidate in a period (confirmed via careers-site FAQs or observed pattern),
+so applying past that spends a real apply run on a job that was never
+reachable. `src/applypilot/company_limits.py` is the new home for this:
+`DEFAULT_LIMIT = 6` as a **lifetime total** (`period: "total"`, never resets)
+for any company with no confirmed number, plus `KNOWN_LIMITS` for the ones
+that do carry a real renewing allowance (Google: 3/month; TikTok and
+ByteDance: 2/season). `settings.json` can override either half
+(`default_company_application_limit`, `company_application_limits`), same
+pattern as `tier1_companies`. The default started out "6/month" and was
+corrected same-day -- most employers never state a renewing number, so
+resetting the blanket default monthly would have let it be applied to
+indefinitely; only companies with an actually-confirmed period get one.
+
+- **Matching reuses the whole-word-prefix rule** `compute_company_tiers()`
+  already established for `company_tier` -- "TikTok (ByteDance)" and
+  "tiktok" have to land in the same bucket, or the cap silently never fires.
+  Didn't refactor scorer.py's private `_matches` out into a shared helper;
+  the ~3-line rule is duplicated in `company_limits._matches` rather than
+  risk touching the tier-pin logic for this.
+- **"season" is winter/spring/summer/fall (Dec/Mar/Jun/Sep 1st starts)** --
+  the same boundaries the `term` column already uses, not a rolling window.
+  A rolling window was considered and rejected: calendar-aligned periods are
+  what "3 per month" or "2 per season" actually mean when a person says them.
+- **`acquire_job` gates on this, an explicit `--url` does not.** The cap
+  applies to both the ranked and queued branches (a row the cap would block
+  gets added to the existing `deferred` set for that call, same mechanism
+  already used for a manual-ATS or blocked-site row -- except it does NOT
+  get written a terminal DB status, since the cap resets on its own once the
+  period rolls over and the row should be retried on a future run). A
+  targeted `--url` apply is the user overriding the queue by hand, and the
+  cap doesn't second-guess an explicit pick.
+- **Dashboard tab, new "Company application caps" card** (`CompanyLimits.tsx`,
+  `/api/company-limits`): one bar per company with at least one applied row,
+  sorted fewest-remaining-first. Reuses the `.ats-row`/`.ats-bar-*` layout
+  pattern as `.cl-row`/`.cl-bar-*`, colored green→amber→red as a company
+  nears or hits its cap.
+- **Browse tab's job expansion** now shows "Company cap: 4/6 this month" next
+  to Applied, from `job_detail()`'s new `company_limit` field -- the same
+  `company_limits.status_for()` call the launcher's gate uses, so the number
+  a person sees before selecting a job matches what will actually stop it
+  from being auto-applied to.

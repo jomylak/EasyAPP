@@ -118,6 +118,35 @@ def test_eligibility_is_always_enforced(db):
     assert "u4" not in {r["url"] for r in res["rows"]}   # explicit 'no', dropped
 
 
+def test_decided_jobs_are_always_hidden(db):
+    """Not an opt-in flag any more -- once a job is queued, in flight, or
+    applied, Browse must stop showing it everywhere without the user having
+    to remember to toggle a pill. A 'failed' row stays visible (it's the
+    Retry case)."""
+    db.execute("UPDATE jobs SET apply_status = 'queued' WHERE url = 'u1'")
+    db.execute("UPDATE jobs SET apply_status = 'in_progress' WHERE url = 'u2'")
+    db.execute("UPDATE jobs SET apply_status = 'applied' WHERE url = 'u3'")
+    db.commit()
+    res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
+    assert {r["url"] for r in res["rows"]} == set()
+
+    db.execute("UPDATE jobs SET apply_status = 'failed' WHERE url = 'u1'")
+    db.commit()
+    res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
+    assert {r["url"] for r in res["rows"]} == {"u1"}
+
+
+def test_confirmed_duplicates_are_always_hidden(db):
+    """Not an opt-in flag either -- fit_gate_sql() already excludes
+    duplicate_of rows from the ranked apply queue and from
+    scoring/tailoring, so Browse must match or a duplicate posting can be
+    selected and queued/applied to separately from its canonical row."""
+    db.execute("UPDATE jobs SET duplicate_of = 'u2' WHERE url = 'u1'")
+    db.commit()
+    res = queries.list_jobs({"day": "2026-09-03"}, conn=db)
+    assert "u1" not in {r["url"] for r in res["rows"]}
+
+
 @pytest.mark.parametrize("f,expected", [
     ({"min_fit": 9}, {"u1", "u2", "u3"}),   # u3 is fit 10
     ({"min_fit": 10}, {"u1", "u3"}),
