@@ -185,20 +185,30 @@ def start_forwarder(
     ready.wait(timeout=5.0)
 
     def stop() -> None:
-        """Close the listening socket and every in-flight connection before
-        stopping the loop, all from within the loop's own thread.
+        """Close the listening socket before stopping the loop, from within
+        the loop's own thread.
 
         A bare loop.stop() from another thread (the original approach here)
         abandons server.serve_forever() mid-await -- the `async with server`
         block that's supposed to close the listening socket on exit never
         gets to run, so the OS-level socket leaks. The next job's forwarder
-        then fails to rebind the same port ("address already in use"),
-        which is exactly what broke the second job of the first real test
-        run: every _handle_client/_pipe task got torn down mid-flight too,
-        producing a cascade of "Event loop is closed" errors sys.excepthook
-        can't suppress, on top of the real functional failure.
+        then fails to rebind the same port ("address already in use"), which
+        is exactly what broke the second job of the first real test run.
+
+        Deliberately does NOT wait for in-flight _handle_client/_pipe tasks
+        to finish first (an earlier version of this fix did, via
+        asyncio.gather) -- those can be actively relaying real network
+        traffic over Tailscale to a home connection, and waiting for a
+        clean finish raced this function's own timeout on a real second
+        test run. Chrome is already killed by the time this runs (see
+        chrome.cleanup_worker's call order), so those tasks' sockets are
+        already broken and they unwind on their own; letting the loop close
+        out from under them produces cosmetic "Event loop is closed" noise
+        from tasks racing to write to an already-closed transport, not a
+        functional problem -- confirmed by two real jobs completing
+        successfully through this exact path.
         """
-        if not loop.is_running():
+        if not loop.is_running() or loop.is_closed():
             return
 
         async def _shutdown():
@@ -206,11 +216,6 @@ def start_forwarder(
             if server:
                 server.close()
                 await server.wait_closed()
-            tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-            for t in tasks:
-                t.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
             loop.stop()
 
         try:
@@ -218,7 +223,11 @@ def start_forwarder(
             future.result(timeout=5.0)
         except Exception:
             logger.debug("proxy forwarder: graceful shutdown failed, forcing stop", exc_info=True)
-            loop.call_soon_threadsafe(loop.stop)
+            try:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass  # loop closed between the check above and this call
         thread.join(timeout=2.0)
 
     return stop
