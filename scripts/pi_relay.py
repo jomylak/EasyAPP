@@ -28,6 +28,7 @@ import asyncio
 import base64
 import logging
 import os
+import socket
 import sys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -95,7 +96,9 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
         if method == b"CONNECT":
             host, _, port = target.decode().partition(":")
-            dest_reader, dest_writer = await asyncio.open_connection(host, int(port or 443))
+            dest_reader, dest_writer = await asyncio.open_connection(
+                host, int(port or 443), family=socket.AF_INET
+            )
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             await asyncio.gather(
@@ -108,7 +111,9 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             parsed = urlparse(target.decode())
             host = parsed.hostname
             port = parsed.port or 80
-            dest_reader, dest_writer = await asyncio.open_connection(host, port)
+            dest_reader, dest_writer = await asyncio.open_connection(
+                host, port, family=socket.AF_INET
+            )
             path = parsed.path or "/"
             if parsed.query:
                 path += f"?{parsed.query}"
