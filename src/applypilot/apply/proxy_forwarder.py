@@ -156,6 +156,7 @@ def start_forwarder(
 
     loop = asyncio.new_event_loop()
     ready = threading.Event()
+    server_holder: dict = {}
 
     async def _serve():
         server = await asyncio.start_server(
@@ -165,6 +166,7 @@ def start_forwarder(
             bind_host,
             local_port,
         )
+        server_holder["server"] = server
         ready.set()
         async with server:
             await server.serve_forever()
@@ -183,6 +185,40 @@ def start_forwarder(
     ready.wait(timeout=5.0)
 
     def stop() -> None:
-        loop.call_soon_threadsafe(loop.stop)
+        """Close the listening socket and every in-flight connection before
+        stopping the loop, all from within the loop's own thread.
+
+        A bare loop.stop() from another thread (the original approach here)
+        abandons server.serve_forever() mid-await -- the `async with server`
+        block that's supposed to close the listening socket on exit never
+        gets to run, so the OS-level socket leaks. The next job's forwarder
+        then fails to rebind the same port ("address already in use"),
+        which is exactly what broke the second job of the first real test
+        run: every _handle_client/_pipe task got torn down mid-flight too,
+        producing a cascade of "Event loop is closed" errors sys.excepthook
+        can't suppress, on top of the real functional failure.
+        """
+        if not loop.is_running():
+            return
+
+        async def _shutdown():
+            server = server_holder.get("server")
+            if server:
+                server.close()
+                await server.wait_closed()
+            tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            loop.stop()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+            future.result(timeout=5.0)
+        except Exception:
+            logger.debug("proxy forwarder: graceful shutdown failed, forcing stop", exc_info=True)
+            loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2.0)
 
     return stop
