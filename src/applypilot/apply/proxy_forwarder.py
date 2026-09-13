@@ -175,7 +175,13 @@ def start_forwarder(
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(_serve())
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, RuntimeError):
+            # RuntimeError("Event loop stopped before Future completed") is
+            # the normal shape of stop()'s own loop.stop() unwinding
+            # run_until_complete -- cosmetic, not a real failure (confirmed:
+            # the next job's forwarder rebinds and proceeds normally right
+            # after). Letting it propagate here only prints a scary
+            # "Exception in thread" traceback for something already handled.
             pass
         finally:
             loop.close()
