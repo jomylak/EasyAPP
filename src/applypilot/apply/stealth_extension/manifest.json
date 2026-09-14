@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "chrome-parity",
+  "version": "1.0",
+  "description": "Restores window.chrome.* objects and navigator.plugins that a bare CDP-driven session is missing relative to a real user's Chrome, so page-level bot-detection scripts see a normal profile.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ]
+}

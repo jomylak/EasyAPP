@@ -24,6 +24,9 @@ BASE_CDP_PORT = 9222
 # Local forwarding-proxy port base — each worker uses BASE_PROXY_PORT + worker_id
 BASE_PROXY_PORT = 9322
 
+# Loaded into every worker's Chrome -- see stealth_extension/inject.js.
+_STEALTH_EXTENSION_DIR = Path(__file__).parent / "stealth_extension"
+
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 # Track each worker's *current job's* upstream proxy string (CapSolver format,
@@ -342,14 +345,19 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--password-store=basic",
         "--disable-save-password-bubble",
         "--disable-popup-blocking",
-        # The worker profile is cloned from the user's real Chrome, so it
-        # inherits their extensions. That is actively harmful here: a rival
-        # autofill extension (Jobright) injects its own "Upload Resume" and
-        # "Autofill" controls into the very page we are filling, which both
-        # confuses a vision-driven agent and eats ~40% of the viewport.
-        # Cookies and sessions live in the profile, not the extensions, so
-        # logged-in ATS state is unaffected.
-        "--disable-extensions",
+        # setup_worker_profile() already skips copying Extensions/Local
+        # Extension Settings/Extension State when cloning the profile, so the
+        # inherited-extensions problem this used to guard against (a rival
+        # autofill extension injecting its own "Upload Resume"/"Autofill"
+        # controls into the page, confusing a vision-driven agent and eating
+        # ~40% of the viewport) can't recur even without --disable-extensions.
+        # Load exactly our own stealth extension instead of blocking all
+        # extensions outright -- see stealth_extension/inject.js for what it
+        # does and why. --disable-extensions-except scopes this down to just
+        # that one extension, so nothing else can load even if a future
+        # profile-cloning change stops excluding them.
+        f"--load-extension={_STEALTH_EXTENSION_DIR}",
+        f"--disable-extensions-except={_STEALTH_EXTENSION_DIR}",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
         "--use-fake-ui-for-media-stream",
