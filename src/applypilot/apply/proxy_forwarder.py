@@ -184,6 +184,28 @@ def start_forwarder(
             # "Exception in thread" traceback for something already handled.
             pass
         finally:
+            # loop.stop() (in stop()'s _shutdown) only unwinds
+            # run_until_complete -- it doesn't cancel whatever
+            # _handle_client/_pipe tasks were still in flight for this
+            # forwarder's connections. Left alone, those Task objects sit
+            # pending until Python's GC finalizes them at some arbitrary
+            # later point, and Task.__del__ prints "Task was destroyed but
+            # it is pending!" for each one when that happens -- unrelated to,
+            # and not covered by, the run_until_complete RuntimeError this
+            # try/except above already silences. Cancelling here is
+            # immediate (a task blocked on reader.read() raises
+            # CancelledError right away), not a wait for real traffic to
+            # finish, so it doesn't reintroduce the shutdown-races-live-
+            # traffic problem stop()'s docstring describes.
+            try:
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
             loop.close()
 
     thread = threading.Thread(target=_run, daemon=True, name=f"proxy-fwd-{local_port}")
