@@ -132,14 +132,21 @@ score_loop() {
 
 discover_loop &
 DISCOVER_PID=$!
-enrich_loop &
-ENRICH_PID=$!
+# enrich_loop is NOT started here as of 2026-09-11: Jobright's detail pages
+# (/jobs/info/*) sit behind a Cloudflare Turnstile challenge that hard-blocks
+# this VM's datacenter IP (AS31898) on essentially every request -- confirmed
+# directly, including plain curl with no JS. A home-IP machine (the
+# enrichment Pi, scripts/pi_enrich_runner.py) runs the same scrape/retry/tier
+# cascade instead and reports results back through /api/enrich/*. Running
+# enrich_loop here too would just burn detail_attempts on jobs the Pi could
+# still succeed on. The function is left defined above in case Jobright's
+# policy changes and local enrichment becomes viable again.
 score_loop &
 SCORE_PID=$!
 tailor_loop &
 TAILOR_PID=$!
 
-wait "$DISCOVER_PID" "$ENRICH_PID" "$SCORE_PID" "$TAILOR_PID"
+wait "$DISCOVER_PID" "$SCORE_PID" "$TAILOR_PID"
 rm -f "$STOP_FLAG"
 
 echo "=== CONTINUOUS PIPELINE STOPPED: $(date) ===" | tee -a "$LOG"

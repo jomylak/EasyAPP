@@ -37,12 +37,45 @@ _worker_proxies: dict[int, str] = {}
 _worker_forwarder_stops: dict[int, callable] = {}
 _chrome_lock = threading.Lock()
 
+# APPLY_PROXY is one home relay on one real IP -- it can only ever carry one
+# worker's traffic at a time, or concurrent proxied sessions would just be
+# multiple workers competing for (and overloading) that single connection.
+# Serializes launch_chrome(use_proxy=True) across every worker thread; see
+# acquire_proxy_slot/release_proxy_slot below.
+_proxy_lock = threading.Lock()
+
+
+def acquire_proxy_slot(stop_event=None, poll: float = 1.0) -> bool:
+    """Block until the single APPLY_PROXY slot is free, then hold it.
+
+    Caller must call release_proxy_slot() once done with the proxied Chrome
+    (after cleanup_worker, in the same try/finally that launched it) --
+    holding this is not tied to launch_chrome itself since the slot must stay
+    held for the whole proxied job, not just the launch.
+
+    Polls in `poll`-second slices (rather than blocking indefinitely) so a
+    worker waiting for the slot still notices `stop_event` and can give up.
+    Returns False if stop_event was set before the slot became free.
+    """
+    while True:
+        if _proxy_lock.acquire(timeout=poll):
+            return True
+        if stop_event is not None and stop_event.is_set():
+            return False
+
+
+def release_proxy_slot() -> None:
+    """Release the slot acquired by acquire_proxy_slot()."""
+    _proxy_lock.release()
+
 
 def get_worker_proxy(worker_id: int) -> str | None:
     """The CapSolver-format proxy string ("type:host:port:user:pass") this
     worker's currently-launched Chrome is using, or None if APPLY_PROXY isn't
-    configured. CapSolver must solve through the exact same egress IP Chrome
-    is browsing from -- see get_apply_proxy's docstring for why.
+    configured, or if this Chrome was launched with use_proxy=False (the
+    default -- see launch_chrome's docstring). CapSolver must solve through
+    the exact same egress IP Chrome is browsing from -- see get_apply_proxy's
+    docstring for why.
     """
     with _chrome_lock:
         return _worker_proxies.get(worker_id)
@@ -277,13 +310,21 @@ def _wait_for_cdp(port: int, worker_id: int, proc: subprocess.Popen,
 
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+                  headless: bool = False, use_proxy: bool = False) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        use_proxy: Route this Chrome instance through APPLY_PROXY (if
+            configured). Default False -- every job starts on a direct
+            connection. launcher.py's worker loop only passes True for the
+            one relaunch it does after a job's first attempt hits a captcha
+            wall, so the home-relay proxy only ever carries the traffic of
+            jobs that actually need CapSolver's IP to match Chrome's, instead
+            of every job on every worker regardless of whether it ever sees
+            a captcha.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -306,11 +347,15 @@ def launch_chrome(worker_id: int, port: int | None = None,
     # A fresh sticky-session proxy per job: this worker's Chrome and the
     # CAPTCHA solve for whatever job it runs must share one egress IP, since
     # the whole point is making the solve session and the submitting session
-    # look like the same real user. Only active when APPLY_PROXY is set --
-    # unset reproduces today's exact (no-proxy) behavior.
-    import secrets
-    session_id = f"w{worker_id}-{secrets.token_hex(4)}"
-    proxy = config.get_apply_proxy(session_id)
+    # look like the same real user. Only requested when the caller passes
+    # use_proxy=True -- APPLY_PROXY being set is necessary but not
+    # sufficient; see this function's docstring for why it's opt-in per
+    # launch rather than automatic just because the env var exists.
+    proxy = None
+    if use_proxy:
+        import secrets
+        session_id = f"w{worker_id}-{secrets.token_hex(4)}"
+        proxy = config.get_apply_proxy(session_id)
 
     _stop_forwarder_for_worker(worker_id)
     proxy_port = None

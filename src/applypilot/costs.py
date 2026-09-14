@@ -91,6 +91,27 @@ def price_for(backend: str, ats: str | None, observed: dict) -> tuple[float, int
     return _fallback_price(backend), 0, "configured default"
 
 
+def median_cost_per_turn(backend: str, conn: sqlite3.Connection | None = None) -> float | None:
+    """Median $/turn across completed runs, for pricing a run that never
+    reported its own cost. A goose run killed by the wall-clock or CDP
+    watchdog (`apply_error_category` "timeout") never emits Goose's
+    ``complete`` stats line, so it lands with ``apply_cost_usd`` NULL --
+    silently priced at $0 even though the OpenRouter calls it made before
+    being killed were real spend. That undercounts the fleet's true bill and
+    contradicts this module's own stance (see `observed_costs`) that a failed
+    run still cost money. None if there is no history to divide by.
+    """
+    conn = conn or get_connection()
+    rows = conn.execute("""
+        SELECT apply_cost_usd AS cost, apply_llm_requests AS turns
+        FROM jobs
+        WHERE apply_backend = ? AND apply_cost_usd IS NOT NULL
+          AND apply_llm_requests IS NOT NULL AND apply_llm_requests > 0
+    """, (backend,)).fetchall()
+    ratios = [r["cost"] / r["turns"] for r in rows]
+    return median(ratios) if ratios else None
+
+
 def ats_stats(conn: sqlite3.Connection | None = None) -> list[dict]:
     """Per-(ATS, backend) run statistics, for cost/duration reporting.
 

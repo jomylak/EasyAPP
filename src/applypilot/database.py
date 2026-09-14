@@ -170,6 +170,15 @@ _ALL_COLUMNS: dict[str, str] = {
     # posting can be up to 7 days old on first discovery (see
     # _posted_within_days). Null when the source page gave no parseable date.
     "posted_date": "TEXT",
+    # The employer's own stated posting date (JSON-LD `datePosted` on the
+    # real ATS/careers page, read during enrichment's click-through past the
+    # aggregator wrapper -- see enrichment.detail.resolve_original_job_url).
+    # This is the most authoritative date available (straight from the
+    # source, not an aggregator's re-touched timestamp) and takes priority
+    # over `posted_date` wherever both exist -- see database._DAY_EXPR. Null
+    # whenever the employer's page carries no JSON-LD date (most ATS
+    # platforms do, but not all) or the aggregator wrapper never resolved.
+    "employer_posted_date": "TEXT",
     # Enrichment
     "full_description": "TEXT",
     "application_url": "TEXT",
@@ -384,7 +393,13 @@ _ALL_COLUMNS: dict[str, str] = {
 #
 # The day expression must be written character-for-character the way the query
 # writes it, or SQLite will not match the index to the query.
-_DAY_EXPR = "date(COALESCE(posted_date, discovered_at))"
+#
+# employer_posted_date (the ATS/careers page's own JSON-LD datePosted, read
+# during enrichment) outranks posted_date (Jobright's postedAt, or -- for the
+# Airtable-sourced boards -- their grid's own Date column) because it comes
+# straight from the source instead of an aggregator's re-touched timestamp.
+# discovered_at is the last resort, for whatever neither source dated.
+_DAY_EXPR = "date(COALESCE(employer_posted_date, posted_date, discovered_at))"
 
 _ALL_INDEXES: dict[str, str] = {
     # Day bucketing: the browse tab groups by this and nothing else.

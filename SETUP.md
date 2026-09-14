@@ -171,14 +171,17 @@ Playwright + Gmail MCP servers, and the same Chrome:
 
 | Backend | Model | Cost | Role |
 |---|---|---|---|
-| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default.** Runs every job first. |
-| `claude` | Claude Code CLI | Your Claude subscription quota | Fallback. Retries only the jobs Goose couldn't finish. |
+| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and effectively the only engine in normal use.** Runs every job first. |
+| `claude` | Claude Code CLI | Your Claude subscription quota | Rare fallback only. Retries only the jobs Goose couldn't finish. |
 
 The fallback is deliberately narrow. Claude gets a second attempt only when
 Goose gave up for a reason that means *the driver* lost the thread — it got
 stuck, timed out, hit a broken page, or never reported an outcome. A posting
 that's expired, already applied to, or behind an SSO wall is just as dead for
-the stronger model, so those are never retried.
+the stronger model, so those are never retried. In practice Goose on
+`xiaomi/mimo-v2.5` finishes the large majority of jobs itself, so Claude usage
+should stay occasional — if it isn't, that's a sign something regressed on
+the Goose side, not that Claude should become the primary engine.
 
 Change any of it in `~/.applypilot/settings.json`:
 
@@ -206,9 +209,9 @@ same ATS gets those notes in its prompt, on either backend — so the fleet
 gets better at Workday, Greenhouse, and friends over time.
 
 `goose_writes_quirks` controls whether Goose may *add* to that cache; reading
-it is always on. It ships enabled. If you ever see junk entries, turn it off —
-the cache is shared, so a bad note from a cheap model would also mislead
-Claude runs.
+it is always on. It ships enabled and should stay that way — `xiaomi/mimo-v2.5`
+is the trusted, always-on quirk writer now that it's the only engine in
+regular use. Only turn it off if junk entries start showing up.
 
 ## What you don't need
 

@@ -67,11 +67,15 @@ sites:
   # tab title is literally "Airtable - Grid view", not the Jobright-branded
   # widget). That means these route through _scrape_airtable_button_grid
   # (matched by "airtable.com/embed/" in the url below), NOT the API path.
-  # KNOWN LIMITATION: that scraper only reads whatever the virtualized grid
-  # has rendered on first load (~18-30 rows observed), not the full
-  # 600-972 records each of these grids actually holds -- it does not
-  # scroll/paginate. Every run still only nets a small, recency-biased
-  # slice of each category until that scraper gains real pagination.
+  # FIXED (was a known limitation): _scrape_airtable_button_grid now scrolls
+  # the grid's own scroll container round by round instead of reading only
+  # the ~18-30 rows rendered on first load, and does reach the bottom of a
+  # 600+ record grid (verified live, 2026-09). Live spot-checks the same
+  # month found cumulative DB row counts for all three of these boards
+  # exceeding their current live record count, the same healthy pattern as
+  # the two fully API-verified SWE boards -- i.e. not stuck on a small
+  # recency-biased slice. See _scrape_airtable_button_grid's own docstring
+  # for the scroll mechanics.
   - name: "Intern List - AIML"
     url: "https://airtable.com/embed/appjSXAWiVF4d1HoZ/shrf04yGbrK3IebAl?viewControls=on"
     type: static

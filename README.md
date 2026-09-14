@@ -95,7 +95,7 @@ Each stage is independent. Run them all or pick what you need.
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Goose CLI | Auto-apply (default engine) | [Install guide](https://block.github.io/goose/docs/getting-started/installation/) |
 | OpenRouter API key | The model Goose runs on | [openrouter.ai/keys](https://openrouter.ai/keys) |
-| Claude Code CLI | Optional fallback engine | Install from [claude.ai/code](https://claude.ai/code) |
+| Claude Code CLI | Optional, rarely-used fallback engine | Install from [claude.ai/code](https://claude.ai/code) |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
 
@@ -156,8 +156,8 @@ the same Playwright + Gmail MCP servers, and the same Chrome.
 
 | Backend | Model | Cost | Role |
 |---|---|---|---|
-| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default.** Tries every job first. |
-| `claude` | Claude Code CLI | Claude subscription quota | Fallback for jobs Goose can't finish. |
+| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and effectively the only engine in normal use.** Tries every job first. |
+| `claude` | Claude Code CLI | Claude subscription quota | Rare fallback only, for jobs Goose can't finish. |
 
 Because both apply as the same candidate and record the same outcome codes, their
 completion rates are directly comparable.
@@ -165,7 +165,9 @@ completion rates are directly comparable.
 The fallback is narrow on purpose: Claude retries a job only when Goose gave up for
 a reason that means the *driver* lost the thread (stuck, timed out, broken page, no
 outcome reported). A posting that is expired, already applied to, or behind an SSO
-wall is just as dead for the stronger model, so it is never retried.
+wall is just as dead for the stronger model, so it is never retried. In practice this
+fires rarely -- Goose on `xiaomi/mimo-v2.5` finishes the large majority of jobs itself,
+so budget for Claude usage as an occasional safety net, not a co-equal path.
 
 ```bash
 applypilot apply --backend claude       # skip Goose entirely

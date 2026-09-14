@@ -12,10 +12,12 @@ Three-tier extraction cascade (cheapest first):
 
 import json
 import logging
+import random
 import re
 import socket
 import sqlite3
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import urljoin
@@ -205,6 +207,35 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
 
 # -- Detail page intelligence ------------------------------------------------
 
+_JOBRIGHT_NEXT_DATA_RE = re.compile(
+    r'__NEXT_DATA__"\s*type="application/json">(.*?)</script>', re.S
+)
+
+
+def _extract_jobright_publish_time(page) -> str | None:
+    """Pull Jobright's own precise posting time off its job page, free.
+
+    This page is already loaded here (scrape_detail_page navigates to it
+    first, before ever clicking through to the employer's site), so this
+    is a zero-extra-request safety net for whatever discovery's own fetch
+    (_fetch_jobright_publish_time in discovery/smartextract.py) missed --
+    same field, same reasoning: the bulk minisite API's own `postedAt` runs
+    ~7h behind what Jobright's page itself displays, but the page's
+    embedded Next.js data has the correct `publishTime`.
+    """
+    try:
+        match = _JOBRIGHT_NEXT_DATA_RE.search(page.content())
+        if not match:
+            return None
+        data = json.loads(match.group(1))
+        publish_time = data["props"]["pageProps"]["dataSource"]["jobResult"].get("publishTime")
+        if not publish_time:
+            return None
+        return datetime.fromisoformat(publish_time).replace(tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
 def collect_detail_intelligence(page) -> dict:
     """Collect signals from a detail page. Lighter than discovery -- no API interception."""
     intel: dict = {"json_ld": [], "page_title": "", "final_url": ""}
@@ -224,9 +255,32 @@ def collect_detail_intelligence(page) -> dict:
 
 # -- Tier 1: JSON-LD extraction -----------------------------------------------
 
+def _normalize_employer_date(date_str: str | None) -> str | None:
+    """Parse a JSON-LD `datePosted` value into ISO 8601, or None.
+
+    Unlike discovery's `_normalize_posted_date` (which also handles relative
+    text like "2 days ago" scraped off a card), schema.org's `datePosted` is
+    always meant to be an absolute date/datetime already -- so this only
+    needs a straight parse, not the relative-text branches. Still runs
+    through dateutil rather than assuming strict ISO, since real-world sites
+    are inconsistent about it (bare "2026-09-13" vs a full timestamp).
+    """
+    if not date_str or not date_str.strip():
+        return None
+    from dateutil import parser as dateutil_parser
+    try:
+        parsed = dateutil_parser.parse(date_str.strip())
+    except (ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
 def extract_from_json_ld(intel: dict) -> dict | None:
-    """Extract description and apply URL from JSON-LD JobPosting.
-    Returns {"full_description": str, "application_url": str|None} or None."""
+    """Extract description, apply URL, and posting date from JSON-LD JobPosting.
+    Returns {"full_description": str, "application_url": str|None,
+    "employer_posted_date": str|None} or None."""
 
     def find_job_posting(data):
         if isinstance(data, dict):
@@ -270,6 +324,7 @@ def extract_from_json_ld(intel: dict) -> dict | None:
         return {
             "full_description": desc_clean,
             "application_url": apply_url,
+            "employer_posted_date": _normalize_employer_date(posting.get("datePosted")),
         }
 
     return None
@@ -352,22 +407,30 @@ def extract_apply_url_deterministic(page) -> str | None:
     return None
 
 
-def _extract_page_description(page) -> str | None:
-    """Best-effort description pull from a page already loaded in the
-    browser -- JSON-LD first (free, structured), falling back to the same
-    deterministic CSS patterns used for a normal detail-page scrape.
+def _extract_page_description(page) -> tuple[str | None, str | None]:
+    """Best-effort (description, employer_posted_date) pull from a page
+    already loaded in the browser -- JSON-LD first (free, structured, and
+    the only source that can carry a posting date), falling back to the
+    same deterministic CSS patterns used for a normal detail-page scrape
+    for description alone (no employer date -- that's JSON-LD-only, this
+    module has no CSS-based date fallback).
+
+    This runs against the real employer/ATS page (see
+    resolve_original_job_url), not Jobright's own wrapper page -- so a
+    `datePosted` found here is the employer's own stated date, the most
+    authoritative one available (see database._DAY_EXPR).
     """
     try:
         intel = collect_detail_intelligence(page)
         json_ld_result = extract_from_json_ld(intel)
         if json_ld_result and json_ld_result.get("full_description"):
-            return json_ld_result["full_description"]
+            return json_ld_result["full_description"], json_ld_result.get("employer_posted_date")
     except Exception:
         pass
     try:
-        return extract_description_deterministic(page)
+        return extract_description_deterministic(page), None
     except Exception:
-        return None
+        return None, None
 
 
 def _dismiss_tour_modal(page) -> None:
@@ -393,6 +456,12 @@ def _dismiss_tour_modal(page) -> None:
     for selector in (
         '#___reactour button[aria-label="Close"]',
         '#___reactour [aria-label*="close" i]',
+        # The one actually observed live, once logged in: Jobright's "Orion"
+        # resume-tailoring tour tooltip, an `EXIT` button
+        # (id="index_tour-exit-button-id__..."). Matched by text rather than
+        # that id, which looks like a per-build CSS-module hash, not
+        # something to pin to.
+        '#___reactour button:has-text("Exit")',
         '#___reactour button:has-text("Skip")',
         '#___reactour button:has-text("Got it")',
         '#___reactour button:has-text("Done")',
@@ -421,7 +490,7 @@ def _dismiss_tour_modal(page) -> None:
         pass
 
 
-def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
+def _resolve_via_original_job_post(page) -> tuple[str | None, str | None, str | None]:
     """Primary strategy: click Jobright's "Original Job Post" toolbar link.
 
     A single stable link present on every job page regardless of which Apply
@@ -431,25 +500,31 @@ def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
     jobs with two different Apply-button variants; both resolved correctly
     through this one link.
 
-    Returns (resolved_url, description) -- description is a best-effort pull
-    from the real employer's own page before closing it, since we're already
-    there: the original posting is more likely to state salary than
-    Jobright's own summary of it (pay-transparency law requires it on the
-    original in many states; Jobright's paraphrase doesn't reliably carry it
-    over), and it costs nothing extra -- this tab was already being opened
-    and closed to get the URL.
+    Returns (resolved_url, description, employer_posted_date) -- description
+    and employer_posted_date are a best-effort pull from the real employer's
+    own page before closing it, since we're already there: the original
+    posting is more likely to state salary than Jobright's own summary of it
+    (pay-transparency law requires it on the original in many states;
+    Jobright's paraphrase doesn't reliably carry it over) and to carry its
+    own JSON-LD `datePosted`, and it costs nothing extra -- this tab was
+    already being opened and closed to get the URL.
     """
     # A wait, not an instant query: the link is fine on a fully-rendered
     # page, but querying the instant scrape_detail_page's own navigation
     # settles was seen to miss it on a slower-rendering layout, silently
     # falling through to the Apply-flow strategy (or nothing) for a job that
     # did have this link, just not yet.
+    # A Locator, not an ElementHandle from wait_for_selector -- the latter is
+    # a snapshot reference to one DOM node, which _dismiss_tour_modal's own
+    # interaction (right below) can detach by triggering a React re-render
+    # (seen consistently once logged in, which surfaces a first-login "tour"
+    # modal that didn't appear signed out). A Locator re-resolves the live
+    # DOM at click time instead of clicking a now-stale handle.
+    link = page.locator("text=Original Job Post").first
     try:
-        link = page.wait_for_selector("text=Original Job Post", timeout=4000)
+        link.wait_for(timeout=4000)
     except Exception:
-        link = None
-    if not link:
-        return None, None
+        return None, None, None
     _dismiss_tour_modal(page)
     pages_before = set(page.context.pages)
     link.click(timeout=5000)
@@ -459,13 +534,13 @@ def _resolve_via_original_job_post(page) -> tuple[str | None, str | None]:
         new_page = new_pages.pop()
         new_page.wait_for_load_state("domcontentloaded", timeout=10000)
         resolved = new_page.url
-        description = _extract_page_description(new_page)
+        description, employer_posted_date = _extract_page_description(new_page)
         new_page.close()
-        return resolved, description
-    return None, None
+        return resolved, description, employer_posted_date
+    return None, None, None
 
 
-def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
+def _resolve_via_apply_flow(page) -> tuple[str | None, str | None, str | None]:
     """Fallback strategy: the Apply button's own flow.
 
     Only reached if "Original Job Post" isn't present for some job layout
@@ -475,7 +550,7 @@ def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
     can surface a "Customize Your Resume" upsell dialog with an "Apply
     Without Customizing" skip link before the real navigation happens; not
     every posting shows it. See _resolve_via_original_job_post for why a
-    description is captured here too.
+    description and employer_posted_date are captured here too.
     """
     apply_btn = None
     for el in page.query_selector_all("a, button"):
@@ -484,7 +559,7 @@ def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
             apply_btn = el
             break
     if not apply_btn:
-        return None, None
+        return None, None, None
 
     _dismiss_tour_modal(page)
     pages_before = set(page.context.pages)
@@ -501,15 +576,15 @@ def _resolve_via_apply_flow(page) -> tuple[str | None, str | None]:
         new_page = new_pages.pop()
         new_page.wait_for_load_state("domcontentloaded", timeout=10000)
         resolved = new_page.url
-        description = _extract_page_description(new_page)
+        description, employer_posted_date = _extract_page_description(new_page)
         new_page.close()
-        return resolved, description
-    return None, None
+        return resolved, description, employer_posted_date
+    return None, None, None
 
 
-def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | None, str | None]:
-    """Get the real employer ATS URL (and a best-effort description from
-    that page) behind a Jobright-wrapped job page.
+def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | None, str | None, str | None]:
+    """Get the real employer ATS URL (and a best-effort description and
+    posting date from that page) behind a Jobright-wrapped job page.
 
     Jobright's own detail page is itself an aggregator wrapper -- its og:url
     and default Apply link both stay on jobright.ai, so ATS detection run
@@ -523,19 +598,19 @@ def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | Non
     regardless of which Apply-button variant the posting shows), falling
     back to the Apply button's own flow only if that link isn't present.
 
-    Returns (resolved_url, description) -- either or both may be None.
-    Best-effort on failure -- most jobs are not aggregator-wrapped, a
-    logged-out context can't get past the wall at all, and a page layout
-    neither strategy recognizes should not break enrichment -- but every
-    failure is now logged rather than swallowed silently, since a silent
-    failure here is exactly what let 128 jobright.ai rows in the live DB
-    store the aggregator's own UI chrome as if it were the job posting (see
-    is_aggregator_boilerplate).
+    Returns (resolved_url, description, employer_posted_date) -- any of the
+    three may be None. Best-effort on failure -- most jobs are not
+    aggregator-wrapped, a logged-out context can't get past the wall at all,
+    and a page layout neither strategy recognizes should not break
+    enrichment -- but every failure is now logged rather than swallowed
+    silently, since a silent failure here is exactly what let 128 jobright.ai
+    rows in the live DB store the aggregator's own UI chrome as if it were
+    the job posting (see is_aggregator_boilerplate).
     """
     from applypilot.ats import _AGGREGATORS
 
     if not candidate_url or not re.search(_AGGREGATORS, candidate_url.lower()):
-        return None, None
+        return None, None, None
 
     try:
         # scrape_detail_page navigates `page` to the job's own url, which for
@@ -546,15 +621,15 @@ def resolve_original_job_url(page, candidate_url: str | None) -> tuple[str | Non
             page.wait_for_load_state("domcontentloaded", timeout=15000)
             page.wait_for_timeout(1500)
 
-        resolved, description = _resolve_via_original_job_post(page)
+        resolved, description, employer_posted_date = _resolve_via_original_job_post(page)
         if not resolved:
-            resolved, description = _resolve_via_apply_flow(page)
+            resolved, description, employer_posted_date = _resolve_via_apply_flow(page)
         if not resolved:
             log.warning("Could not resolve original posting behind aggregator: %s", candidate_url)
-        return resolved, description
+        return resolved, description, employer_posted_date
     except Exception as e:
         log.warning("Original-posting resolution errored for %s: %s", candidate_url, e)
-        return None, None
+        return None, None, None
 
 
 def extract_description_deterministic(page) -> str | None:
@@ -827,7 +902,7 @@ def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
     """
     candidate = result.get("application_url") or url
 
-    resolved, original_description = resolve_original_job_url(page, candidate)
+    resolved, original_description, employer_posted_date = resolve_original_job_url(page, candidate)
     if resolved:
         result["application_url"] = resolved
         if result.get("full_description"):
@@ -843,6 +918,13 @@ def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
             result["full_description"] = original_description
             result["status"] = "ok"
 
+        # Same reasoning as the description above: the employer's own
+        # JSON-LD `datePosted`, straight from the source, outranks anything
+        # Jobright or a discovery-time scrape ever recorded (see
+        # database._DAY_EXPR) -- store it whenever this resolution found one.
+        if employer_posted_date:
+            result["employer_posted_date"] = employer_posted_date
+
     result["elapsed"] = time.time() - t0
     return result
 
@@ -852,6 +934,8 @@ def scrape_detail_page(page, url: str) -> dict:
     result: dict = {
         "full_description": None,
         "application_url": None,
+        "employer_posted_date": None,
+        "posted_date": None,
         "status": "error",
         "tier_used": None,
         "error": None,
@@ -877,6 +961,9 @@ def scrape_detail_page(page, url: str) -> dict:
             result["error"] = err_str[:200]
         result["elapsed"] = time.time() - t0
         return result
+
+    if "jobright.ai/jobs/info/" in url:
+        result["posted_date"] = _extract_jobright_publish_time(page)
 
     intel = collect_detail_intelligence(page)
 
@@ -931,10 +1018,31 @@ def scrape_site_batch(
     jobs: list[tuple],
     delay: float = 2.0,
     max_jobs: int | None = None,
+    remote_report: Callable[[str, dict], None] | None = None,
+    jitter: float = 0.0,
 ) -> dict:
     """Process all jobs for one site using shared browser context.
 
-    If conn is None, creates its own DB connection.
+    If conn is None and remote_report is None, creates its own DB connection.
+
+    remote_report, when given, is called once per job with (url, outcome)
+    instead of every local `conn.execute(...)` in this function -- the
+    mechanism that lets a machine with no direct DB access (e.g. the
+    enrichment Pi, run from a home IP to get past Jobright's Cloudflare
+    challenge on this VM's datacenter IP) reuse this exact scrape/retry/tier
+    cascade unchanged, reporting results back over HTTP instead of writing
+    SQL directly. `outcome` is one of:
+      {"status": "success", "full_description": str|None, "application_url": str|None}
+      {"status": "network_down", "error": str}
+      {"status": "error", "error": str}
+    The receiving end (queries.report_enrich_result) mirrors this function's
+    own local UPDATE logic byte-for-byte, including the attempts/gave-up
+    accounting and the post-success dedup check.
+
+    jitter (0.0-1.0, default off) randomizes each inter-job sleep within
+    delay*(1-jitter) to delay*(1+jitter) -- a fixed cadence for hours is a
+    more obviously-mechanical shape than the same average rate with natural
+    variance. Zero behavior change for existing callers, which never pass it.
     """
     stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
 
@@ -944,7 +1052,7 @@ def scrape_site_batch(
     if not jobs:
         return stats
 
-    own_conn = conn is None
+    own_conn = conn is None and remote_report is None
     if own_conn:
         conn = init_db()
 
@@ -988,22 +1096,33 @@ def scrape_site_batch(
 
                 if status in ("ok", "partial"):
                     stats[status] += 1
-                    from applypilot.ats import detect_ats
-                    detected = detect_ats(
-                        result.get("application_url") or url,
-                        result.get("full_description"),
-                    )
-                    conn.execute(
-                        "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL, ats = ? WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"),
-                         now, detected, url),
-                    )
-                    conn.commit()
-                    from applypilot.dedup import check_duplicate
-                    dup = check_duplicate(conn, url)
-                    if dup["duplicate_of"]:
-                        log.info("  duplicate of %s (%s)", dup["duplicate_of"], dup["reason"])
+                    if remote_report:
+                        remote_report(url, {
+                            "status": "success",
+                            "full_description": result.get("full_description"),
+                            "application_url": result.get("application_url"),
+                            "employer_posted_date": result.get("employer_posted_date"),
+                            "posted_date": result.get("posted_date"),
+                        })
+                    else:
+                        from applypilot.ats import detect_ats
+                        detected = detect_ats(
+                            result.get("application_url") or url,
+                            result.get("full_description"),
+                        )
+                        conn.execute(
+                            "UPDATE jobs SET full_description = ?, application_url = ?, "
+                            "employer_posted_date = ?, posted_date = COALESCE(posted_date, ?), "
+                            "detail_scraped_at = ?, detail_error = NULL, ats = ? WHERE url = ?",
+                            (result.get("full_description"), result.get("application_url"),
+                             result.get("employer_posted_date"), result.get("posted_date"),
+                             now, detected, url),
+                        )
+                        conn.commit()
+                        from applypilot.dedup import check_duplicate
+                        dup = check_duplicate(conn, url)
+                        if dup["duplicate_of"]:
+                            log.info("  duplicate of %s (%s)", dup["duplicate_of"], dup["reason"])
                 else:
                     stats["error"] += 1
                     err = result.get("error")
@@ -1020,11 +1139,14 @@ def scrape_site_batch(
                         # every remaining job would otherwise fail the same
                         # way in under a second each, burning attempts across
                         # the whole backlog for one outage.
-                        conn.execute(
-                            "UPDATE jobs SET detail_error = ? WHERE url = ?",
-                            (err, url),
-                        )
-                        conn.commit()
+                        if remote_report:
+                            remote_report(url, {"status": "network_down", "error": err})
+                        else:
+                            conn.execute(
+                                "UPDATE jobs SET detail_error = ? WHERE url = ?",
+                                (err, url),
+                            )
+                            conn.commit()
                         if wait_for_connectivity():
                             continue
                         # Still offline after the long wait -- stop hammering
@@ -1038,38 +1160,50 @@ def scrape_site_batch(
                         )
                         break
 
-                    # detail_scraped_at is what takes a job out of the
-                    # "pending" queue -- setting it unconditionally on every
-                    # error used to permanently strand a job the moment it
-                    # hit one bad network blip (net::ERR_INTERNET_DISCONNECTED,
-                    # DNS failure, timeout), with no retry ever. Only give up
-                    # for real after 3 attempts; before that, leave it NULL
-                    # so the next enrichment pass picks it back up on its own,
-                    # the same self-healing model scoring already uses.
-                    # Read the count fresh from the DB rather than the `jobs`
-                    # list passed in -- that list is built once per batch by
-                    # two different callers (_run_detail_scraper, stream_detail),
-                    # neither of which needs to carry this value through.
-                    prev_attempts = conn.execute(
-                        "SELECT detail_attempts FROM jobs WHERE url = ?", (url,)
-                    ).fetchone()
-                    attempts = ((prev_attempts[0] if prev_attempts else 0) or 0) + 1
-                    if attempts >= 3:
-                        conn.execute(
-                            "UPDATE jobs SET detail_error = ?, detail_scraped_at = ?, "
-                            "detail_attempts = ? WHERE url = ?",
-                            (err or "unknown", now, attempts, url),
-                        )
+                    if remote_report:
+                        # Attempts/gave-up accounting happens server-side
+                        # (queries.report_enrich_result) -- it reads and
+                        # increments detail_attempts itself, mirroring the
+                        # local branch below exactly. A remote reporter has
+                        # no direct DB access to read the current count from.
+                        remote_report(url, {"status": "error", "error": err or "unknown"})
                     else:
-                        conn.execute(
-                            "UPDATE jobs SET detail_error = ?, detail_attempts = ? WHERE url = ?",
-                            (err or "unknown", attempts, url),
-                        )
+                        # detail_scraped_at is what takes a job out of the
+                        # "pending" queue -- setting it unconditionally on every
+                        # error used to permanently strand a job the moment it
+                        # hit one bad network blip (net::ERR_INTERNET_DISCONNECTED,
+                        # DNS failure, timeout), with no retry ever. Only give up
+                        # for real after 3 attempts; before that, leave it NULL
+                        # so the next enrichment pass picks it back up on its own,
+                        # the same self-healing model scoring already uses.
+                        # Read the count fresh from the DB rather than the `jobs`
+                        # list passed in -- that list is built once per batch by
+                        # two different callers (_run_detail_scraper, stream_detail),
+                        # neither of which needs to carry this value through.
+                        prev_attempts = conn.execute(
+                            "SELECT detail_attempts FROM jobs WHERE url = ?", (url,)
+                        ).fetchone()
+                        attempts = ((prev_attempts[0] if prev_attempts else 0) or 0) + 1
+                        if attempts >= 3:
+                            conn.execute(
+                                "UPDATE jobs SET detail_error = ?, detail_scraped_at = ?, "
+                                "detail_attempts = ? WHERE url = ?",
+                                (err or "unknown", now, attempts, url),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE jobs SET detail_error = ?, detail_attempts = ? WHERE url = ?",
+                                (err or "unknown", attempts, url),
+                            )
 
-                conn.commit()
+                if not remote_report:
+                    conn.commit()
 
                 if i < len(jobs) - 1:
-                    time.sleep(delay)
+                    if jitter:
+                        time.sleep(random.uniform(delay * (1 - jitter), delay * (1 + jitter)))
+                    else:
+                        time.sleep(delay)
 
             context.close()
     finally:

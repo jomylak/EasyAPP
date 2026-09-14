@@ -51,6 +51,18 @@ auto-decision either way.
    in practice a different tenant means a different employer, which is
    exactly the false-positive case find_ats_duplicate's own title check
    guards against.)
+
+4. **Also after scoring** (`find_cross_company_duplicate`, same call site as
+   #3, run only if #3 found nothing): catches a near-verbatim repost under a
+   company name that doesn't even match -- a staffing mill spamming the same
+   template across many legally-distinct subsidiary brands, or a
+   parent/subsidiary pair (TikTok/ByteDance) posting the identical req under
+   both names. Company is dropped from the key entirely (it's the field
+   this exists to route around), so the bar on title and description
+   similarity is raised well above #3's to compensate -- near-verbatim text
+   is the only signal left standing between a real duplicate and two
+   different postings that happen to share boilerplate. Location still
+   must match exactly, same reasoning as #3.
 """
 
 import difflib
@@ -86,6 +98,16 @@ _TITLE_SIMILARITY_THRESHOLD = 0.7
 # the same underlying role can still legitimately fall under 0.85 on
 # description text alone -- title and description each need their own bar.
 _DESC_SIMILARITY_THRESHOLD = 0.85
+
+# find_cross_company_duplicate's bar, well above the company-scoped one
+# above: without company or exact title as a supporting signal, this is the
+# only thing standing between "same posting, different label" and "two
+# different jobs that happen to use similar boilerplate." Calibrated to
+# require near-verbatim text -- a templated staffing-mill repost or a
+# parent/subsidiary pair (TikTok/ByteDance) posting the identical req under
+# two different brand names, not merely a similar-sounding role.
+_CROSS_COMPANY_TITLE_SIMILARITY_THRESHOLD = 0.85
+_CROSS_COMPANY_DESC_SIMILARITY_THRESHOLD = 0.93
 
 
 def canonicalize_url(url: str) -> str:
@@ -204,6 +226,55 @@ def find_company_duplicate(
     return None
 
 
+def find_cross_company_duplicate(
+    conn: sqlite3.Connection, title: str | None, text: str | None,
+    location: str | None, *, text_column: str = "full_description",
+    exclude_url: str | None = None,
+) -> str | None:
+    """URL of an existing row -- possibly under a completely different
+    company name -- whose title and description both match at a much
+    higher bar than find_company_duplicate requires.
+
+    For the pattern find_company_duplicate can't catch because it insists
+    on company agreeing first: a near-verbatim template reposted under a
+    different company string entirely. Two real-world sources of this,
+    both confirmed in production data:
+      - Staffing-mill spam (e.g. Arthur J. Gallagher's many legally-distinct
+        subsidiary brands each posting the identical "AI Developer" template).
+      - A parent/subsidiary pair posting the same req under both brand names
+        (TikTok/ByteDance).
+    Company is deliberately not part of the key here -- it's the one field
+    this function exists to route around -- but location still must match
+    exactly, same NULL-safe comparison and same reasoning as everywhere else
+    in this module: a genuinely different office is a different req no
+    matter how similar the text.
+
+    Both thresholds sit well above the company-scoped ones: without company
+    or exact title as a supporting signal, near-verbatim text is the only
+    thing separating a real duplicate from two different postings that
+    happen to share boilerplate.
+    """
+    if not title or not text or len(text) < _MIN_TEXT_LEN:
+        return None
+    rows = conn.execute(
+        f"SELECT url, title, {text_column} AS text FROM jobs "
+        f"WHERE location IS ? AND url != ? AND {text_column} IS NOT NULL "
+        f"ORDER BY discovered_at ASC",
+        (location, exclude_url or ""),
+    ).fetchall()
+    for row in rows:
+        row_text = row["text"]
+        # Cheap length pre-filter before the O(n*m) difflib comparison below:
+        # two postings within the description threshold of each other can't
+        # differ in length by much more than the allowed edit distance.
+        if row_text and abs(len(text) - len(row_text)) > 0.15 * max(len(text), len(row_text)):
+            continue
+        if (_text_similar(title, row["title"], _CROSS_COMPANY_TITLE_SIMILARITY_THRESHOLD)
+                and _text_similar(text, row_text, _CROSS_COMPANY_DESC_SIMILARITY_THRESHOLD)):
+            return row["url"]
+    return None
+
+
 def check_duplicate(conn: sqlite3.Connection, url: str) -> dict:
     """Run checkpoint 2 for one already-enriched row and persist the result.
 
@@ -240,6 +311,14 @@ def check_duplicate(conn: sqlite3.Connection, url: str) -> dict:
         )
         if canonical:
             reason = "company_repost"
+
+    if not canonical:
+        canonical = find_cross_company_duplicate(
+            conn, row["title"], row["full_description"], row["location"],
+            text_column="full_description", exclude_url=url,
+        )
+        if canonical:
+            reason = "cross_company_text"
 
     conn.execute(
         "UPDATE jobs SET ats_job_id = ?, duplicate_of = ?, duplicate_reason = ? WHERE url = ?",
