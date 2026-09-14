@@ -8,7 +8,15 @@ Last updated: 2026-09-03
 
 ## Current state
 
-**Apply agent (Claude Code + Playwright MCP):** solid. Real confirmed
+**Deployment:** the live pipeline runs continuously on an Oracle Cloud VM
+(`ssh oracle-applypilot`), not locally. Check there for real run state, logs,
+and the actual `applypilot.db` -- local checkouts are for development only.
+
+**Apply agent (Goose on `xiaomi/mimo-v2.5` + Playwright MCP):** this is the
+primary and effectively only engine in regular use now. Claude Code is kept
+wired up as a narrow, rarely-firing fallback (see `apply_fallback_backend`)
+for jobs where Goose itself lost the thread -- it is not a co-equal path and
+should not be treated as one in cost/behavior reasoning. Real confirmed
 applications on Workday, SAP SuccessFactors, and simple-form ATS platforms.
 Cost/turn data is real, not estimated -- see the per-ATS cost table below.
 
@@ -34,7 +42,11 @@ This now unblocks the `is_hard_to_automate` scoring nudge (see Open Items)
 -- there's finally enough real `ats` data across the queue to act on.
 
 **Cheap-model testing (Goose + OpenRouter):** MiMo-V2.5 is the current best
-result -- $0.045, 140 turns, on a real Workday form, cache-hit ratio ~99%.
+result -- $0.045, 140 turns, on a real Workday form. That single-job test
+measured a ~99% cache-hit ratio, but the real fleet-wide average (from the
+VM's `applypilot.db`, across 172 goose runs) is only ~50%, and barely moves
+with run length (~47% on runs under 30 turns vs. ~50% on runs over 150) --
+this is being actively investigated, see cost-saving investigation notes.
 GLM 5.3 Flash and DeepSeek V4 Flash Vision Exp both landed around $0.33-0.37
 due to per-model inefficiencies (GLM: reading Playwright's own snapshot
 files via shell instead of `browser_find`, now guarded against in the

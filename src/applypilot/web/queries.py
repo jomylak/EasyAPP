@@ -16,6 +16,7 @@ Two conventions matter here:
 """
 
 import sqlite3
+from datetime import datetime, timezone
 
 from applypilot import company_limits
 from applypilot.database import _DAY_EXPR, get_connection
@@ -33,7 +34,7 @@ _ROW_COLUMNS = f"""
     apply_status, applied_at, apply_error, apply_cost_usd,
     queue_batch, queue_position, tailored_resume_path,
     {_DAY_EXPR} AS day,
-    COALESCE(posted_date, discovered_at) AS posted
+    COALESCE(employer_posted_date, posted_date, discovered_at) AS posted
 """
 
 # Sortable columns, mapped to SQL. A whitelist rather than interpolation --
@@ -56,7 +57,7 @@ _SORT_COLUMNS: dict[str, dict] = {
     "company": {"expr": "company COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
     "title": {"expr": "title COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
     "location": {"expr": "location COLLATE NOCASE", "tiebreak": None, "default_dir": "asc", "nulls": "LAST"},
-    "posted": {"expr": "COALESCE(posted_date, discovered_at)", "tiebreak": None, "default_dir": "desc"},
+    "posted": {"expr": "COALESCE(employer_posted_date, posted_date, discovered_at)", "tiebreak": None, "default_dir": "desc"},
     # Never sort on the `salary` text: it compares "$9" against "$110500"
     # lexically and puts the nine first. NULLS LAST regardless of direction --
     # an unstated pay should never sort to the top just because the user
@@ -425,6 +426,109 @@ def applications(status: str | None = None, limit: int = 200,
         params + [max(1, min(limit, 1000))],
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Remote enrichment -- the enrichment Pi (a home-IP machine, not this VM's
+# datacenter IP; see enrichment/detail.py's `remote_report` param docstring
+# for why) has no direct DB access. It pulls pending jobs and reports results
+# through these three functions instead of raw SQL. `report_enrich_result`
+# deliberately mirrors `scrape_site_batch`'s local UPDATE branches
+# byte-for-byte -- any drift between the two would mean a job scraped from
+# the Pi ages/retries differently than one scraped locally would have.
+# ---------------------------------------------------------------------------
+
+# Same site skip-list detail.py's own local scraper uses -- these sites are
+# never worth a detail-page visit (Glassdoor/Google gate behind their own
+# login wall, Workopolis' listing already carries everything worth having).
+_SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
+
+
+def pending_enrich_sites(conn: sqlite3.Connection | None = None) -> list[str]:
+    """Distinct sites that currently have at least one pending-enrichment job."""
+    conn = conn or get_connection()
+    skip_filter = " AND ".join(f"site != '{s}'" for s in _SKIP_DETAIL_SITES)
+    rows = conn.execute(
+        f"SELECT DISTINCT site FROM jobs WHERE detail_scraped_at IS NULL AND {skip_filter}"
+    ).fetchall()
+    return [r[0] for r in rows if r[0]]
+
+
+def pending_enrich_batch(site: str, limit: int = 100,
+                         conn: sqlite3.Connection | None = None) -> list[list]:
+    """(url, title) pairs for one site's pending-enrichment queue, oldest first.
+
+    Shape matches what `scrape_site_batch`'s `jobs` param already expects, so
+    the Pi runner can hand this straight through unchanged.
+    """
+    conn = conn or get_connection()
+    rows = conn.execute(
+        "SELECT url, title FROM jobs WHERE detail_scraped_at IS NULL AND site = ? "
+        "ORDER BY discovered_at ASC LIMIT ?",
+        (site, max(1, min(limit, 500))),
+    ).fetchall()
+    return [[r[0], r[1]] for r in rows]
+
+
+def report_enrich_result(url: str, outcome: dict,
+                         conn: sqlite3.Connection | None = None) -> dict:
+    """Apply one job's remote-scrape outcome, mirroring scrape_site_batch's
+    local branches exactly (see that function's `remote_report` docstring).
+
+    outcome["status"] is one of "success" | "network_down" | "error".
+    """
+    conn = conn or get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    status = outcome.get("status")
+
+    if status == "success":
+        from applypilot.ats import detect_ats
+        from applypilot.dedup import check_duplicate
+        full_description = outcome.get("full_description")
+        application_url = outcome.get("application_url")
+        employer_posted_date = outcome.get("employer_posted_date")
+        posted_date = outcome.get("posted_date")
+        detected = detect_ats(application_url or url, full_description)
+        conn.execute(
+            "UPDATE jobs SET full_description = ?, application_url = ?, "
+            "employer_posted_date = ?, posted_date = COALESCE(posted_date, ?), "
+            "detail_scraped_at = ?, detail_error = NULL, ats = ? WHERE url = ?",
+            (full_description, application_url, employer_posted_date, posted_date,
+             now, detected, url),
+        )
+        conn.commit()
+        dup = check_duplicate(conn, url)
+        return {"ok": True, "duplicate_of": dup.get("duplicate_of")}
+
+    if status == "network_down":
+        # The Pi's own connectivity, not the job's fault -- don't spend an
+        # attempt or mark it scraped, same as the local branch.
+        conn.execute(
+            "UPDATE jobs SET detail_error = ? WHERE url = ?",
+            (outcome.get("error"), url),
+        )
+        conn.commit()
+        return {"ok": True}
+
+    # status == "error"
+    err = outcome.get("error") or "unknown"
+    prev_attempts = conn.execute(
+        "SELECT detail_attempts FROM jobs WHERE url = ?", (url,)
+    ).fetchone()
+    attempts = ((prev_attempts[0] if prev_attempts else 0) or 0) + 1
+    if attempts >= 3:
+        conn.execute(
+            "UPDATE jobs SET detail_error = ?, detail_scraped_at = ?, "
+            "detail_attempts = ? WHERE url = ?",
+            (err, now, attempts, url),
+        )
+    else:
+        conn.execute(
+            "UPDATE jobs SET detail_error = ?, detail_attempts = ? WHERE url = ?",
+            (err, attempts, url),
+        )
+    conn.commit()
+    return {"ok": True, "attempts": attempts, "gave_up": attempts >= 3}
 
 
 def pending_batches(conn: sqlite3.Connection | None = None) -> list[dict]:

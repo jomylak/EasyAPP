@@ -172,12 +172,14 @@ def test_blocked_row_is_failed_not_silently_skipped(db):
     assert err == "site_blocked"
 
 
-def test_duplicate_row_is_failed_not_applied_to(db):
+def test_duplicate_row_is_failed_when_sibling_already_applied(db):
     """A confirmed duplicate (dedup.check_duplicate) must never be applied
-    to, even in queue_batch mode where the ranked branch's gates are
-    deliberately skipped -- this one isn't a ranking gate, it's "don't apply
-    to the same posting twice under two URLs." A canonical row not flagged
-    as a duplicate of anything is unaffected and still gets claimed."""
+    to when its sibling has genuinely already been submitted -- even in
+    queue_batch mode where the ranked branch's gates are deliberately
+    skipped, since this one isn't a ranking gate, it's "don't apply to the
+    same posting twice under two URLs." A canonical row not flagged as a
+    duplicate of anything is unaffected and still gets claimed."""
+    _insert(db, "https://a.example/1", apply_status="applied")
     _insert(db, "https://a.example/2", queue_position=0,
             duplicate_of="https://a.example/1")
     _insert(db, "https://a.example/3", queue_position=1)
@@ -190,6 +192,41 @@ def test_duplicate_row_is_failed_not_applied_to(db):
     ).fetchone()
     assert status == "failed"
     assert err == "duplicate_of:https://a.example/1"
+
+
+def test_duplicate_row_is_still_tried_when_sibling_never_applied(db):
+    """duplicate_of is set by checkpoint-time content matching alone,
+    independent of apply history -- a row can be "the duplicate" of a
+    sibling that was itself never applied to (neither side has been tried
+    yet). Failing this row unconditionally in that case doesn't prevent any
+    double apply (the sibling hasn't been applied to either) and just wastes
+    the whole cluster's only chance to be tried, so it must still be
+    claimed normally."""
+    _insert(db, "https://a.example/1", apply_status="queued", queue_batch="other-batch")
+    _insert(db, "https://a.example/2", queue_position=0,
+            duplicate_of="https://a.example/1")
+
+    job = launcher.acquire_job(queue_batch="batch-1")
+
+    assert job["url"] == "https://a.example/2"
+
+
+def test_already_applied_row_is_never_reprocessed(db):
+    """An 'applied' row must be a true terminal state: even if it is later
+    re-selected (e.g. --url on a job whose duplicate_of got backfilled after
+    it had already succeeded), acquire_job must refuse to touch it rather
+    than let a downstream gate overwrite a real, confirmed application."""
+    _insert(db, "https://a.example/1", apply_status="applied",
+            duplicate_of="https://a.example/9", apply_cost_usd=0.20)
+
+    job = launcher.acquire_job(target_url="https://a.example/1")
+
+    assert job is None
+    status, cost = db.execute(
+        "SELECT apply_status, apply_cost_usd FROM jobs WHERE url = 'https://a.example/1'"
+    ).fetchone()
+    assert status == "applied"
+    assert cost == 0.20
 
 
 def test_gap_window_duplicate_is_failed_not_applied_to(db):

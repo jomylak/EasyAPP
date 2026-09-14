@@ -325,11 +325,16 @@ DEFAULTS = {
     "playwright_output_max_bytes": 200_000_000,
     # --- Goose backend (the default) ---
     # Best measured cost/reliability tradeoff on real ATS forms: $0.045 and
-    # ~140 turns on a Workday application, ~99% cache-hit ratio. GLM 5.3 Flash
-    # and DeepSeek V4 Flash Vision Exp both came in at $0.33-0.37 on the same
-    # work -- GLM read Playwright's snapshot files through the shell instead of
-    # using browser_find (now guarded against in the prompt), DeepSeek leaned
-    # heavily on browser_evaluate. Override with `goose_model` in settings.json.
+    # ~140 turns on a single Workday application test (~99% cache-hit ratio
+    # there). The real fleet-wide average across all goose runs is only
+    # ~50% and barely improves with run length -- large per-turn Playwright
+    # snapshots (unique page state, not cacheable) likely dominate token
+    # volume regardless of how well the static prompt prefix caches. GLM 5.3
+    # Flash and DeepSeek V4 Flash Vision Exp both came in at $0.33-0.37 on the
+    # same work -- GLM read Playwright's snapshot files through the shell
+    # instead of using browser_find (now guarded against in the prompt),
+    # DeepSeek leaned heavily on browser_evaluate. Override with `goose_model`
+    # in settings.json.
     "goose_model": "xiaomi/mimo-v2.5",
     "goose_provider": "openrouter",
     # Passed to Goose as GOOSE_THINKING_EFFORT, which Goose forwards to
@@ -659,6 +664,18 @@ def load_env():
         load_dotenv(ENV_PATH)
     # Also try CWD .env as fallback
     load_dotenv()
+
+
+def apply_proxy_configured() -> bool:
+    """Whether APPLY_PROXY is set at all, without minting a session.
+
+    Cheap existence check for callers (chrome.launch_chrome's captcha-retry
+    gate) that need to know *if* a proxy retry is possible before deciding
+    to launch Chrome a second time -- see get_apply_proxy's docstring for why
+    the proxy itself is only requested reactively, per launch, not here.
+    """
+    load_env()
+    return bool(os.environ.get("APPLY_PROXY", "").strip())
 
 
 def get_apply_proxy(session_id: str) -> dict | None:

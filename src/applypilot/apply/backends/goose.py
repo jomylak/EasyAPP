@@ -35,6 +35,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -60,12 +61,20 @@ _goose_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _extension_args(cdp_port: int) -> list[str]:
-    """Playwright + Gmail MCP servers, as Goose ``--with-extension`` specs.
+    """Playwright + Gmail + applytools MCP servers, as Goose ``--with-extension`` specs.
 
-    Same two servers the Claude backend declares in its MCP config file, but
+    Same servers the Claude backend declares in its MCP config file, but
     Goose takes them as inline command strings rather than a JSON file. The
     ``name:`` prefix is what makes the tools show up as ``playwright__*`` /
-    ``gmail__*`` instead of both being named after ``npx``.
+    ``gmail__*`` / ``applytools__*`` instead of all being named after their
+    launcher command.
+
+    ``applytools`` is our own small MCP server (``apply/mcp_tools/server.py``)
+    exposing deterministic replacements for generic, environment-level
+    friction (file upload, searchable comboboxes) -- see that module's
+    docstring for the scope rule on what belongs there vs. in known_quirks.
+    It connects to the same CDP endpoint as ``playwright``, so it drives the
+    exact same live tab, not a separate browser.
     """
     viewport = config.DEFAULTS["viewport"]
     out_dir = config.playwright_output_dir()
@@ -77,6 +86,9 @@ def _extension_args(cdp_port: int) -> list[str]:
         f"--output-dir={out_dir} --output-max-size={max_bytes}",
         "--with-extension",
         "gmail:npx -y @gongrzhe/server-gmail-autoauth-mcp",
+        "--with-extension",
+        f"applytools:{sys.executable} -m applypilot.apply.mcp_tools.server "
+        f"--cdp-endpoint=http://localhost:{cdp_port}",
     ]
 
 
@@ -418,6 +430,32 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             ws = get_state(worker_id)
             prev_cost = ws.total_cost if ws else 0.0
             update_state(worker_id, total_cost=prev_cost + cost)
+        elif timed_out.is_set() or cdp_dead.is_set():
+            # Goose only emits its "complete" stats line at graceful end of
+            # session -- a run we killed ourselves (wall-clock or dead CDP
+            # port) never gets there, so `stats` is empty here even though the
+            # OpenRouter calls it made before being killed were real spend.
+            # Recording that as $0/0 turns would silently undercount the
+            # fleet's true bill (this is exactly the gap between what
+            # OpenRouter charges and what the dashboard shows). Impute from
+            # the turns we did observe (`tool_calls`, counted live as each
+            # toolRequest streamed in) times the fleet's own median $/turn --
+            # an estimate, not the real billed number, but far closer than 0.
+            from applypilot import costs
+            per_turn = costs.median_cost_per_turn("goose")
+            estimated_cost = round(per_turn * (tool_calls + 1), 4) if per_turn else None
+            with _goose_lock:
+                _goose_stats[worker_id] = {
+                    "llm_requests": tool_calls + 1,
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "cache_read_tokens": None,
+                    "cost_usd": estimated_cost,
+                }
+            if estimated_cost:
+                ws = get_state(worker_id)
+                prev_cost = ws.total_cost if ws else 0.0
+                update_state(worker_id, total_cost=prev_cost + estimated_cost)
 
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()

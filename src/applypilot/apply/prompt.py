@@ -281,8 +281,14 @@ Open-ended questions ("Why do you want this role?", "Tell us about yourself", "W
 
 EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything.
 Gender, Race/Ethnicity, Veteran status and Disability status always get this same
-answer -- there is nothing to decide. Set them as one consecutive batch and verify
-them together with a single browser_find, rather than open/click/verify four times.{grad_mismatch_section}{skills_section}"""
+answer -- there is nothing to decide. Try applytools__decline_eeo() FIRST -- it
+selects the decline/prefer-not-to-answer option on every native radio group,
+checkbox, and <select> on the page in one call, instead of the usual
+open/click/verify loop repeated per field. It returns "ok: no EEO/decline-style
+fields found" when there's nothing to do, or when the page uses a custom
+widget it doesn't recognize -- in that case, fall back to the manual batch
+approach (set them as one consecutive batch, verify together with a single
+browser_find rather than open/click/verify four times).{grad_mismatch_section}{skills_section}"""
 
 
 def _build_hard_rules(profile: dict) -> str:
@@ -316,8 +322,24 @@ def _build_hard_rules(profile: dict) -> str:
 def _build_captcha_section(proxy_string: str | None = None) -> str:
     """Build the CAPTCHA detection and solving instructions.
 
-    Reads the CapSolver API key from environment. The CAPTCHA section
-    contains no personal data -- it's the same for every user.
+    Two separate vendors, split by CAPTCHA type -- not a primary/fallback
+    pair for the same type:
+      - hCaptcha -> NoneCap. CapSolver dropped hCaptcha support (confirmed
+        live against their API: every hCaptcha sitekey, including hCaptcha's
+        own public demo key, comes back "we don't support this service",
+        while reCAPTCHA v2 on the same account works fine) around the same
+        time hCaptcha's enterprise variant got materially harder to solve
+        (each challenge bound to a fresh rqdata blob -- see NoneCap's own
+        writeup on why that breaks pure recognition solvers). So there is no
+        CapSolver fallback to reach for here; if NoneCap can't solve it,
+        nothing server-side can, and a manual/visual attempt from here
+        (clicking image tiles, which is what's actually rejecting us -- see
+        MANUAL FALLBACK) isn't worth the extra agent turns it would burn for
+        a captcha that's specifically designed to be hard for exactly that.
+      - reCAPTCHA v2/v3, Turnstile, FunCaptcha -> CapSolver, unchanged.
+
+    The CAPTCHA section contains no personal data -- it's the same for every
+    user.
 
     Args:
         proxy_string: This job's CapSolver-format proxy ("type:host:port:
@@ -326,14 +348,33 @@ def _build_captcha_section(proxy_string: str | None = None) -> str:
             through it instead of its own ProxyLess farm IP, so the token's
             trust score is computed from a session that actually matches the
             one submitting it. None reproduces today's ProxyLess behavior.
+            NoneCap's hCaptcha flow takes the same proxy string, since its
+            "proxy" field accepts a plain URL rather than CapSolver's
+            type:host:port:user:pass shape -- see the NoneCap step below for
+            the reformatting.
     """
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    nonecap_key = os.environ.get("NONECAP_API_KEY", "")
 
-    if not capsolver_key:
-        # Without a key the 8.3k-char CapSolver section is dead weight -- 29% of
-        # the prompt, resent on every turn of a ~50-turn agentic loop, purely to
-        # say the API is unavailable. Emit the manual fallback only.
+    # NoneCap's "proxy" field wants a plain URL (scheme://user:pass@host:port),
+    # not CapSolver's "type:host:port:user:pass" -- reformat once here so the
+    # NoneCap step below can just drop it in, rather than asking the agent to
+    # do string surgery on a credential inline.
+    nonecap_proxy = ""
+    if proxy_string:
+        try:
+            ptype, phost, pport, puser, ppass = proxy_string.split(":", 4)
+            nonecap_proxy = f"{ptype}://{puser}:{ppass}@{phost}:{pport}"
+        except ValueError:
+            logger.warning("Unrecognized proxy_string shape for NoneCap: %r", proxy_string)
+    nonecap_proxy_field = f", proxy: '{nonecap_proxy}'" if nonecap_proxy else ""
+
+    if not capsolver_key and not nonecap_key:
+        # Without either key the 9k-char solving section is dead weight -- a
+        # large fraction of the prompt, resent on every turn of a ~50-turn
+        # agentic loop, purely to say both APIs are unavailable. Emit the
+        # manual fallback only.
         return """== CAPTCHA ==
 No CAPTCHA solving service is configured, so you cannot solve image or token
 CAPTCHAs programmatically. If one appears:
@@ -345,8 +386,8 @@ silently block a submit. If a form submits with no error and no confirmation,
 suspect one and report RESULT:CAPTCHA rather than retrying indefinitely."""
 
     if proxy_string:
-        task_type_table = """TASK_TYPE values (use EXACTLY these strings):
-  hcaptcha     -> HCaptchaTask
+        task_type_table = """TASK_TYPE values (use EXACTLY these strings -- hCaptcha is NOT
+in this list, it does not go through CapSolver, see the NoneCap step below):
   recaptchav2  -> ReCaptchaV2Task
   recaptchav3  -> ReCaptchaV3Task
   turnstile    -> AntiTurnstileTask
@@ -358,23 +399,48 @@ nested). This makes CapSolver solve through the SAME IP your browser is using,
 instead of its own datacenter IP -- required for the trust score (reCAPTCHA
 v3 especially) to reflect the session actually submitting the form.""".format(proxy=proxy_string)
     else:
-        task_type_table = """TASK_TYPE values (use EXACTLY these strings):
-  hcaptcha     -> HCaptchaTaskProxyLess
+        task_type_table = """TASK_TYPE values (use EXACTLY these strings -- hCaptcha is NOT
+in this list, it does not go through CapSolver, see the NoneCap step below):
   recaptchav2  -> ReCaptchaV2TaskProxyLess
   recaptchav3  -> ReCaptchaV3TaskProxyLess
   turnstile    -> AntiTurnstileTaskProxyLess
   funcaptcha   -> FunCaptchaTaskProxyLess"""
 
     return f"""== CAPTCHA ==
-You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
-API base: https://api.capsolver.com
+You solve CAPTCHAs server-side via two REST APIs, split strictly by type -- NOT
+a primary/fallback pair, each one is the ONLY path for its types:
+  - hCaptcha              -> NoneCap (API key: {nonecap_key or 'NOT CONFIGURED -- if hCaptcha appears, skip the NoneCap step, output RESULT:FAILED:captcha immediately'})
+  - reCAPTCHA v2/v3, Turnstile, FunCaptcha -> CapSolver (API key: {capsolver_key or 'NOT CONFIGURED -- see MANUAL FALLBACK'})
+No browser extension for either. You control the entire flow.
 
-CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
+CRITICAL RULE: When ANY CAPTCHA appears, you MUST:
 1. Run CAPTCHA DETECT to get the type and sitekey
-2. Run CAPTCHA SOLVE (createTask -> poll -> inject) with the CapSolver API
-3. ONLY go to MANUAL FALLBACK if CapSolver returns errorId > 0
-Do NOT skip the API call based on what the CAPTCHA looks like. CapSolver solves CAPTCHAs server-side -- it does NOT need to see or interact with images, puzzles, or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are solved via API token, not visually. ALWAYS try the API first.
+2. hCaptcha -> CAPTCHA SOLVE (NoneCap) below. Everything else -> CAPTCHA SOLVE (CapSolver) below.
+3. Do NOT skip the API call based on what the CAPTCHA looks like -- both vendors
+   solve server-side, they do NOT need to see or interact with images, puzzles,
+   or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are
+   solved via API token, not visually. ALWAYS try the API first.
+
+hCaptcha is a HARD STOP, not a retry loop: ONE NoneCap attempt per captcha
+instance. If it doesn't come back "solved" and inject cleanly, output
+RESULT:FAILED:captcha immediately -- do NOT fall through to MANUAL FALLBACK's
+audio/text/visual tricks for hCaptcha specifically, and do NOT try to solve
+the image challenge yourself by clicking tiles. If NoneCap can't do it,
+nothing server-side can (that's the whole point of paying for a solver), and
+hCaptcha's image challenges are specifically built to be hard for exactly the
+kind of model driving this session -- burning turns clicking through
+escalating challenge rounds is not a productive use of this run's budget.
+This restriction is hCaptcha-only: CapSolver's types below keep their normal
+budget and manual fallback.
+
+BUDGET (CapSolver types only -- reCAPTCHA v2/v3, Turnstile, FunCaptcha): across
+this entire application, you get at most 2 full solve cycles (createTask->poll
+->inject) against the SAME captcha instance, and at most 3 total across the
+whole run if the captcha reappears at a different step (e.g. once at login,
+once at submit). Once you hit that budget without success, stop -- go to
+MANUAL FALLBACK's last resort and output RESULT:FAILED:captcha. A run that
+keeps retrying past this point is not making progress, it is just spending
+money.
 
 --- CAPTCHA DETECT ---
 Run this browser_evaluate after every navigation, Apply/Submit/Login click, or when a page feels stuck.
@@ -437,9 +503,56 @@ browser_evaluate function: () => {{{{
 Result actions:
 - null -> no CAPTCHA. Continue normally.
 - "turnstile_script_only" -> browser_wait_for time: 3, re-run detect.
-- Any other type -> proceed to CAPTCHA SOLVE below.
+- "hcaptcha" -> proceed to CAPTCHA SOLVE (NoneCap) below.
+- Any other type (recaptchav2, recaptchav3, turnstile, funcaptcha) -> proceed to CAPTCHA SOLVE (CapSolver) below.
 
---- CAPTCHA SOLVE ---
+--- CAPTCHA SOLVE (NoneCap -- hCaptcha only) ---
+One step, synchronous: no createTask/poll split like CapSolver below.
+
+CALL (fill in the 2 placeholders; PAGE_URL/SITE_KEY are from the detect result):
+browser_evaluate function: async () => {{{{
+  const r = await fetch('https://api.nonecap.com/v1/solves?wait=60', {{{{
+    method: 'POST',
+    headers: {{{{
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer {nonecap_key}'
+    }}}},
+    body: JSON.stringify({{{{
+      type: 'hcaptcha',
+      sitekey: 'SITE_KEY',
+      url: 'PAGE_URL'{nonecap_proxy_field}
+    }}}})
+  }}}});
+  return await r.json();
+}}}}
+
+The call itself blocks up to 60s server-side for the solve, so there is no
+separate poll step -- one browser_evaluate call returns the final result
+directly (unlike CapSolver's createTask/getTaskResult split below).
+
+- response.status === 'solved' -> take response.token, go to INJECT below.
+- Anything else (status "failed"/"error", or the request itself erroring) ->
+  STOP. Do not retry, do not fall through to MANUAL FALLBACK's audio/text/
+  visual tricks, do not attempt the challenge yourself. Output
+  RESULT:FAILED:captcha immediately -- see the HARD STOP note above.
+
+INJECT (replace THE_TOKEN with response.token):
+browser_evaluate function: () => {{{{
+  const token = 'THE_TOKEN';
+  const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
+  if (ta) ta.value = token;
+  document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(f => f.setAttribute('data-hcaptcha-response', token));
+  const cb = document.querySelector('[data-hcaptcha-widget-id]');
+  if (cb && window.hcaptcha) try {{{{ window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); }}}} catch(e) {{{{}}}}
+  return 'injected';
+}}}}
+Then browser_wait_for time: 2, snapshot.
+- Widget gone or green check -> success. Click Submit if needed.
+- No change -> click Submit/Verify/Continue button (some sites need it).
+- Still stuck -> that's the hard stop above. RESULT:FAILED:captcha now, not
+  another NoneCap call.
+
+--- CAPTCHA SOLVE (CapSolver -- reCAPTCHA v2/v3, Turnstile, FunCaptcha) ---
 Three steps: createTask -> poll -> inject. Do each as a separate browser_evaluate call.
 
 STEP 1 -- CREATE TASK (copy this exactly, fill in the 3 placeholders):
@@ -511,17 +624,6 @@ browser_evaluate function: () => {{{{
   return 'injected';
 }}}}
 
-For hCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
-  if (ta) ta.value = token;
-  document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(f => f.setAttribute('data-hcaptcha-response', token));
-  const cb = document.querySelector('[data-hcaptcha-widget-id]');
-  if (cb && window.hcaptcha) try {{{{ window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
 For Turnstile:
 browser_evaluate function: () => {{{{
   const token = 'THE_TOKEN';
@@ -543,9 +645,21 @@ browser_evaluate function: () => {{{{
 After injecting: browser_wait_for time: 2, then snapshot.
 - Widget gone or green check -> success. Click Submit if needed.
 - No change -> click Submit/Verify/Continue button (some sites need it).
-- Still stuck -> token may have expired (~2 min lifetime). Re-run from STEP 1.
+- Still stuck on reCAPTCHA v2/Turnstile -> token may have expired
+  (~2 min lifetime). Re-run from STEP 1 ONCE more. If it still doesn't clear
+  after that second attempt, stop -- go to MANUAL FALLBACK's last resort and
+  output RESULT:FAILED:captcha. Do not attempt a third solve cycle in this run.
+- Still stuck on reCAPTCHA v3 specifically -> do NOT retry the solve loop.
+  v3 is an invisible trust-score check, not a token you can brute-force: a
+  rejected submission usually means the SITE decided your session's IP/
+  behavior looks automated, and CapSolver returning another "solved" token
+  changes nothing about that score. Retrying burns turns for no gain. Output
+  RESULT:FAILED:captcha immediately after the first failed v3 attempt so the
+  job can be retried through a different egress path instead of stalling here.
 
---- MANUAL FALLBACK ---
+--- MANUAL FALLBACK (CapSolver types only -- reCAPTCHA v2/v3, Turnstile, FunCaptcha) ---
+NOT for hCaptcha -- a failed NoneCap attempt goes straight to
+RESULT:FAILED:captcha, see the HARD STOP note near the top of this section.
 You should ONLY be here if CapSolver createTask returned errorId > 0. If you haven't tried CapSolver yet, GO BACK and try it first.
 If CapSolver genuinely failed (errorId > 0):
 1. Audio challenge: Look for "audio" or "accessibility" button -> click it for an easier challenge.
@@ -883,21 +997,25 @@ time as you hit each need.
   5g. If that known-existing account rejects the password, use Forgot password/Reset password. Do not use password reset for a registration error, a generic login error, or an account whose existence was never confirmed.
   5h. If registration is unavailable, registration fails without explicitly saying the account exists, verification cannot be completed, or recovery mail does not arrive -> RESULT:FAILED:login_issue. Do not guess, loop, or try a speculative login.
   5i. After registration or login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
-   If browser_file_upload fails with an "outside the allowed roots" (or similar
-   path-restriction) error, the site's upload button opens a native OS file
-   picker that Playwright sandboxes to specific directories -- the resume PDF
-   is legitimately yours to upload, only the delivery mechanism is blocked.
-   Fall back to browser_run_code_unsafe and set the file directly on the
-   Playwright side, bypassing the OS picker entirely:
-     async (page) => {{
-       const input = await page.$('input[type="file"]');
-       await input.setInputFiles('{pdf_path}');
-       return 'uploaded';
-     }}
-   Adjust the selector if there's more than one file input on the page (e.g.
-   separate resume/cover-letter inputs) so you target the right one. Verify
-   the upload took (filename shown, or the page advances) before continuing.
+6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then
+   applytools__upload_resume(pdf_path: '{pdf_path}'). This bypasses the native
+   OS file picker entirely (no "outside the allowed roots" error is possible),
+   so use it as the FIRST attempt, not a fallback -- do not try
+   browser_file_upload first and only reach for this on failure.
+   Do NOT browser_click a visible "Upload Resume" button/label first, even to
+   "see what happens" -- that click opens a REAL native OS file-chooser dialog,
+   which Playwright then reports as a blocking modal state ("[File chooser]:
+   can be handled by browser_file_upload"). Once that's open,
+   applytools__upload_resume can no longer cleanly set the file on the
+   now-blocked input, and you're stuck re-deriving a manual JS workaround --
+   this is the single most common way the upload tool ends up failing when it
+   otherwise would have worked. Call applytools__upload_resume directly on
+   the page as soon as you see the upload section; it finds the (possibly
+   hidden) file input itself, no click needed. If it returns
+   an error (e.g. no file input found, or the wrong one on a page with more
+   than one), fall back to browser_file_upload, then browser_click the upload
+   area followed by browser_file_upload. Verify the upload took (filename
+   shown, or the page advances) before continuing.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields, then fill what's left in ONE pass, not field by field:
    - Snapshot once. List every plain TEXT/number input still empty or wrong on
@@ -977,8 +1095,8 @@ layout.
 
 == FORM TRICKS ==
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
-- "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
-- File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
+- "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. applytools__upload_resume with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
+- File upload not working? applytools__upload_resume should be your first and second try (it targets the first <input type=file> even when hidden behind a styled button, so a retry after a click that reveals the real input can succeed where the first call didn't). If it still fails, fall back to: (1) browser_click the upload button/area, (2) browser_file_upload with the path.
 - TOOL DISCIPLINE (this is the difference between a 4-minute run and a 20-minute one):
   Read page state ONLY through browser_snapshot / browser_find. Do NOT use a
   shell/terminal tool to cat, grep, or sed the Playwright MCP's own on-disk
@@ -987,6 +1105,41 @@ layout.
   directly, and every shell call is its own full turn on top of the browser
   action that already ran. If you want to search a large page for one
   keyword, that is exactly what browser_find is for.
+  A full browser_snapshot dumps the ENTIRE page's accessibility tree --
+  correct after browser_navigate or a real page transition (new form, new
+  modal), wasteful when you just want to confirm one thing worked. For those
+  narrower checks, use the cheaper targeted tools instead:
+  * Just filled/clicked ONE field and want to confirm it took?
+    applytools__read_field(label_or_selector) -- returns that field's value
+    or checked state in a couple of lines, not the whole page.
+  * Just clicked Submit/Next/Continue and want to know if it was rejected?
+    applytools__check_for_errors() -- scans standard error markers
+    (role="alert", aria-invalid, .error/.invalid classes) and returns only
+    those, or "ok: no errors found". Try this BEFORE a full snapshot; only
+    fall back to browser_snapshot if it comes back clean but something still
+    seems wrong (e.g. the page plainly didn't move on).
+  * Filled a WHOLE PAGE of fields (radios, checkboxes, text inputs) and want
+    to double-check everything landed before hitting Submit?
+    applytools__read_form_state() -- dumps every visible field's current
+    value/checked state in one compact list, including fields inside
+    same-origin iframes (the whole form on iCIMS lives in one). Use this
+    instead of a full browser_snapshot for a pre-submit review pass.
+  * Know exactly which button/link/field you want by its label or visible
+    text and just need to click it? applytools__find_and_click(text) does
+    the locate-and-click in one call instead of browser_find then
+    browser_click as two separate turns.
+  * Just want to confirm a click/fill actually changed something, with no
+    need to click anything new afterward? applytools__snapshot_diff() --
+    EXPERIMENTAL, not yet verified on a live page, so sanity-check its
+    output against what you actually see before trusting it. Returns only
+    what changed since the last time it was called this session (headings,
+    alerts, buttons, field states), not the whole tree. It cannot give you
+    click targets (no ref= system) -- if the next step is clicking something
+    new, use browser_snapshot instead.
+  Reach for a full browser_snapshot when you actually need the whole page's
+  layout -- right after navigating somewhere new, or when you're locating
+  multiple elements to act on next. Don't reach for it just to re-verify a
+  single action you already have a cheaper tool for.
   Set values with browser_type, browser_click, browser_fill_form and
   browser_file_upload. Use browser_evaluate ONLY to READ state you cannot see in
   a snapshot -- never to set a value. Assigning `el.value` and firing a synthetic
@@ -1000,12 +1153,16 @@ layout.
     browser_fill_form and fill() DO NOT WORK on these: they set the value without
     producing keystrokes, so the live-search filter never runs and the list never
     narrows. Worse, the value they leave behind concatenates with what you type
-    next ("United StatesUnited States"). So: CLEAR the field first, then
-    browser_type(text: value, slowly: true) -- this fires one real keystroke
-    per character in a SINGLE tool call, which both triggers the filter and
-    avoids the cost of typing digit-by-digit with separate browser_press_key
-    calls -- THEN click the matching option from a fresh snapshot. Do not
-    scroll the unfiltered list hunting for it.
+    next ("United StatesUnited States"). Use
+    applytools__fill_searchable_combobox(label_or_selector, value) as the FIRST
+    attempt -- it does the open/type/select sequence in one call instead of the
+    manual multi-step version below. Only fall back to the manual version if it
+    returns an error: CLEAR the field first, then browser_type(text: value,
+    slowly: true) -- this fires one real keystroke per character in a SINGLE
+    tool call, which both triggers the filter and avoids the cost of typing
+    digit-by-digit with separate browser_press_key calls -- THEN click the
+    matching option from a fresh snapshot. Do not scroll the unfiltered list
+    hunting for it.
   * Date field ignores browser_fill_form / fill(), or a value you set doesn't
     read back correctly? Same fix: browser_type(text: "MM/DD/YYYY", slowly:
     true) on the field. Try this BEFORE resorting to individual
@@ -1062,7 +1219,7 @@ layout.
   directly, no separate clear step needed. For pattern 3, reopen the calendar
   and click the correct day again; selecting a new day replaces the old one.
   Verify with browser_find afterward, same as any other field.
-- Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
+- Validation errors after submit? Start with applytools__check_for_errors() -- it's built for exactly this and far cheaper than a full page read. Only go to snapshot + screenshot if that comes back clean but the page still didn't proceed (some sites highlight fields visually without any of the standard error markup check_for_errors looks for). Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
 

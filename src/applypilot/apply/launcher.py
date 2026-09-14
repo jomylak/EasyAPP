@@ -34,6 +34,7 @@ from applypilot.apply.backends import get_backend, interrupt_all_backends
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     cleanup_on_exit, BASE_CDP_PORT,
+    acquire_proxy_slot, release_proxy_slot,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, render_full, get_totals,
@@ -180,17 +181,24 @@ def _is_blocked(site: str | None, url: str | None,
 
 def _live_duplicate_already_committed(conn, row) -> str | None:
     """URL of a same-content sibling row that has already reached
-    'applied'/'in_progress'/'queued', or None.
+    'applied'/'in_progress', or None.
 
     row["duplicate_of"] only reflects what checkpoint 2/3 had computed the
     last time they ran on this row -- a row queued before enrichment or
     scoring ever touched it has duplicate_of NULL regardless of whether a
     duplicate exists. This is a live, narrow recheck at claim time, not a
     replacement for those checkpoints: it only fails the claim when the
-    matched sibling has already been acted on, never against a merely
-    similar row that's still pending (that could be a legitimately
-    different req, and wrongly failing it would cost an application for
-    nothing).
+    matched sibling has genuinely been submitted, or is being submitted
+    right now by another worker -- never against a merely similar row
+    that's still pending/queued, since that could be a legitimately
+    different req (or could just as easily be THIS row's own duplicate
+    cluster where neither side has been applied to yet -- in which case one
+    of them should simply be tried, not both permanently blocked). Excludes
+    'queued': being queued isn't having applied, and blocking on it here
+    previously meant two never-applied duplicates could deadlock each other
+    out of ever being tried. 'in_progress' stays in, to avoid two workers
+    racing to double-submit the same underlying job under different URLs
+    at the same moment.
     """
     from applypilot.dedup import find_company_duplicate, find_exact_text_duplicate
 
@@ -211,7 +219,7 @@ def _live_duplicate_already_committed(conn, row) -> str | None:
     already = conn.execute(
         "SELECT apply_status FROM jobs WHERE url = ?", (candidate,),
     ).fetchone()
-    if already and already["apply_status"] in ("applied", "in_progress", "queued"):
+    if already and already["apply_status"] in ("applied", "in_progress"):
         return candidate
     return None
 
@@ -330,9 +338,9 @@ def _select_ranked(conn, min_score: int, skip: set,
           (CASE company_tier WHEN 'tier1' THEN 2
                              WHEN 'adjacent' THEN 1 ELSE 0 END) DESC,
           COALESCE(desirability_score, fit_score)
-          - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ? DESC,
+          - (julianday('now') - julianday(COALESCE(employer_posted_date, posted_date, discovered_at))) * ? DESC,
           fit_score DESC,
-          COALESCE(posted_date, discovered_at) DESC,
+          COALESCE(employer_posted_date, posted_date, discovered_at) DESC,
           url
         LIMIT 1
     """, [_settings.get("max_apply_attempts") or config.DEFAULTS["max_apply_attempts"]] + params
@@ -397,6 +405,27 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 conn.rollback()
                 return None
 
+            # 'applied' must be a true terminal state -- nothing past this
+            # point may ever reclassify it. This bit a real job: a row that
+            # had genuinely succeeded (confirmed submission, real cost/turns
+            # recorded) was later re-selected via --url after an async dedup
+            # backfill set its duplicate_of, and the duplicate-of gate a few
+            # lines below unconditionally overwrote it to
+            # failed:duplicate_of -- silently erasing the record of a real
+            # application (and leaving the actual duplicate sibling, which
+            # was never applied to, free to be picked up and double-submit
+            # to the same company later). _select_target is the only path
+            # permissive enough to return an 'applied' row at all (it only
+            # excludes 'in_progress'); guarding here protects every caller.
+            if row["prior_status"] == "applied":
+                conn.rollback()
+                logger.warning(
+                    "Refusing to re-process already-applied job: %s", row["url"][:80])
+                if target_url:
+                    return None
+                deferred.add(row["url"])
+                continue
+
             # A company cap only applies to rows this call picked on its own
             # -- an explicit --url is the user overriding the queue by hand,
             # and second-guessing that pick isn't this check's job.
@@ -426,7 +455,13 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # ran. The ranked branch filters blocked sites in SQL already, so
             # that check only ever fires for a queued or targeted row.
             from applypilot.config import is_manual_ats
+            duplicate_sibling_status = None
             if row["duplicate_of"]:
+                sibling = conn.execute(
+                    "SELECT apply_status FROM jobs WHERE url = ?", (row["duplicate_of"],),
+                ).fetchone()
+                duplicate_sibling_status = sibling["apply_status"] if sibling else None
+            if row["duplicate_of"] and duplicate_sibling_status in ("applied", "in_progress"):
                 # Only reachable via queue_batch/target_url: the ranked
                 # branch's fit_gate_sql() already excludes duplicate_of rows
                 # from selection. A human can still queue one from the web UI
@@ -434,6 +469,18 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 # by the enrichment backfill after the row was already
                 # queued), so this is the last check before money is spent
                 # applying to a posting under two different URLs.
+                #
+                # Gated on the sibling's own status, not merely on
+                # duplicate_of being set: checkpoint-time dedup marks
+                # duplicate_of from content similarity alone, independent of
+                # apply history, so a row can be "the duplicate" of a sibling
+                # that itself was never applied to. Failing this row
+                # unconditionally in that case doesn't prevent a double
+                # apply (the sibling hasn't been applied to yet either) --
+                # it just means the whole cluster loses its only chance to
+                # be tried, and previously this could even overwrite a row
+                # that HAD already been genuinely applied to (see the
+                # already-applied guard above this loop).
                 outcome = ("failed", f"duplicate_of:{row['duplicate_of']}")
             elif (live_dupe := _live_duplicate_already_committed(conn, row)):
                 # duplicate_of was unset on this row -- either it was never
@@ -640,6 +687,11 @@ def mark_result(url: str, status: str, error: str | None = None,
     stats = stats or {}
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    # Token/cost columns accumulate across attempts (COALESCE(col, 0) + new),
+    # same as apply_attempts already does -- a retried job made a separate,
+    # separately-billed OpenRouter call each time, and a plain overwrite here
+    # was silently discarding every attempt but the last one's real spend.
+    # That's real money OpenRouter charged that the dashboard never showed.
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
@@ -647,13 +699,15 @@ def mark_result(url: str, status: str, error: str | None = None,
                            agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = NULL, apply_backend = ?,
-                           apply_llm_requests = ?, apply_input_tokens = ?,
-                           apply_output_tokens = ?, apply_cache_read_tokens = ?,
-                           apply_cost_usd = ?
+                           apply_llm_requests = COALESCE(apply_llm_requests, 0) + ?,
+                           apply_input_tokens = COALESCE(apply_input_tokens, 0) + ?,
+                           apply_output_tokens = COALESCE(apply_output_tokens, 0) + ?,
+                           apply_cache_read_tokens = COALESCE(apply_cache_read_tokens, 0) + ?,
+                           apply_cost_usd = COALESCE(apply_cost_usd, 0) + ?
             WHERE url = ?
-        """, (now, duration_ms, task_id, backend, llm_requests,
-              stats.get("input_tokens"), stats.get("output_tokens"),
-              stats.get("cache_read_tokens"), stats.get("cost_usd"), url))
+        """, (now, duration_ms, task_id, backend, llm_requests or 0,
+              stats.get("input_tokens") or 0, stats.get("output_tokens") or 0,
+              stats.get("cache_read_tokens") or 0, stats.get("cost_usd") or 0, url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         error = error or "unknown"
@@ -664,15 +718,17 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_attempts = {attempts}, agent_id = NULL,
                            apply_duration_ms = ?, apply_task_id = ?,
                            review_status = ?, apply_backend = ?,
-                           apply_llm_requests = ?, apply_input_tokens = ?,
-                           apply_output_tokens = ?, apply_cache_read_tokens = ?,
-                           apply_cost_usd = ?
+                           apply_llm_requests = COALESCE(apply_llm_requests, 0) + ?,
+                           apply_input_tokens = COALESCE(apply_input_tokens, 0) + ?,
+                           apply_output_tokens = COALESCE(apply_output_tokens, 0) + ?,
+                           apply_cache_read_tokens = COALESCE(apply_cache_read_tokens, 0) + ?,
+                           apply_cost_usd = COALESCE(apply_cost_usd, 0) + ?
             WHERE url = ?
         """, (status, error, normalize_failure_reason(error), duration_ms,
               task_id, review_status,
-              backend, llm_requests, stats.get("input_tokens"),
-              stats.get("output_tokens"), stats.get("cache_read_tokens"),
-              stats.get("cost_usd"), url))
+              backend, llm_requests or 0, stats.get("input_tokens") or 0,
+              stats.get("output_tokens") or 0, stats.get("cache_read_tokens") or 0,
+              stats.get("cost_usd") or 0, url))
     conn.commit()
 
 
@@ -918,6 +974,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         attempted.add(job["url"])
 
         chrome_proc = None
+        holding_proxy_slot = False
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
@@ -927,6 +984,35 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                           backend=backend)
             run_stats = get_backend(backend).pop_run_stats(worker_id)
             used_backend = backend
+
+            # One retry through APPLY_PROXY when the first (direct) attempt
+            # hit a captcha wall. Whether a job needs CapSolver's IP to match
+            # Chrome's is only knowable after a captcha actually shows up, so
+            # the proxy can't be decided at the first launch_chrome call --
+            # see chrome.launch_chrome's use_proxy docstring. This keeps the
+            # home-relay proxy off the vast majority of jobs that never see a
+            # captcha at all, instead of routing every session through it.
+            if (not dry_run
+                    and not _stop_event.is_set()
+                    and result.split(":", 1)[-1].strip().lower() == "captcha"
+                    and config.apply_proxy_configured()):
+                if chrome_proc:
+                    cleanup_worker(worker_id, chrome_proc)
+                    chrome_proc = None
+                # There's exactly one home relay IP behind APPLY_PROXY, so
+                # only one worker may be routed through it at a time -- wait
+                # our turn rather than stacking concurrent proxied sessions
+                # onto the same connection (see acquire_proxy_slot).
+                update_state(worker_id, last_action="waiting for proxy slot")
+                holding_proxy_slot = acquire_proxy_slot(stop_event=_stop_event)
+                if holding_proxy_slot:
+                    add_event(f"[W{worker_id}] Captcha wall, retrying via proxy")
+                    chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
+                                                use_proxy=True)
+                    result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+                                                  model=model, dry_run=dry_run,
+                                                  backend=backend)
+                    run_stats = get_backend(backend).pop_run_stats(worker_id)
 
             # Second chance on the fallback backend. Only for failures that
             # mean the *driver* gave up (outcomes.should_fall_back) -- a job
@@ -1011,6 +1097,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         finally:
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
+            if holding_proxy_slot:
+                release_proxy_slot()
 
         jobs_done += 1
         if target_url:

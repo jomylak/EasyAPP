@@ -232,6 +232,32 @@ def api_facets() -> dict:
     return queries.facets()
 
 
+# --- remote enrichment (the enrichment Pi) ----------------------------------
+# This VM's own IP is Cloudflare-challenged on Jobright's detail pages (a
+# datacenter ASN gets far more scrutiny than a home ISP one); the enrichment
+# Pi runs the same scrape/retry cascade from a home IP instead and reports
+# results back here, since it has no direct DB access. Same trust model as
+# every other endpoint on this Tailscale-loopback-only server -- see
+# queries.py's remote-enrichment section for what these three calls do.
+
+@app.get("/api/enrich/sites")
+def api_enrich_sites() -> dict:
+    return {"sites": queries.pending_enrich_sites()}
+
+
+@app.get("/api/enrich/pending")
+def api_enrich_pending(site: str, limit: int = 100) -> dict:
+    return {"jobs": queries.pending_enrich_batch(site, limit)}
+
+
+@app.post("/api/enrich/report")
+def api_enrich_report(body: dict = Body(...)) -> dict:
+    url = body.get("url")
+    if not url:
+        raise HTTPException(400, "url is required")
+    return queries.report_enrich_result(url, body)
+
+
 @app.get("/api/stats")
 def api_stats() -> dict:
     reconcile_stale_locks()

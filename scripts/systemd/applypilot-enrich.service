@@ -1,0 +1,20 @@
+[Unit]
+Description=ApplyPilot enrichment runner (home-IP, talks to Oracle over Tailscale)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/applypilot-enrich
+ExecStart=%h/applypilot-enrich/.venv/bin/python %h/applypilot-enrich/scripts/pi_enrich_runner.py
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/applypilot-enrich/.env
+# Same headroom philosophy as zoombot.service on this Pi -- keep a runaway
+# Chromium from taking the whole 2GB machine down rather than capping tight,
+# since the two already cooperate over browser.lock and never run at once.
+MemoryMax=1500M
+
+[Install]
+WantedBy=default.target

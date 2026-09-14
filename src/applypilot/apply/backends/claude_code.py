@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -63,6 +64,16 @@ def _make_mcp_config(cdp_port: int) -> dict:
             "gmail": {
                 "command": "npx",
                 "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+            },
+            # Deterministic replacements for generic browser friction (file
+            # upload, searchable comboboxes) -- see
+            # apply/mcp_tools/server.py for the scope rule and tool list.
+            "applytools": {
+                "command": sys.executable,
+                "args": [
+                    "-m", "applypilot.apply.mcp_tools.server",
+                    f"--cdp-endpoint=http://localhost:{cdp_port}",
+                ],
             },
         }
     }
@@ -232,6 +243,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     block.get("name", "")
                                     .replace("mcp__playwright__", "")
                                     .replace("mcp__gmail__", "gmail:")
+                                    .replace("mcp__applytools__", "")
                                 )
                                 inp = block.get("input", {})
                                 if "url" in inp:

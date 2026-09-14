@@ -240,6 +240,19 @@ def _store_jobs_filtered(
                  job.get("airtable_record_id")),
             )
             new += 1
+            # jobright_minisite_api rows deliberately arrive with
+            # posted_date=None (see _scrape_jobright_minisite_api) since the
+            # bulk API's own postedAt is wrong. Only fetch the real value
+            # for genuinely new jobs -- one lightweight GET each, not one
+            # per item in the ~4000-job list on every pass.
+            if strategy == "jobright_minisite_api":
+                job_id = url.rsplit("/", 1)[-1]
+                publish_time = _fetch_jobright_publish_time(job_id)
+                if publish_time:
+                    conn.execute(
+                        "UPDATE jobs SET posted_date = ? WHERE url = ?",
+                        (publish_time, url),
+                    )
         except sqlite3.IntegrityError:
             existing += 1
             # Jobright (and presumably other sources) re-touch a listing's
@@ -1022,6 +1035,26 @@ def _extract_airtable_record_id(href: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _extract_dialog_field(full_text: str | None, label: str) -> str | None:
+    """Pull one labeled field's value out of an expanded Airtable record's
+    flat `inner_text()` dump.
+
+    Every field but the primary one (Position Title, read positionally as
+    the dialog's first line) renders as its label on its own line followed
+    by its value on the next -- e.g. "...\\nDate\\n2026-09-13\\nApply\\n...".
+    Returns None if the label isn't present or has nothing after it (a
+    genuinely blank field, or the label is the dialog's last line).
+    """
+    if not full_text:
+        return None
+    lines = full_text.split("\n")
+    for i, line in enumerate(lines[:-1]):
+        if line.strip() == label:
+            value = lines[i + 1].strip()
+            return value or None
+    return None
+
+
 def _scrape_airtable_button_grid(
     url: str,
     headless: bool = True,
@@ -1157,6 +1190,7 @@ def _scrape_airtable_button_grid(
                         # base) is always the dialog's first line of text.
                         full_text = dialog.inner_text()
                         title = full_text.split("\n")[0].strip() if full_text else None
+                        posted_date = _extract_dialog_field(full_text, "Date")
 
                         link_el = dialog.query_selector('a[data-button-field-button="true"]')
                         apply_url = link_el.get_attribute("href") if link_el else None
@@ -1171,7 +1205,7 @@ def _scrape_airtable_button_grid(
                                 "salary": None,
                                 "description": None,
                                 "location": None,
-                                "posted_date": None,
+                                "posted_date": posted_date,
                                 "airtable_record_id": record_id,
                             }
                             jobs.append(job)
@@ -1247,6 +1281,60 @@ _JOBRIGHT_EXCLUDE_TITLES = [
 ]
 
 
+_JOBRIGHT_NEXT_DATA_RE = re.compile(
+    r'__NEXT_DATA__"\s*type="application/json">(.*?)</script>', re.S
+)
+
+
+def _fetch_jobright_publish_time(job_id: str, retries: int = 2) -> str | None:
+    """Pull the precise, correct posting time for one Jobright job.
+
+    The bulk `/swan/mini-sites/list` API's own `postedAt` field is wrong --
+    spot-checked against Jobright's own job page and found running ~7h
+    behind what that page itself displays (looks like a tz bug on
+    Jobright's end, e.g. a Pacific-time value stored as if it were UTC).
+    That job page, though, embeds a Next.js `__NEXT_DATA__` JSON blob with
+    a `publishTime` field that matches its own displayed "X ago" text --
+    confirmed by cross-checking `publishTimeDesc` (e.g. "8 hours ago")
+    against `publishTime` for the same job. A plain GET here (no browser,
+    no JS execution needed -- the value is already in the server-rendered
+    HTML) is what backs both new-job discovery and backfilling existing
+    rows.
+
+    This endpoint has its own rate limiter, separate from the bulk API's:
+    a 303 to `/_jr/security/challenge` instead of the real page once
+    requests come in faster than ~1/2s. Measured recovering within a few
+    seconds, so retried with backoff rather than treated as a permanent
+    miss -- this only runs once per newly-discovered job here, so the
+    volume is low regardless.
+    """
+    for attempt in range(retries + 1):
+        try:
+            resp = httpx.get(
+                f"https://jobright.ai/jobs/info/{job_id}",
+                headers={"User-Agent": UA},
+                timeout=15.0,
+            )
+            if resp.status_code == 303:
+                if attempt < retries:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                return None
+            match = _JOBRIGHT_NEXT_DATA_RE.search(resp.text)
+            if not match:
+                return None
+            data = json.loads(match.group(1))
+            publish_time = data["props"]["pageProps"]["dataSource"]["jobResult"].get("publishTime")
+            if not publish_time:
+                return None
+            parsed = datetime.fromisoformat(publish_time).replace(tzinfo=timezone.utc)
+            return parsed.isoformat()
+        except Exception as e:
+            log.warning("Jobright publishTime fetch failed for %s: %s", job_id, e)
+            return None
+    return None
+
+
 def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
     """Pull jobs directly from Jobright's own public minisite JSON API.
 
@@ -1262,9 +1350,11 @@ def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
     to whatever the widget rendered on its initial view (~20-30 rows) since
     neither drove real pagination, when the underlying dataset is actually
     ~3000-4700 jobs. It's also strictly richer data per job -- full
-    qualifications text, a real salary field, and a precise `postedAt`
-    timestamp -- instead of a scraped card snippet and a fuzzy "2 days ago"
-    string, for free, in the same call.
+    qualifications text and a real salary field, for free, in the same
+    call. NOT using this response's `postedAt` field, though: spot-checked
+    it against Jobright's own job pages and it runs ~7h behind what their
+    site actually displays for the same job (looks like a tz bug on their
+    end). See the "posted_date": None below.
 
     Args:
         category: Jobright's own category slug, e.g. "intern:us:swe" or
@@ -1330,12 +1420,6 @@ def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
                 job_id = item.get("jobId")
                 if not job_id:
                     continue
-                posted_at_ms = item.get("postedAt")
-                posted_date = None
-                if posted_at_ms:
-                    posted_date = datetime.fromtimestamp(
-                        posted_at_ms / 1000, tz=timezone.utc
-                    ).isoformat()
                 salary = props.get("salary")
                 if salary in (None, "N/A", ""):
                     salary = None
@@ -1346,7 +1430,13 @@ def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
                     "description": props.get("qualifications"),
                     "location": props.get("location"),
                     "url": f"https://jobright.ai/jobs/info/{job_id}",
-                    "posted_date": posted_date,
+                    # Deliberately not using this item's "postedAt": spot-checked
+                    # against Jobright's own job pages and it runs ~7h behind what
+                    # their site displays (looks like a tz bug on their end, not
+                    # ours). The real value (see _fetch_jobright_publish_time) gets
+                    # filled in separately, right after a new row is inserted --
+                    # see _store_jobs_filtered.
+                    "posted_date": None,
                 }
                 jobs.append(job)
                 if on_job:
