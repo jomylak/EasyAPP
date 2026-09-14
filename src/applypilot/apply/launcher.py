@@ -75,6 +75,13 @@ _JOB_COLUMNS = """url, title, site, company, application_url,
 # rows ends the worker instead of spinning against the database.
 _MAX_DEFERRALS = 50
 
+# A --queued batch never gains new rows mid-run, unlike the ranked queue's
+# continuous mode. So once it goes empty, the only things that could still
+# unblock it are transient (another worker's company lock clearing) -- a
+# lifetime/daily company cap never will. Give locks a few minutes, then stop,
+# rather than polling a permanently-stuck batch forever (see worker_loop).
+_QUEUE_BATCH_IDLE_POLLS = 5
+
 
 def _daily_cap_reason(conn, settings: dict) -> str | None:
     """Whether today's spend or application count has hit a configured cap.
@@ -891,6 +898,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
             empty_polls += 1
+            if queue_batch and empty_polls >= _QUEUE_BATCH_IDLE_POLLS:
+                add_event(f"[W{worker_id}] Queue batch idle for "
+                          f"{empty_polls * POLL_INTERVAL}s (remaining rows "
+                          f"permanently blocked, e.g. company cap) -- stopping")
+                update_state(worker_id, status="done",
+                             last_action="batch idle, stopping")
+                break
             update_state(worker_id, status="idle",
                          last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
