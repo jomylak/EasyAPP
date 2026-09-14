@@ -30,6 +30,10 @@ dependencies = [
     # applypilot/web/server.py for why there is deliberately no --host flag.
     "fastapi>=0.110",
     "uvicorn>=0.27",
+    # Custom MCP tool server (apply/mcp_tools) -- deterministic replacements
+    # for generic environment-level friction (file upload, comboboxes) that
+    # goose/Claude load as a third --with-extension alongside playwright/gmail.
+    "mcp>=2.0",
     ]
 
 [project.optional-dependencies]
@@ -56,6 +60,9 @@ artifacts = [
     # The built frontend ships with the package so a fresh clone can run
     # `applypilot serve` without Node installed.
     "src/applypilot/web/static/**",
+    # Unpacked Chrome extension loaded by apply/chrome.py -- see
+    # stealth_extension/inject.js.
+    "src/applypilot/apply/stealth_extension/**",
 ]
 
 [tool.ruff]
