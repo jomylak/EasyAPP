@@ -57,6 +57,37 @@
   } catch (e) {}
 
   try {
+    // WebRTC ICE gathering runs over raw UDP and ignores Chrome's configured
+    // HTTP(S) proxy entirely, so a page can probe RTCPeerConnection to read
+    // the real local/host IP straight past APPLY_PROXY's tunnel (confirmed
+    // leaking via scripts/fingerprint_check.py -- the command-line
+    // --force-webrtc-ip-handling-policy flag only restricts UDP relative to
+    // an *active* proxy, so it's a no-op on the direct connection most jobs
+    // run on). Nothing in this pipeline uses WebRTC/getUserMedia, so it's
+    // safe to remove outright rather than try to filter ICE candidates.
+    //
+    // Blink installs the RTCPeerConnection binding onto window *after*
+    // document_start content scripts run, which silently clobbers a
+    // one-shot override here (confirmed: deleting/reassigning it at
+    // document_start does nothing, while the identical code run later via
+    // CDP Page.evaluate works fine). So reapply on every later lifecycle
+    // point available before page scripts can realistically run first.
+    const killWebRTC = () => {
+      for (const name of ["RTCPeerConnection", "webkitRTCPeerConnection", "mozRTCPeerConnection", "RTCDataChannel"]) {
+        try {
+          delete window[name];
+        } catch (e) {}
+        try {
+          Object.defineProperty(window, name, { get: () => undefined, configurable: true });
+        } catch (e) {}
+      }
+    };
+    killWebRTC();
+    queueMicrotask(killWebRTC);
+    document.addEventListener("readystatechange", killWebRTC);
+  } catch (e) {}
+
+  try {
     if (navigator.plugins.length === 0) {
       const fakePlugin = {
         name: "Chrome PDF Plugin",
