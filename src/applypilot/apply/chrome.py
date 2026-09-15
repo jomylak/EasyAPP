@@ -310,7 +310,8 @@ def _wait_for_cdp(port: int, worker_id: int, proc: subprocess.Popen,
 
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False, use_proxy: bool = False) -> subprocess.Popen:
+                  headless: bool = False, use_proxy: bool = False,
+                  extra_args: list[str] | None = None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
@@ -325,6 +326,10 @@ def launch_chrome(worker_id: int, port: int | None = None,
             jobs that actually need CapSolver's IP to match Chrome's, instead
             of every job on every worker regardless of whether it ever sees
             a captcha.
+        extra_args: Additional Chrome command-line flags, appended after the
+            standard set. For one-off experiments (e.g. scripts/fingerprint_check.py
+            trying `--use-angle=swiftshader`) without changing every worker's
+            default launch args.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -382,7 +387,7 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-size=1024,768",
+        "--window-size=1920,1080",
         "--disable-session-crashed-bubble",
         "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
         "--hide-crash-restore-bubble",
@@ -413,11 +418,19 @@ def launch_chrome(worker_id: int, port: int | None = None,
         # Ashby's own bot check) by default. This is the one free mitigation;
         # it does not need a vendor decision the way the proxy below does.
         "--disable-blink-features=AutomationControlled",
+        # WebRTC negotiates over raw UDP and ignores --proxy-server entirely,
+        # so a page can probe ICE candidates and leak the real local/host IP
+        # straight past APPLY_PROXY's HTTP(S) tunnel. This restricts WebRTC to
+        # the configured proxy (or drops it if there is none), closing that
+        # side channel independent of whether a job is proxied.
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     ]
     if proxy_port:
         cmd.append(f"--proxy-server=127.0.0.1:{proxy_port}")
     if headless:
         cmd.append("--headless=new")
+    if extra_args:
+        cmd.extend(extra_args)
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
