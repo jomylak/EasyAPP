@@ -32,6 +32,7 @@ _ROW_COLUMNS = f"""
     is_remote_spring_internship,
     pay_min_hourly, pay_max_hourly, pay_below_floor,
     apply_status, applied_at, apply_error, apply_cost_usd,
+    post_apply_status, post_apply_status_at, post_apply_evidence,
     queue_batch, queue_position, tailored_resume_path,
     {_DAY_EXPR} AS day,
     COALESCE(employer_posted_date, posted_date, discovered_at) AS posted

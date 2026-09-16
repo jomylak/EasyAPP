@@ -12,6 +12,15 @@ const STATUS_LABEL: Record<string, string> = {
   manual: "Manual",
 }
 
+const POST_APPLY_LABEL: Record<string, string> = {
+  none: "No response",
+  oa: "OA",
+  interview: "Interview",
+  rejected: "Rejected",
+  offer: "Offer",
+}
+const POST_APPLY_OPTIONS = ["none", "oa", "interview", "rejected", "offer"]
+
 const STATUS_PILLS: { id: string | null; label: string }[] = [
   { id: null, label: "All" },
   { id: "applied", label: "Applied" },
@@ -201,6 +210,18 @@ export function ApplicationsTable({ live }: { live: boolean }) {
     }
   }
 
+  async function setPostApplyStatus(r: ApplicationRow, status: string) {
+    setBusyUrl(r.url)
+    try {
+      await api.setPostApplyStatus(r.url, status)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusyUrl(null)
+      refresh()
+    }
+  }
+
   function toggleOpen(url: string) {
     setOpenRows((prev) => {
       const next = new Set(prev)
@@ -286,6 +307,7 @@ export function ApplicationsTable({ live }: { live: boolean }) {
               <th className="col-when sortable" onClick={() => setSort("applied_at")} title={`Sort by ${SORT_LABEL.applied_at}`}>
                 Applied{sortIndicator("applied_at")}
               </th>
+              <th className="col-status">Outcome</th>
               <th className="col-cost num sortable" onClick={() => setSort("cost")} title={`Sort by ${SORT_LABEL.cost}`}>
                 Cost{sortIndicator("cost")}
               </th>
@@ -302,14 +324,14 @@ export function ApplicationsTable({ live }: { live: boolean }) {
           <tbody>
             {error && (
               <tr>
-                <td colSpan={10} style={{ color: "var(--a-bad)", padding: "10px" }}>
+                <td colSpan={11} style={{ color: "var(--a-bad)", padding: "10px" }}>
                   Failed to load: {error}
                 </td>
               </tr>
             )}
             {!error && visible.length === 0 && !loading && (
               <tr>
-                <td colSpan={10} style={{ padding: "10px", color: "var(--a-text-3)" }}>
+                <td colSpan={11} style={{ padding: "10px", color: "var(--a-text-3)" }}>
                   Nothing clears this filter.
                 </td>
               </tr>
@@ -359,6 +381,26 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                     )}
                   </td>
                   <td className="loc">{formatWhen(r.applied_at)}</td>
+                  <td onClick={(e) => e.stopPropagation()}>
+                    {status === "applied" || status === "manual" ? (
+                      <select
+                        className={`badge ${r.post_apply_status ?? "none"}`}
+                        style={{ border: "none", cursor: "pointer" }}
+                        value={r.post_apply_status ?? "none"}
+                        disabled={busyUrl === r.url}
+                        title={r.post_apply_evidence ?? undefined}
+                        onChange={(e) => setPostApplyStatus(r, e.target.value)}
+                      >
+                        {POST_APPLY_OPTIONS.map((opt) => (
+                          <option key={opt} value={opt}>
+                            {POST_APPLY_LABEL[opt]}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
                   <td className="num">{formatCost(r.apply_cost_usd)}</td>
                   <td className="loc">{r.apply_backend ?? "—"}</td>
                   <td className="loc">{formatWhen(r.last_attempted_at)}</td>
@@ -395,7 +437,7 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                   </td>
                 </tr>
                 <tr className={`exp${openRows.has(r.url) ? " open" : ""}`}>
-                  <td colSpan={10}>
+                  <td colSpan={11}>
                     <div className="slide">
                       <div>
                         <JobExpansion row={r} open={openRows.has(r.url)} />

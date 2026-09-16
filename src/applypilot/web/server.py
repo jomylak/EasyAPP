@@ -25,13 +25,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from applypilot import config, costs
 from applypilot.database import get_connection, init_db
 from applypilot.web import queries
+from applypilot.web.screencast import stream_worker
 
 logger = logging.getLogger(__name__)
 
@@ -453,6 +454,34 @@ def api_report_ineligible(payload: dict = Body(...)) -> dict:
     return mark_ineligibility_and_sweep_company(url, note, conn=conn)
 
 
+@app.post("/api/post-apply-status")
+def api_post_apply_status(payload: dict = Body(...)) -> dict:
+    """Set (or clear) a job's post-apply status by hand from the dashboard --
+    the correction path for when scan_gmail_status.py's match misses or gets
+    it wrong. Marked 'manual' so the scanner never overwrites it.
+    """
+    from applypilot.apply.post_apply_status import STATUSES
+
+    url = payload.get("url")
+    status = payload.get("status")
+    if not url:
+        raise HTTPException(400, "No job given")
+    if status not in STATUSES:
+        raise HTTPException(400, f"status must be one of {STATUSES}")
+
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    with conn:
+        cur = conn.execute(
+            "UPDATE jobs SET post_apply_status = ?, post_apply_status_at = ?, "
+            "post_apply_evidence = NULL, post_apply_source = 'manual' WHERE url = ?",
+            (status, now, url),
+        )
+    if cur.rowcount == 0:
+        raise HTTPException(404, "No such job")
+    return {"url": url, "status": status}
+
+
 # --- running ---------------------------------------------------------------
 
 @app.post("/api/launch")
@@ -484,12 +513,18 @@ def api_launch(payload: dict = Body(...)) -> dict:
         sys.executable, "-m", "applypilot.cli", "apply",
         "--queued", batch,
         "--workers", str(int(payload.get("workers", 1))),
-        "--headless",
     ]
     if payload.get("backend"):
         cmd += ["--backend", str(payload["backend"])]
     if payload.get("dry_run"):
         cmd.append("--dry-run")
+    # Headful by default (matches the CLI's own default) -- the whole point
+    # of running real Chrome instead of headless is the anti-detection
+    # posture (see stealth_extension/), and it's what makes the Runs tab's
+    # live screencast show anything. --headless is opt-in for whoever wants
+    # to trade that off for lower resource use with many workers at once.
+    if payload.get("headless"):
+        cmd.append("--headless")
 
     log_path = config.LOG_DIR / f"web-run-{batch}.log"
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -645,6 +680,12 @@ def api_set_env_keys(payload: dict = Body(...)) -> dict:
         set_key(str(config.ENV_PATH), key, value.strip())
         updated.append(key)
     return {"updated": updated}
+
+
+@app.websocket("/ws/screencast/{worker_id}")
+async def ws_screencast(websocket: WebSocket, worker_id: int) -> None:
+    """Live-view a worker's headful Chrome -- see web/screencast.py."""
+    await stream_worker(websocket, worker_id)
 
 
 @app.get("/api/events")

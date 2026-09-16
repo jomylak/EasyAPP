@@ -7,15 +7,18 @@ exactly the way production workers are (same flags, same stealth extension,
 same profile setup) -- this measures the real pipeline, not a hand-rolled
 approximation of it.
 
+--via-proxy uses whatever static proxy is configured for the given
+--worker-id (APPLY_PROXY_<worker_id>), the same primary tier production
+workers use -- not the home-IP fallback (APPLY_PROXY).
+
 Usage:
     python scripts/fingerprint_check.py --label vm-direct
-    python scripts/fingerprint_check.py --label vm-proxy --via-proxy
+    python scripts/fingerprint_check.py --label vm-proxy --via-proxy --worker-id 0
 """
 import argparse
 import asyncio
 import json
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -99,8 +102,6 @@ async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str]
             await browser.close()
     finally:
         chrome.cleanup_worker(worker_id, proc)
-        if via_proxy:
-            chrome.release_proxy_slot()
 
     return report
 
@@ -125,11 +126,6 @@ def main() -> None:
     parser.add_argument("--swiftshader", action="store_true",
                          help="Force software WebGL via --use-angle=swiftshader (experiment for GPU-less VMs)")
     args = parser.parse_args()
-
-    if args.via_proxy:
-        if not chrome.acquire_proxy_slot():
-            print("Could not acquire the single APPLY_PROXY slot.", file=sys.stderr)
-            sys.exit(1)
 
     extra_args = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] if args.swiftshader else None
     report = asyncio.run(run(args.label, args.via_proxy, args.worker_id, extra_args))

@@ -4,6 +4,7 @@ import { AtsBreakdown } from "@/components/AtsBreakdown"
 import { CompanyLimits } from "@/components/CompanyLimits"
 import { Donut } from "@/components/Donut"
 import { FailureBreakdown } from "@/components/FailureBreakdown"
+import { WorkerExpansion } from "@/components/WorkerExpansion"
 import { api } from "@/lib/api"
 import type { Stats } from "@/lib/types"
 import { useRunStream } from "@/lib/useRunStream"
@@ -38,6 +39,10 @@ export function DashboardTab() {
   const [pending, setPending] = useState<{ batch: string; count: number; queued_at: string | null }[]>([])
   const [launchingBatch, setLaunchingBatch] = useState<string | null>(null)
   const [pendingError, setPendingError] = useState<string | null>(null)
+  // Which worker's row is expanded to show its live view, if any -- at most
+  // one at a time, so opening a second live view doesn't quietly double the
+  // number of screencast sessions running on the VM.
+  const [expandedWorker, setExpandedWorker] = useState<number | null>(null)
 
   function refreshStats() {
     api
@@ -211,32 +216,45 @@ export function DashboardTab() {
         )}
 
         {live &&
-          run?.workers.map((w) => (
-            <div className="worker-row" key={w.worker_id}>
-              <span className="worker-id">#{w.worker_id}</span>
-              <span className="worker-status">
-                <span className={`badge ${w.status === "applied" ? "applied" : w.status === "failed" ? "failed" : "in_progress"}`}>
-                  {STATUS_LABEL[w.status] ?? w.status}
-                </span>
-              </span>
-              <span className="worker-job" title={`${w.company} — ${w.job_title}`}>
-                {w.company ? (
-                  <span className={w.company_tier === "tier1" ? "tier1-company" : w.company_tier ? "tier-adjacent" : undefined}>
-                    {w.company}
+          run?.workers.map((w) => {
+            const isOpen = expandedWorker === w.worker_id
+            return (
+              <div className={`worker-exp${isOpen ? " open" : ""}`} key={w.worker_id}>
+                <div
+                  className="worker-row worker-row-clickable"
+                  onClick={() => setExpandedWorker(isOpen ? null : w.worker_id)}
+                >
+                  <span className="worker-id">#{w.worker_id}</span>
+                  <span className="worker-status">
+                    <span className={`badge ${w.status === "applied" ? "applied" : w.status === "failed" ? "failed" : "in_progress"}`}>
+                      {STATUS_LABEL[w.status] ?? w.status}
+                    </span>
                   </span>
-                ) : (
-                  "—"
-                )}{" "}
-                {w.job_title ? `— ${w.job_title}` : ""}
-              </span>
-              <span className="worker-last" title={w.last_action}>
-                {w.last_action || "—"}
-              </span>
-              <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--a-text-3)" }}>
-                {elapsed(w.start_time)}
-              </span>
-            </div>
-          ))}
+                  <span className="worker-job" title={`${w.company} — ${w.job_title}`}>
+                    {w.company ? (
+                      <span className={w.company_tier === "tier1" ? "tier1-company" : w.company_tier ? "tier-adjacent" : undefined}>
+                        {w.company}
+                      </span>
+                    ) : (
+                      "—"
+                    )}{" "}
+                    {w.job_title ? `— ${w.job_title}` : ""}
+                  </span>
+                  <span className="worker-last" title={w.last_action}>
+                    {w.last_action || "—"}
+                  </span>
+                  <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--a-text-3)" }}>
+                    {elapsed(w.start_time)}
+                  </span>
+                </div>
+                <div className="slide">
+                  <div className="slide-inner">
+                    <WorkerExpansion worker={w} open={isOpen} />
+                  </div>
+                </div>
+              </div>
+            )
+          })}
       </div>
 
       <ApplicationsTable live={live} />

@@ -25,7 +25,7 @@ from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 from applypilot.ats import detect_ats
 from applypilot.apply.chrome import get_worker_proxy, reset_worker_dir, _kill_process_tree
-from applypilot.apply.dashboard import add_event, get_state, update_state
+from applypilot.apply.dashboard import accumulate_usage, add_event, add_worker_action, get_state, update_state
 from applypilot.scoring.router import resume_paths_for_job
 
 logger = logging.getLogger(__name__)
@@ -142,7 +142,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                  company=job.get("company") or job.get("site", ""),
                  company_tier=job.get("company_tier"),
                  url=job.get("url", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting")
+                 start_time=time.time(), actions=0, last_action="starting",
+                 recent_actions=[])
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
@@ -238,6 +239,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                             if bt == "text":
                                 text_parts.append(block["text"])
                                 lf.write(block["text"] + "\n")
+                                # Unlike goose, each block here is already a
+                                # complete turn's text (not one token per
+                                # envelope), so it can go straight to the
+                                # live log with no buffering.
+                                stripped = block["text"].strip()
+                                if stripped:
+                                    add_worker_action(worker_id, f"\U0001f4ad {stripped[:200]}")
                             elif bt == "tool_use":
                                 name = (
                                     block.get("name", "")
@@ -265,6 +273,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                 update_state(worker_id,
                                              actions=cur_actions + 1,
                                              last_action=desc[:35])
+                                add_worker_action(worker_id, desc[:120])
                     elif msg_type == "result":
                         stats = {
                             "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
@@ -343,10 +352,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "cache_read_tokens": stats.get("cache_read"),
                     "cost_usd": stats.get("cost_usd"),
                 }
-            cost = stats.get("cost_usd", 0)
-            ws = get_state(worker_id)
-            prev_cost = ws.total_cost if ws else 0.0
-            update_state(worker_id, total_cost=prev_cost + cost)
+            accumulate_usage(worker_id, stats.get("cost_usd", 0), stats)
 
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()

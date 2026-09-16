@@ -5,7 +5,6 @@ how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
-import logging
 import os
 import shutil
 from datetime import datetime
@@ -14,8 +13,6 @@ from pathlib import Path
 from applypilot import config
 from applypilot.ats import detect_ats
 from applypilot.scoring.router import resume_paths_for_job
-
-logger = logging.getLogger(__name__)
 
 
 def _build_profile_summary(profile: dict, start_date_override: str = "") -> str:
@@ -319,353 +316,85 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
-def _build_captcha_section(proxy_string: str | None = None) -> str:
-    """Build the CAPTCHA detection and solving instructions.
+def _build_captcha_section(proxy_string: str | None = None, ats: str | None = None) -> str:
+    """Build the (now short) CAPTCHA handling instructions.
 
-    Two separate vendors, split by CAPTCHA type -- not a primary/fallback
-    pair for the same type:
-      - hCaptcha -> NoneCap. CapSolver dropped hCaptcha support (confirmed
-        live against their API: every hCaptcha sitekey, including hCaptcha's
-        own public demo key, comes back "we don't support this service",
-        while reCAPTCHA v2 on the same account works fine) around the same
-        time hCaptcha's enterprise variant got materially harder to solve
-        (each challenge bound to a fresh rqdata blob -- see NoneCap's own
-        writeup on why that breaks pure recognition solvers). So there is no
-        CapSolver fallback to reach for here; if NoneCap can't solve it,
-        nothing server-side can, and a manual/visual attempt from here
-        (clicking image tiles, which is what's actually rejecting us -- see
-        MANUAL FALLBACK) isn't worth the extra agent turns it would burn for
-        a captcha that's specifically designed to be hard for exactly that.
-      - reCAPTCHA v2/v3, Turnstile, FunCaptcha -> CapSolver, unchanged.
+    Detection, vendor dispatch, solving, and token injection all moved into
+    applytools__handle_captcha() (mcp_tools/server.py) -- this used to be
+    ~15,000 characters of raw JavaScript (detect + NoneCap solve/inject +
+    CapSolver's 3-step createTask/poll/inject with 4 separate per-vendor
+    inject blocks) asked to be retyped from a template on every single job,
+    the single largest chunk of the whole prompt. The vendor-selection logic
+    (hCaptcha -> NoneCap, everything else -> CapSolver) and budget/hard-stop
+    rules are unchanged -- they're now enforced by the tool itself, not left
+    to the agent to self-police (one hCaptcha attempt, up to 2 CapSolver
+    cycles per instance / 3 total per run), so only the policy prose the
+    agent still needs to decide anything from lives here.
 
-    The CAPTCHA section contains no personal data -- it's the same for every
-    user.
+    `ats` further gates even this short version: Greenhouse and Workday have
+    a measured zero-captcha-incidence history across real runs (and are the
+    two highest apply-volume platforms), so they get an even shorter stub.
+    Every other/unknown ATS defaults to the full version -- captcha coverage
+    should never silently drop for a platform that hasn't been verified safe.
 
     Args:
         proxy_string: This job's CapSolver-format proxy ("type:host:port:
-            user:pass"), from chrome.get_worker_proxy() -- the same egress IP
-            this job's Chrome is browsing from. When set, CapSolver solves
-            through it instead of its own ProxyLess farm IP, so the token's
-            trust score is computed from a session that actually matches the
-            one submitting it. None reproduces today's ProxyLess behavior.
-            NoneCap's hCaptcha flow takes the same proxy string, since its
-            "proxy" field accepts a plain URL rather than CapSolver's
-            type:host:port:user:pass shape -- see the NoneCap step below for
-            the reformatting.
+            user:pass"), from chrome.get_worker_proxy() -- passed straight
+            through to applytools__handle_captcha, which does the NoneCap
+            URL-format reformatting itself.
+        ats: Detected ATS platform for this job, from build_prompt's
+            detect_ats() -- used only for the risk-tier gate above.
     """
     config.load_env()
     capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
     nonecap_key = os.environ.get("NONECAP_API_KEY", "")
 
-    # NoneCap's "proxy" field wants a plain URL (scheme://user:pass@host:port),
-    # not CapSolver's "type:host:port:user:pass" -- reformat once here so the
-    # NoneCap step below can just drop it in, rather than asking the agent to
-    # do string surgery on a credential inline.
-    nonecap_proxy = ""
-    if proxy_string:
-        try:
-            ptype, phost, pport, puser, ppass = proxy_string.split(":", 4)
-            nonecap_proxy = f"{ptype}://{puser}:{ppass}@{phost}:{pport}"
-        except ValueError:
-            logger.warning("Unrecognized proxy_string shape for NoneCap: %r", proxy_string)
-    nonecap_proxy_field = f", proxy: '{nonecap_proxy}'" if nonecap_proxy else ""
-
     if not capsolver_key and not nonecap_key:
-        # Without either key the 9k-char solving section is dead weight -- a
-        # large fraction of the prompt, resent on every turn of a ~50-turn
-        # agentic loop, purely to say both APIs are unavailable. Emit the
-        # manual fallback only.
         return """== CAPTCHA ==
-No CAPTCHA solving service is configured, so you cannot solve image or token
-CAPTCHAs programmatically. If one appears:
+No CAPTCHA solving service is configured. If one appears:
 1. Audio challenge: look for an "audio" or "accessibility" button -- often easier.
 2. Text or logic puzzles ("What is 3+7?", "type the word"): solve them yourself.
 3. Anything else -> RESULT:CAPTCHA. Do not loop.
-Note that invisible CAPTCHAs (reCAPTCHA v3, Turnstile) show no widget but can
-silently block a submit. If a form submits with no error and no confirmation,
+Invisible CAPTCHAs (reCAPTCHA v3, Turnstile) show no widget but can silently
+block a submit -- if a form submits with no error and no confirmation,
 suspect one and report RESULT:CAPTCHA rather than retrying indefinitely."""
 
-    if proxy_string:
-        task_type_table = """TASK_TYPE values (use EXACTLY these strings -- hCaptcha is NOT
-in this list, it does not go through CapSolver, see the NoneCap step below):
-  recaptchav2  -> ReCaptchaV2Task
-  recaptchav3  -> ReCaptchaV3Task
-  turnstile    -> AntiTurnstileTask
-  funcaptcha   -> FunCaptchaTask
+    call = f"applytools__handle_captcha(proxy_string: '{proxy_string or ''}')"
 
-This job's Chrome browses through a residential proxy, so pass it to CapSolver
-too -- add "proxy": "{proxy}" to the task object (a sibling of "type", not
-nested). This makes CapSolver solve through the SAME IP your browser is using,
-instead of its own datacenter IP -- required for the trust score (reCAPTCHA
-v3 especially) to reflect the session actually submitting the form.""".format(proxy=proxy_string)
-    else:
-        task_type_table = """TASK_TYPE values (use EXACTLY these strings -- hCaptcha is NOT
-in this list, it does not go through CapSolver, see the NoneCap step below):
-  recaptchav2  -> ReCaptchaV2TaskProxyLess
-  recaptchav3  -> ReCaptchaV3TaskProxyLess
-  turnstile    -> AntiTurnstileTaskProxyLess
-  funcaptcha   -> FunCaptchaTaskProxyLess"""
+    if ats in config.load_low_captcha_risk_ats():
+        return f"""== CAPTCHA (low risk on {ats}, abbreviated) ==
+{ats} has shown no CAPTCHAs in observed runs, so this is short. If one appears
+anyway: call {call}. It detects the type, solves via NoneCap (hCaptcha) or
+CapSolver (everything else), and injects the token -- reporting back
+ok/no captcha/error. One hCaptcha attempt only; the tool enforces its own
+budget. On "error: ..." -> RESULT:FAILED:captcha, do not retry manually or
+attempt to solve visually."""
 
     return f"""== CAPTCHA ==
-You solve CAPTCHAs server-side via two REST APIs, split strictly by type -- NOT
-a primary/fallback pair, each one is the ONLY path for its types:
-  - hCaptcha              -> NoneCap (API key: {nonecap_key or 'NOT CONFIGURED -- if hCaptcha appears, skip the NoneCap step, output RESULT:FAILED:captcha immediately'})
-  - reCAPTCHA v2/v3, Turnstile, FunCaptcha -> CapSolver (API key: {capsolver_key or 'NOT CONFIGURED -- see MANUAL FALLBACK'})
-No browser extension for either. You control the entire flow.
+Call {call} whenever you suspect a CAPTCHA -- after a navigation, an
+Apply/Submit/Login click, or when the page feels stuck. It detects the type,
+dispatches to the right vendor (hCaptcha -> NoneCap; reCAPTCHA v2/v3,
+Turnstile, FunCaptcha -> CapSolver), solves, and injects the token, all in one
+call. It also enforces the budget itself (one hCaptcha attempt; up to 2
+CapSolver cycles per instance, 3 total this run) so you don't need to count
+attempts yourself.
 
-CRITICAL RULE: When ANY CAPTCHA appears, you MUST:
-1. Run CAPTCHA DETECT to get the type and sitekey
-2. hCaptcha -> CAPTCHA SOLVE (NoneCap) below. Everything else -> CAPTCHA SOLVE (CapSolver) below.
-3. Do NOT skip the API call based on what the CAPTCHA looks like -- both vendors
-   solve server-side, they do NOT need to see or interact with images, puzzles,
-   or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are
-   solved via API token, not visually. ALWAYS try the API first.
-
-hCaptcha is a HARD STOP, not a retry loop: ONE NoneCap attempt per captcha
-instance. If it doesn't come back "solved" and inject cleanly, output
-RESULT:FAILED:captcha immediately -- do NOT fall through to MANUAL FALLBACK's
-audio/text/visual tricks for hCaptcha specifically, and do NOT try to solve
-the image challenge yourself by clicking tiles. If NoneCap can't do it,
-nothing server-side can (that's the whole point of paying for a solver), and
-hCaptcha's image challenges are specifically built to be hard for exactly the
-kind of model driving this session -- burning turns clicking through
-escalating challenge rounds is not a productive use of this run's budget.
-This restriction is hCaptcha-only: CapSolver's types below keep their normal
-budget and manual fallback.
-
-BUDGET (CapSolver types only -- reCAPTCHA v2/v3, Turnstile, FunCaptcha): across
-this entire application, you get at most 2 full solve cycles (createTask->poll
-->inject) against the SAME captcha instance, and at most 3 total across the
-whole run if the captcha reappears at a different step (e.g. once at login,
-once at submit). Once you hit that budget without success, stop -- go to
-MANUAL FALLBACK's last resort and output RESULT:FAILED:captcha. A run that
-keeps retrying past this point is not making progress, it is just spending
-money.
-
---- CAPTCHA DETECT ---
-Run this browser_evaluate after every navigation, Apply/Submit/Login click, or when a page feels stuck.
-IMPORTANT: Detection order matters. hCaptcha elements also have data-sitekey, so check hCaptcha BEFORE reCAPTCHA.
-
-browser_evaluate function: () => {{{{
-  const r = {{}};
-  const url = window.location.href;
-  // 1. hCaptcha (check FIRST -- hCaptcha uses data-sitekey too)
-  const hc = document.querySelector('.h-captcha, [data-hcaptcha-sitekey]');
-  if (hc) {{{{
-    r.type = 'hcaptcha'; r.sitekey = hc.dataset.sitekey || hc.dataset.hcaptchaSitekey;
-  }}}}
-  if (!r.type && document.querySelector('script[src*="hcaptcha.com"], iframe[src*="hcaptcha.com"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'hcaptcha'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 2. Cloudflare Turnstile
-  if (!r.type) {{{{
-    const cf = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]');
-    if (cf) {{{{
-      r.type = 'turnstile'; r.sitekey = cf.dataset.sitekey || cf.dataset.turnstileSitekey;
-      if (cf.dataset.action) r.action = cf.dataset.action;
-      if (cf.dataset.cdata) r.cdata = cf.dataset.cdata;
-    }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="challenges.cloudflare.com"]')) {{{{
-    r.type = 'turnstile_script_only'; r.note = 'Wait 3s and re-detect.';
-  }}}}
-  // 3. reCAPTCHA v3 (invisible, loaded via render= param)
-  if (!r.type) {{{{
-    const s = document.querySelector('script[src*="recaptcha"][src*="render="]');
-    if (s) {{{{
-      const m = s.src.match(/render=([^&]+)/);
-      if (m && m[1] !== 'explicit') {{{{ r.type = 'recaptchav3'; r.sitekey = m[1]; }}}}
-    }}}}
-  }}}}
-  // 4. reCAPTCHA v2 (checkbox or invisible)
-  if (!r.type) {{{{
-    const rc = document.querySelector('.g-recaptcha');
-    if (rc) {{{{ r.type = 'recaptchav2'; r.sitekey = rc.dataset.sitekey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="recaptcha"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'recaptchav2'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 5. FunCaptcha (Arkose Labs)
-  if (!r.type) {{{{
-    const fc = document.querySelector('#FunCaptcha, [data-pkey], .funcaptcha');
-    if (fc) {{{{ r.type = 'funcaptcha'; r.sitekey = fc.dataset.pkey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) {{{{
-    const el = document.querySelector('[data-pkey]');
-    if (el) {{{{ r.type = 'funcaptcha'; r.sitekey = el.dataset.pkey; }}}}
-  }}}}
-  if (r.type) {{{{ r.url = url; return r; }}}}
-  return null;
-}}}}
-
-Result actions:
-- null -> no CAPTCHA. Continue normally.
-- "turnstile_script_only" -> browser_wait_for time: 3, re-run detect.
-- "hcaptcha" -> proceed to CAPTCHA SOLVE (NoneCap) below.
-- Any other type (recaptchav2, recaptchav3, turnstile, funcaptcha) -> proceed to CAPTCHA SOLVE (CapSolver) below.
-
---- CAPTCHA SOLVE (NoneCap -- hCaptcha only) ---
-One step, synchronous: no createTask/poll split like CapSolver below.
-
-CALL (fill in the 2 placeholders; PAGE_URL/SITE_KEY are from the detect result):
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.nonecap.com/v1/solves?wait=60', {{{{
-    method: 'POST',
-    headers: {{{{
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer {nonecap_key}'
-    }}}},
-    body: JSON.stringify({{{{
-      type: 'hcaptcha',
-      sitekey: 'SITE_KEY',
-      url: 'PAGE_URL'{nonecap_proxy_field}
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-The call itself blocks up to 60s server-side for the solve, so there is no
-separate poll step -- one browser_evaluate call returns the final result
-directly (unlike CapSolver's createTask/getTaskResult split below).
-
-- response.status === 'solved' -> take response.token, go to INJECT below.
-- Anything else (status "failed"/"error", or the request itself erroring) ->
-  STOP. Do not retry, do not fall through to MANUAL FALLBACK's audio/text/
-  visual tricks, do not attempt the challenge yourself. Output
-  RESULT:FAILED:captcha immediately -- see the HARD STOP note above.
-
-INJECT (replace THE_TOKEN with response.token):
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
-  if (ta) ta.value = token;
-  document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(f => f.setAttribute('data-hcaptcha-response', token));
-  const cb = document.querySelector('[data-hcaptcha-widget-id]');
-  if (cb && window.hcaptcha) try {{{{ window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-Then browser_wait_for time: 2, snapshot.
-- Widget gone or green check -> success. Click Submit if needed.
-- No change -> click Submit/Verify/Continue button (some sites need it).
-- Still stuck -> that's the hard stop above. RESULT:FAILED:captcha now, not
-  another NoneCap call.
-
---- CAPTCHA SOLVE (CapSolver -- reCAPTCHA v2/v3, Turnstile, FunCaptcha) ---
-Three steps: createTask -> poll -> inject. Do each as a separate browser_evaluate call.
-
-STEP 1 -- CREATE TASK (copy this exactly, fill in the 3 placeholders):
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/createTask', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      task: {{{{
-        type: 'TASK_TYPE',
-        websiteURL: 'PAGE_URL',
-        websiteKey: 'SITE_KEY'
-      }}}}
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-{task_type_table}
-
-PAGE_URL = the url from detect result. SITE_KEY = the sitekey from detect result.
-For recaptchav3: add "pageAction": "submit" to the task object (or the actual action found in page scripts).
-For turnstile: add "metadata": {{"action": "...", "cdata": "..."}} if those were in detect result.
-
-Response: {{"errorId": 0, "taskId": "abc123"}} on success.
-If errorId > 0 -> CAPTCHA SOLVE failed. Go to MANUAL FALLBACK.
-
-STEP 2 -- POLL (replace TASK_ID with the taskId from step 1):
-Loop: browser_wait_for time: 3, then run:
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/getTaskResult', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      taskId: 'TASK_ID'
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-- status "processing" -> wait 3s, poll again. Max 10 polls (30s).
-- status "ready" -> extract token:
-    reCAPTCHA: solution.gRecaptchaResponse
-    hCaptcha:  solution.gRecaptchaResponse
-    Turnstile: solution.token
-- errorId > 0 or 30s timeout -> MANUAL FALLBACK.
-
-STEP 3 -- INJECT TOKEN (replace THE_TOKEN with actual token string):
-
-For reCAPTCHA v2/v3:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{{{ el.value = token; el.style.display = 'block'; }}}});
-  if (window.___grecaptcha_cfg) {{{{
-    const clients = window.___grecaptcha_cfg.clients;
-    for (const key in clients) {{{{
-      const walk = (obj, d) => {{{{
-        if (d > 4 || !obj) return;
-        for (const k in obj) {{{{
-          if (typeof obj[k] === 'function' && k.length < 3) try {{{{ obj[k](token); }}}} catch(e) {{{{}}}}
-          else if (typeof obj[k] === 'object') walk(obj[k], d+1);
-        }}}}
-      }}}};
-      walk(clients[key], 0);
-    }}}}
-  }}}}
-  return 'injected';
-}}}}
-
-For Turnstile:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
-  if (inp) inp.value = token;
-  if (window.turnstile) try {{{{ const w = document.querySelector('.cf-turnstile'); if (w) window.turnstile.getResponse(w); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-For FunCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('#FunCaptcha-Token, input[name="fc-token"]');
-  if (inp) inp.value = token;
-  if (window.ArkoseEnforcement) try {{{{ window.ArkoseEnforcement.setConfig({{{{data: {{{{blob: token}}}}}}}}) }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-After injecting: browser_wait_for time: 2, then snapshot.
-- Widget gone or green check -> success. Click Submit if needed.
-- No change -> click Submit/Verify/Continue button (some sites need it).
-- Still stuck on reCAPTCHA v2/Turnstile -> token may have expired
-  (~2 min lifetime). Re-run from STEP 1 ONCE more. If it still doesn't clear
-  after that second attempt, stop -- go to MANUAL FALLBACK's last resort and
-  output RESULT:FAILED:captcha. Do not attempt a third solve cycle in this run.
-- Still stuck on reCAPTCHA v3 specifically -> do NOT retry the solve loop.
-  v3 is an invisible trust-score check, not a token you can brute-force: a
-  rejected submission usually means the SITE decided your session's IP/
-  behavior looks automated, and CapSolver returning another "solved" token
-  changes nothing about that score. Retrying burns turns for no gain. Output
-  RESULT:FAILED:captcha immediately after the first failed v3 attempt so the
-  job can be retried through a different egress path instead of stalling here.
-
---- MANUAL FALLBACK (CapSolver types only -- reCAPTCHA v2/v3, Turnstile, FunCaptcha) ---
-NOT for hCaptcha -- a failed NoneCap attempt goes straight to
-RESULT:FAILED:captcha, see the HARD STOP note near the top of this section.
-You should ONLY be here if CapSolver createTask returned errorId > 0. If you haven't tried CapSolver yet, GO BACK and try it first.
-If CapSolver genuinely failed (errorId > 0):
-1. Audio challenge: Look for "audio" or "accessibility" button -> click it for an easier challenge.
-2. Text/logic puzzles: Solve them yourself. Think step by step. Common tricks: "All but 9 die" = 9 left. "3 sisters and 4 brothers, how many siblings?" = 7.
-3. Simple text captchas ("What is 3+7?", "Type the word") -> solve them.
-4. All else fails -> Output RESULT:CAPTCHA."""
+Read the result:
+- "ok: no captcha detected" -> nothing to do, continue normally.
+- "ok: ..." -> solved and injected. Click Submit/Verify/Continue if the page
+  didn't auto-advance.
+- "error: hcaptcha ..." -> HARD STOP. hCaptcha's image challenges are
+  specifically built to defeat exactly the kind of model driving this
+  session -- do not attempt to solve it visually, do not retry. Output
+  RESULT:FAILED:captcha immediately.
+- "error: capsolver budget exhausted ..." or any other CapSolver-side failure
+  -> MANUAL FALLBACK: try the audio/accessibility button, or solve a simple
+  text/logic puzzle if that's what's actually shown ("What is 3+7?" -> solve
+  it; "All but 9 die" = 9 left). If none of that applies, output
+  RESULT:CAPTCHA.
+Invisible CAPTCHAs (reCAPTCHA v3, Turnstile) show no widget but can silently
+block a submit -- if a form submits with no error and no confirmation,
+suspect one and call {call} proactively rather than retrying blind."""
 
 
 def _build_known_quirks_section(ats: str | None) -> str:
@@ -914,13 +643,13 @@ def build_prompt(job: dict, tailored_resume: str,
     blocked_sso = ctx["blocked_sso"]
     display_name = ctx["display_name"]
     STD_PASSWORD = ctx["std_password"]
-    captcha_section = _build_captcha_section(proxy_string)
+    captcha_section = _build_captcha_section(proxy_string, ctx["ats"])
 
     # Dry-run: override submit instruction
     if dry_run:
         submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
     else:
-        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Only click Submit after confirming everything is correct."
+        submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Once everything is confirmed correct, call applytools__human_pause() ONCE, then click Submit."
 
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
@@ -1090,6 +819,11 @@ layout.
 - Fill ALL plain text fields in ONE browser_fill_form call. Not one at a time.
   Custom comboboxes are the exception -- see TOOL DISCIPLINE below; batching them
   into fill_form leaves them unset and poisons the field for the retry.
+  Optional: applytools__human_fill_form(fields) does the same batching but
+  types real keystrokes instead of setting the value instantly -- costs a
+  couple extra seconds of real time, not extra turns, since it's still ONE
+  call for every field passed. Use it for the last field or two before a
+  submit, not the whole form.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 
@@ -1156,8 +890,15 @@ layout.
     next ("United StatesUnited States"). Use
     applytools__fill_searchable_combobox(label_or_selector, value) as the FIRST
     attempt -- it does the open/type/select sequence in one call instead of the
-    manual multi-step version below. Only fall back to the manual version if it
-    returns an error: CLEAR the field first, then browser_type(text: value,
+    manual multi-step version below. If the label is ambiguous (e.g. both a
+    Phone-group "Country" combobox and a mailing-address "Country" combobox on
+    the same page), do NOT invent a compound selector string like
+    'Phone >> combobox "Country"' copied out of a snapshot -- that is not a
+    real selector and will always error "could not locate a combobox
+    trigger". Pass the plain label plus occurrence=N instead (0-indexed, DOM
+    order -- check a snapshot to see which position you want). Only fall back
+    to the manual version below if fill_searchable_combobox still returns an
+    error: CLEAR the field first, then browser_type(text: value,
     slowly: true) -- this fires one real keystroke per character in a SINGLE
     tool call, which both triggers the filter and avoids the cost of typing
     digit-by-digit with separate browser_press_key calls -- THEN click the
@@ -1185,6 +926,16 @@ layout.
   re-clicking blindly: check once and you know immediately instead of guessing.
   Keep working the field until it holds the right value -- do not give up on it
   and do not move on while it is wrong.
+- STUCK ON ONE FIELD? If the same field/widget has failed verification or
+  errored twice in a row (fill_searchable_combobox couldn't find a trigger,
+  a click didn't change the value, etc.), do NOT try a third blind variation.
+  Take playwright__browser_take_screenshot first. A snapshot only shows the
+  accessibility tree -- it cannot show a flyout panel rendered in the wrong
+  place, an invisible overlay eating your clicks, or a value that LOOKS right
+  in the DOM but isn't. One screenshot costs less than two more guesses that
+  might not even be addressing what's actually wrong. Look at it, form one
+  specific hypothesis about what's blocking you, then act on that hypothesis
+  -- not another repeat of what already failed twice.
 - A required field can appear only AFTER you answer another one (choosing "Other"
   for "how did you hear about this position" reveals a required "Details" box).
   Re-check the form for newly required fields before submitting.

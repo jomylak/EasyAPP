@@ -513,6 +513,7 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
                 (job["url"],),
             )
             needs_review += 1
+            conn.commit()
             continue
 
         dest_txt = TAILORED_DIR / f"{prefix}.txt"
@@ -538,10 +539,10 @@ def run_tailoring_passthrough(min_score: int = 7, limit: int = 20) -> dict:
             "WHERE url = ?",
             (str(dest_txt), now, track, job["url"]),
         )
+        conn.commit()
         approved += 1
         log.info("[PASSTHROUGH] track=%s -- %s", track, job["title"][:50])
 
-    conn.commit()
     elapsed = time.time() - t0
     log.info("Passthrough tailoring done in %.1fs: %d attached, %d needs_review",
               elapsed, approved, needs_review)
@@ -642,6 +643,26 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         results.append(result)
         stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
 
+        # Written the moment this job finishes, not batched until the whole
+        # backlog is done -- each tailor_resume() call is its own LLM round
+        # trip that can run minutes, so a batch-end write used to mean a
+        # crash or kill partway through lost every attempt counter and path
+        # for jobs already finished, and re-ran them from scratch on the
+        # next pass. Mirrors scorer.py's run_scoring per-result write.
+        now = datetime.now(timezone.utc).isoformat()
+        if result["status"] in ("approved", "approved_with_judge_warning"):
+            conn.execute(
+                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["path"], now, result["url"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                (result["url"],),
+            )
+        conn.commit()
+
         elapsed = time.time() - t0
         rate = completed / elapsed if elapsed > 0 else 0
         log.info(
@@ -652,23 +673,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             rate * 60,
             result["title"][:40],
         )
-
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
-    now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
-    for r in results:
-        if r["status"] in _success_statuses:
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
 
     elapsed = time.time() - t0
     log.info(

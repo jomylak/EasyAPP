@@ -195,6 +195,12 @@ def load_blocked_sso() -> list[str]:
     return cfg.get("blocked_sso", [])
 
 
+def load_low_captcha_risk_ats() -> set[str]:
+    """Load ATS platforms with no observed CAPTCHAs from sites.yaml."""
+    cfg = load_sites_config()
+    return set(cfg.get("low_captcha_risk_ats", []))
+
+
 def _quirks_path(ats: str) -> Path:
     slug = re.sub(r"[^a-z0-9]+", "_", ats.lower()).strip("_")
     return CONFIG_DIR / "known_quirks" / f"{slug}.md"
@@ -354,6 +360,32 @@ DEFAULTS = {
     # a cheap model can sit in a slow tool call well past the point of use.
     # ~20s per action on a cheap model, with 45+ actions in a real form.
     "goose_timeout": 2400,
+    # --- Post-apply Gmail status scan (scripts/scan_gmail_status.py) ---
+    # Gemini's free API tier (same GEMINI_API_KEY used for scoring), via
+    # goose's native "google" provider -- read-and-classify doesn't need the
+    # apply flow's paid models. OpenRouter has no free Gemini tier as of
+    # 2026-09 (confirmed against /api/v1/models), so this bypasses OpenRouter
+    # entirely for this one script. Override with `gmail_scan_model` /
+    # `gmail_scan_provider` in settings.json.
+    "gmail_scan_model": "gemini-3.1-flash-lite",
+    "gmail_scan_provider": "google",
+    # Falls back here (a free OpenRouter model) whenever the primary run
+    # fails outright -- bad/retired model id, 429, quota exhausted, anything
+    # -- so a scan never silently no-ops just because Gemini's free tier had
+    # a bad day. Verified live end-to-end (real gmail__search_emails tool
+    # calls, real results) on 2026-09-16 -- most ":free" OpenRouter models
+    # are NOT viable here: this account's privacy/data-training guardrail
+    # setting rejects several outright (nvidia/nemotron-3-super-120b-a12b:free
+    # -- "Free model training violation"), and z-ai/glm-5.2:free has no
+    # endpoint that supports tool calling at all ("No endpoints found that
+    # support tool use"), which this gmail-MCP flow requires. Don't swap this
+    # for another ":free" id without testing it the same way (see
+    # scripts/scan_gmail_status.py's _run_goose_once, callable directly).
+    "gmail_scan_fallback_model": "nex-agi/nex-n2.5-pro:free",
+    "gmail_scan_fallback_provider": "openrouter",
+    # Jobs resolved per run -- keeps the prompt (and the model's gmail search
+    # budget) bounded. The loop just picks this many up again next pass.
+    "gmail_scan_batch_size": 40,
 }
 
 
@@ -667,27 +699,61 @@ def load_env():
 
 
 def apply_proxy_configured() -> bool:
-    """Whether APPLY_PROXY is set at all, without minting a session.
+    """Whether APPLY_PROXY (the home-IP fallback relay) is set at all,
+    without minting a session.
 
     Cheap existence check for callers (chrome.launch_chrome's captcha-retry
-    gate) that need to know *if* a proxy retry is possible before deciding
-    to launch Chrome a second time -- see get_apply_proxy's docstring for why
-    the proxy itself is only requested reactively, per launch, not here.
+    gate) that need to know *if* a fallback retry is possible before
+    deciding to launch Chrome a second time -- see get_apply_proxy's
+    docstring for why the proxy itself is only requested reactively, per
+    launch, not here.
     """
     load_env()
     return bool(os.environ.get("APPLY_PROXY", "").strip())
 
 
+def _parse_proxy_string(raw: str, session_id: str | None = None) -> dict:
+    """host:port:user:pass -> {"host","port","user","pass","capsolver"}.
+
+    A literal "{session}" in the user field is substituted with session_id
+    when given, so a provider's sticky-session syntax (each spells it
+    differently, e.g. appending "-session-<id>" to the username) can be
+    configured without hardcoding any one vendor's format. Static per-worker
+    proxies have no session_id -- they're one fixed IP, not a rotating one.
+    """
+    parts = raw.split(":")
+    if len(parts) != 4:
+        raise ValueError(
+            f"Proxy format not recognized: {raw!r}. "
+            "Expected host:port:user:pass (user may contain '{session}')."
+        )
+    host, port, user, passwd = parts
+    if session_id is not None:
+        user = user.replace("{session}", session_id)
+
+    # CapSolver's "proxy" task field wants "type:ip:port:user:pass" -- verify
+    # this against CapSolver's current docs before relying on it; "http" is
+    # the common case but some providers require "socks5".
+    proxy_type = os.environ.get("APPLY_PROXY_TYPE", "http").strip() or "http"
+    public_host = os.environ.get("APPLY_PROXY_PUBLIC_HOST", "").strip() or host
+    public_port = os.environ.get("APPLY_PROXY_PUBLIC_PORT", "").strip() or port
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "pass": passwd,
+        "capsolver": f"{proxy_type}:{public_host}:{public_port}:{user}:{passwd}",
+    }
+
+
 def get_apply_proxy(session_id: str) -> dict | None:
     """Parse APPLY_PROXY into one sticky-session proxy for a single job.
 
-    Format: host:port:user:pass, same as the scraping-only PROXY var (see
+    This is the home-IP fallback tier: one relay, used exclusively by
+    launcher.py's dedicated home-fallback worker. Format:
+    host:port:user:pass, same as the scraping-only PROXY var (see
     discovery/jobspy.py's parse_proxy) but kept separate since this is a
     different concern -- apply-time browsing + CAPTCHA solving, not discovery.
-    A literal "{session}" in the user field is substituted with session_id,
-    so a provider's sticky-session syntax (each spells it differently, e.g.
-    appending "-session-<id>" to the username) can be configured without
-    hardcoding any one vendor's format.
 
     "host" here is whatever Chrome's local forwarder (chrome.py, loopback
     only) should connect to directly -- e.g. a home relay reachable over
@@ -708,29 +774,30 @@ def get_apply_proxy(session_id: str) -> dict | None:
     raw = os.environ.get("APPLY_PROXY", "").strip()
     if not raw:
         return None
+    return _parse_proxy_string(raw, session_id)
 
-    parts = raw.split(":")
-    if len(parts) != 4:
-        raise ValueError(
-            f"APPLY_PROXY format not recognized: {raw!r}. "
-            "Expected host:port:user:pass (user may contain '{session}')."
-        )
-    host, port, user, passwd = parts
-    user = user.replace("{session}", session_id)
 
-    # CapSolver's "proxy" task field wants "type:ip:port:user:pass" -- verify
-    # this against CapSolver's current docs before relying on it; "http" is
-    # the common case but some providers require "socks5".
-    proxy_type = os.environ.get("APPLY_PROXY_TYPE", "http").strip() or "http"
-    public_host = os.environ.get("APPLY_PROXY_PUBLIC_HOST", "").strip() or host
-    public_port = os.environ.get("APPLY_PROXY_PUBLIC_PORT", "").strip() or port
-    return {
-        "host": host,
-        "port": port,
-        "user": user,
-        "pass": passwd,
-        "capsolver": f"{proxy_type}:{public_host}:{public_port}:{user}:{passwd}",
-    }
+def get_worker_proxy_config(worker_id: int) -> dict | None:
+    """Parse APPLY_PROXY_<worker_id> into this worker's permanently-assigned
+    static residential proxy. Format: host:port:user:pass -- no "{session}"
+    templating, since a static IP isn't a rotating sticky session.
+
+    This is the primary proxy tier: every worker launches through its own
+    entry here from the start (see chrome.launch_chrome). Returns None if
+    APPLY_PROXY_<worker_id> isn't set, in which case the caller falls back
+    to launching direct.
+    """
+    load_env()
+    raw = os.environ.get(f"APPLY_PROXY_{worker_id}", "").strip()
+    if not raw:
+        return None
+    return _parse_proxy_string(raw)
+
+
+def static_proxy_configured(worker_id: int) -> bool:
+    """Whether this worker has its own static proxy configured."""
+    load_env()
+    return bool(os.environ.get(f"APPLY_PROXY_{worker_id}", "").strip())
 
 
 # ---------------------------------------------------------------------------

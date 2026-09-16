@@ -59,6 +59,12 @@ export interface JobRow {
   applied_at: string | null
   apply_error: string | null
   apply_cost_usd: number | null
+  // 'none' | 'oa' | 'interview' | 'rejected' | 'offer' | null -- read from
+  // Gmail by scripts/scan_gmail_status.py, or set by hand. See
+  // apply/post_apply_status.py.
+  post_apply_status: string | null
+  post_apply_status_at: string | null
+  post_apply_evidence: string | null
   queue_batch: string | null
   queue_position: number | null
   tailored_resume_path: string | null
@@ -245,6 +251,18 @@ export interface WorkerState {
   total_cost: number
   log_file: string | null
   url: string
+  // Last few tool-call / reasoning entries, oldest first, each prefixed
+  // with an HH:MM:SS timestamp -- see dashboard.py's add_worker_action().
+  // A reasoning entry (the model's own text, not a tool call) starts with
+  // the U+1F4AD emoji.
+  recent_actions: string[]
+  // Cumulative across every job this worker has run this session. Only
+  // updates once per finished job (the backends report usage at job
+  // completion, not progressively), so treat this as "as of the last
+  // finished job," not a counter ticking up mid-job.
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
 }
 
 export interface RunState {
