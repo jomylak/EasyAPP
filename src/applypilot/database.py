@@ -310,6 +310,19 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
     "review_status": "TEXT",
+    # Post-apply outcome, read from the candidate's own inbox (see
+    # apply/post_apply_status.py and scripts/scan_gmail_status.py) or set by
+    # hand from the dashboard when the automated match misses. NULL | 'none'
+    # (no signal yet) | 'oa' | 'interview' | 'rejected' | 'offer'.
+    "post_apply_status": "TEXT",
+    "post_apply_status_at": "TEXT",
+    # Subject/snippet of the email that produced the status, kept so a
+    # human can sanity-check an automated match without digging back through
+    # Gmail. NULL for a manual override.
+    "post_apply_evidence": "TEXT",
+    # 'gmail' (scan_gmail_status.py matched an email) or 'manual' (set from
+    # the dashboard) -- lets the scanner skip rows a human already corrected.
+    "post_apply_source": "TEXT",
     # Which backend drove this application, and how many LLM requests it took.
     # Together with apply_duration_ms these make backend/model comparison
     # measurable instead of anecdotal.

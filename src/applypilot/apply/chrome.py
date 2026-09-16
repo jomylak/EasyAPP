@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from applypilot import config
-from applypilot.apply import proxy_forwarder
+from applypilot.apply import geo_fingerprint, proxy_forwarder
 
 logger = logging.getLogger(__name__)
 
@@ -35,50 +35,38 @@ _chrome_procs: dict[int, subprocess.Popen] = {}
 # ThreadPoolExecutor), so this must be worker_id-scoped, not a bare module global.
 _worker_proxies: dict[int, str] = {}
 _worker_forwarder_stops: dict[int, callable] = {}
+# Human-readable label for whatever this worker's Chrome is currently using
+# ("static (America/Los_Angeles)", "home (...)", "direct") -- dashboard-only,
+# doesn't affect routing.
+_worker_proxy_labels: dict[int, str] = {}
 _chrome_lock = threading.Lock()
 
-# APPLY_PROXY is one home relay on one real IP -- it can only ever carry one
-# worker's traffic at a time, or concurrent proxied sessions would just be
-# multiple workers competing for (and overloading) that single connection.
-# Serializes launch_chrome(use_proxy=True) across every worker thread; see
-# acquire_proxy_slot/release_proxy_slot below.
-_proxy_lock = threading.Lock()
-
-
-def acquire_proxy_slot(stop_event=None, poll: float = 1.0) -> bool:
-    """Block until the single APPLY_PROXY slot is free, then hold it.
-
-    Caller must call release_proxy_slot() once done with the proxied Chrome
-    (after cleanup_worker, in the same try/finally that launched it) --
-    holding this is not tied to launch_chrome itself since the slot must stay
-    held for the whole proxied job, not just the launch.
-
-    Polls in `poll`-second slices (rather than blocking indefinitely) so a
-    worker waiting for the slot still notices `stop_event` and can give up.
-    Returns False if stop_event was set before the slot became free.
-    """
-    while True:
-        if _proxy_lock.acquire(timeout=poll):
-            return True
-        if stop_event is not None and stop_event.is_set():
-            return False
-
-
-def release_proxy_slot() -> None:
-    """Release the slot acquired by acquire_proxy_slot()."""
-    _proxy_lock.release()
+# APPLY_PROXY is the home-IP fallback: one relay on one real IP. Exactly one
+# worker (launcher.py's dedicated home-fallback worker) ever launches with
+# home_fallback=True, so unlike the old design there's no contention to
+# serialize here -- that worker permanently and exclusively owns this
+# resource the same way every other worker owns its own static proxy.
 
 
 def get_worker_proxy(worker_id: int) -> str | None:
     """The CapSolver-format proxy string ("type:host:port:user:pass") this
-    worker's currently-launched Chrome is using, or None if APPLY_PROXY isn't
-    configured, or if this Chrome was launched with use_proxy=False (the
-    default -- see launch_chrome's docstring). CapSolver must solve through
-    the exact same egress IP Chrome is browsing from -- see get_apply_proxy's
-    docstring for why.
+    worker's currently-launched Chrome is using (its static proxy or, during
+    a home_fallback=True relaunch, the home relay), or None if this Chrome
+    was launched fully direct. CapSolver must solve through the exact same
+    egress IP Chrome is browsing from -- see get_apply_proxy's docstring for
+    why.
     """
     with _chrome_lock:
         return _worker_proxies.get(worker_id)
+
+
+def get_worker_proxy_label(worker_id: int) -> str:
+    """Human-readable summary of what this worker's Chrome is using, e.g.
+    "static (America/Los_Angeles)", "home (...)", or "direct" if no proxy
+    is configured for it at all. Dashboard display only.
+    """
+    with _chrome_lock:
+        return _worker_proxy_labels.get(worker_id, "direct")
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +298,8 @@ def _wait_for_cdp(port: int, worker_id: int, proc: subprocess.Popen,
 
 
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False, use_proxy: bool = False,
+                  headless: bool = False, use_proxy: bool = True,
+                  home_fallback: bool = False,
                   extra_args: list[str] | None = None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
@@ -318,14 +307,19 @@ def launch_chrome(worker_id: int, port: int | None = None,
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
-        use_proxy: Route this Chrome instance through APPLY_PROXY (if
-            configured). Default False -- every job starts on a direct
-            connection. launcher.py's worker loop only passes True for the
-            one relaunch it does after a job's first attempt hits a captcha
-            wall, so the home-relay proxy only ever carries the traffic of
-            jobs that actually need CapSolver's IP to match Chrome's, instead
-            of every job on every worker regardless of whether it ever sees
-            a captcha.
+        use_proxy: Route this Chrome instance through its own static
+            residential proxy, APPLY_PROXY_<worker_id> (if configured).
+            Default True -- every job launches through this worker's
+            permanently-assigned proxy from the start, never the VM's own
+            IP (already flagged by shared threat intel regardless of site).
+            Falls back to a direct connection only if no static proxy is
+            configured for this worker_id at all.
+        home_fallback: Route through APPLY_PROXY, the single shared home-IP
+            relay, instead of this worker's static proxy. Overrides
+            use_proxy. launcher.py runs exactly one dedicated worker with
+            this always True, draining the backlog of jobs whose primary
+            static-proxy attempt hit a captcha wall (see
+            launcher._select_captcha_backlog) -- the last-resort tier.
         extra_args: Additional Chrome command-line flags, appended after the
             standard set. For one-off experiments (e.g. scripts/fingerprint_check.py
             trying `--use-angle=swiftshader`) without changing every worker's
@@ -349,21 +343,25 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     chrome_exe = config.get_chrome_path()
 
-    # A fresh sticky-session proxy per job: this worker's Chrome and the
-    # CAPTCHA solve for whatever job it runs must share one egress IP, since
-    # the whole point is making the solve session and the submitting session
-    # look like the same real user. Only requested when the caller passes
-    # use_proxy=True -- APPLY_PROXY being set is necessary but not
-    # sufficient; see this function's docstring for why it's opt-in per
-    # launch rather than automatic just because the env var exists.
+    # home_fallback mints a fresh sticky session on the single shared home
+    # relay (this worker's Chrome and the CAPTCHA solve for whatever job it
+    # runs must share one egress IP -- see get_apply_proxy's docstring).
+    # Otherwise this worker's own static proxy is permanent, no session
+    # templating needed since the IP never rotates.
     proxy = None
-    if use_proxy:
+    proxy_kind = None
+    if home_fallback:
         import secrets
         session_id = f"w{worker_id}-{secrets.token_hex(4)}"
         proxy = config.get_apply_proxy(session_id)
+        proxy_kind = "home"
+    elif use_proxy:
+        proxy = config.get_worker_proxy_config(worker_id)
+        proxy_kind = "static"
 
     _stop_forwarder_for_worker(worker_id)
     proxy_port = None
+    geo = None
     if proxy:
         proxy_port = BASE_PROXY_PORT + worker_id
         stop = proxy_forwarder.start_forwarder(
@@ -376,9 +374,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         with _chrome_lock:
             _worker_proxies[worker_id] = proxy["capsolver"]
             _worker_forwarder_stops[worker_id] = stop
+        geo = geo_fingerprint.lookup_geo(f"{proxy['host']}:{proxy['port']}", proxy_port)
+        label = f"{proxy_kind} ({geo['timezone']})" if geo else proxy_kind
+        with _chrome_lock:
+            _worker_proxy_labels[worker_id] = label
     else:
         with _chrome_lock:
             _worker_proxies.pop(worker_id, None)
+            _worker_proxy_labels[worker_id] = "direct"
 
     cmd = [
         chrome_exe,
@@ -427,16 +430,28 @@ def launch_chrome(worker_id: int, port: int | None = None,
     ]
     if proxy_port:
         cmd.append(f"--proxy-server=127.0.0.1:{proxy_port}")
+    if geo:
+        cmd.append(f"--lang={geo['locale']}")
     if headless:
         cmd.append("--headless=new")
     if extra_args:
         cmd.extend(extra_args)
 
     # On Unix, start in a new process group so we can kill the whole tree
+    import os
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if platform.system() != "Windows":
-        import os
         kwargs["preexec_fn"] = os.setsid
+
+    # TZ is read once by Chromium's ICU layer at process startup and then
+    # applies to every render process/tab/popup it spawns -- matching it to
+    # the proxy's real exit geo here covers SSO popups too, which a CDP
+    # Emulation.setTimezoneOverride call would miss without reapplying
+    # per-tab.
+    env = os.environ.copy()
+    if geo:
+        env["TZ"] = geo["timezone"]
+    kwargs["env"] = env
 
     proc = subprocess.Popen(cmd, **kwargs)
     with _chrome_lock:

@@ -32,6 +32,14 @@ blocked_sso:
   - "auth0.com"
   - "sso.cisco.com"
 
+# ── Low-CAPTCHA-risk ATS platforms ────────────────────────────────────────
+# Platforms that have shown no CAPTCHAs in observed runs, so the agent gets
+# an abbreviated CAPTCHA section instead of the full playbook. Update this
+# list as more platforms are observed -- it does not need a code change.
+low_captcha_risk_ats:
+  - "Greenhouse"
+  - "Workday"
+
 # ── Base URLs for URL resolution ─────────────────────────────────────────
 # Used by detail enrichment to resolve relative URLs scraped from sites.
 # Sites not listed here (or with null) cannot have relative URLs resolved.

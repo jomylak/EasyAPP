@@ -14,7 +14,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,10 +48,34 @@ class WorkerState:
     jobs_failed: int = 0
     jobs_done: int = 0
     total_cost: float = 0.0
+    # Cumulative across every job this worker has run this session -- like
+    # total_cost, these only land once per job (the backends' own streaming
+    # protocols report token usage at job completion, not progressively
+    # mid-job), so "live" here means "as fresh as the last finished job",
+    # not a running counter within the job in progress.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
     log_file: Path | None = None
     # The job's URL, so a consumer can join a live worker back to its table
     # row. The terminal dashboard has no use for it; the web UI does.
     url: str = ""
+    # Rolling window of this worker's own recent tool-call descriptions
+    # (timestamped), independent of the run-wide `_events` log below -- the
+    # web UI's per-job expansion shows a single worker's stream, not every
+    # worker interleaved. Capped at MAX_WORKER_ACTIONS the same way `_events`
+    # is capped, for the same reason (a browser only needs it fresh, not
+    # complete).
+    recent_actions: list[str] = field(default_factory=list)
+    # What this worker's Chrome is currently egressing through, e.g.
+    # "static (America/Los_Angeles)", "home (...)", "direct" -- see
+    # chrome.get_worker_proxy_label.
+    proxy_label: str = ""
+    # Cumulative captcha walls this worker has hit this session, on whatever
+    # proxy it's currently assigned -- a rising count on one worker while
+    # others stay flat is the signal that its static IP is degrading and
+    # worth burning a manual replacement on.
+    captcha_hits: int = 0
 
 
 # Module-level state (thread-safe via _lock)
@@ -59,6 +83,7 @@ _worker_states: dict[int, WorkerState] = {}
 _events: list[str] = []
 _lock = threading.Lock()
 MAX_EVENTS = 8
+MAX_WORKER_ACTIONS = 10
 
 # Run-level facts the web UI needs but no single worker owns. Set once by the
 # launcher via begin_run(); left empty when nothing has started a run.
@@ -185,6 +210,37 @@ def update_state(worker_id: int = 0, **kwargs) -> None:
         _publish()
 
 
+def accumulate_usage(worker_id: int, cost: float, stats: dict) -> None:
+    """Add one turn's cost/token usage onto the worker's running totals."""
+    with _lock:
+        state = _worker_states.get(worker_id)
+        if state is None:
+            return
+        state.total_cost += cost
+        state.input_tokens += stats.get("input_tokens") or 0
+        state.output_tokens += stats.get("output_tokens") or 0
+        state.cache_read_tokens += stats.get("cache_read") or 0
+        _publish()
+
+
+def add_worker_action(worker_id: int, desc: str) -> None:
+    """Append a timestamped tool-call description to a worker's own log.
+
+    Kept separate from `update_state(last_action=...)`, which callers still
+    call for the single-line summary the table row shows -- this feeds the
+    web UI's expanded per-job view instead, which wants the last few steps,
+    not just the latest one.
+    """
+    ts = datetime.now().strftime("%H:%M:%S")
+    with _lock:
+        state = _worker_states.get(worker_id)
+        if state is not None:
+            state.recent_actions.append(f"{ts} {desc}")
+            if len(state.recent_actions) > MAX_WORKER_ACTIONS:
+                state.recent_actions.pop(0)
+        _publish()
+
+
 def get_state(worker_id: int = 0) -> WorkerState | None:
     """Read the worker's current state."""
     with _lock:
@@ -236,6 +292,7 @@ def render_dashboard() -> Table:
     table.add_column("Time", width=6, justify="right")
     table.add_column("Acts", width=5, justify="right")
     table.add_column("Last Action", min_width=20, max_width=35, no_wrap=True)
+    table.add_column("Proxy", width=22, no_wrap=True)
     table.add_column("OK", width=4, justify="right", style="green")
     table.add_column("Fail", width=4, justify="right", style="red")
     table.add_column("Cost", width=8, justify="right")
@@ -264,6 +321,7 @@ def render_dashboard() -> Table:
             elapsed,
             str(s.actions) if s.actions else "",
             s.last_action[:35] if s.last_action else "",
+            f"{s.proxy_label[:20]} ({s.captcha_hits})" if s.captcha_hits else s.proxy_label[:22],
             str(s.jobs_applied),
             str(s.jobs_failed),
             f"${s.total_cost:.3f}" if s.total_cost else "",
@@ -275,7 +333,7 @@ def render_dashboard() -> Table:
     # Totals row
     table.add_section()
     table.add_row(
-        "", "", "", "", "", "TOTAL",
+        "", "", "", "", "", "TOTAL", "",
         str(total_applied), str(total_failed), f"${total_cost:.3f}",
         style="bold",
     )

@@ -33,13 +33,14 @@ from applypilot.apply.ineligibility import sweep_company_siblings
 from applypilot.apply.backends import get_backend, interrupt_all_backends
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    cleanup_on_exit, BASE_CDP_PORT,
-    acquire_proxy_slot, release_proxy_slot,
+    cleanup_on_exit, BASE_CDP_PORT, get_worker_proxy_label,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, render_full, get_totals,
     begin_run, end_run,
 )
+from applypilot.apply import humanizer
+from applypilot.apply.expiry_check import check_listing_expired
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +295,12 @@ def _select_ranked(conn, min_score: int, skip: set,
         FROM jobs
         WHERE tailored_resume_path IS NOT NULL
           AND (apply_status IS NULL OR apply_status = 'failed')
+          -- A captcha hit on this row's primary static-proxy attempt is
+          -- waiting for the dedicated home-fallback worker (see
+          -- _select_captcha_backlog), not another primary worker on a
+          -- different static IP -- exclude it here so it can't be
+          -- double-claimed from both queues.
+          AND (apply_error IS NULL OR apply_error != 'captcha')
           -- Pay below the candidate's floor is decided at scoring time
           -- (free) rather than burning an apply run to discover it.
           -- NULL/'unknown' still applies: most postings state no pay.
@@ -347,13 +354,40 @@ def _select_ranked(conn, min_score: int, skip: set,
          + [config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
 
 
+def _select_captcha_backlog(conn, deferred: set):
+    """Jobs whose primary-tier static proxy hit a captcha wall, waiting for
+    the dedicated home-fallback worker's retry (see worker_loop's
+    home_fallback lane). mark_result leaves these non-permanent (apply_attempts
+    below the 99 sentinel) specifically so this query can find them --
+    _select_ranked excludes them so a different primary worker never grabs
+    one first. If this retry also hits a captcha, it's marked permanent
+    (apply_attempts=99) and drops out of both queues for good.
+    """
+    skip_clause = ""
+    params: list = []
+    if deferred:
+        skip_clause = f"AND url NOT IN ({','.join('?' * len(deferred))})"
+        params.extend(sorted(deferred))
+    return conn.execute(f"""
+        SELECT {_JOB_COLUMNS}
+        FROM jobs
+        WHERE apply_status = 'failed'
+          AND apply_error = 'captcha'
+          AND apply_attempts < 99
+          {skip_clause}
+        ORDER BY COALESCE(last_attempted_at, applied_at)
+        LIMIT 1
+    """, params).fetchone()
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0,
                 exclude_urls: set[str] | None = None,
-                queue_batch: str | None = None) -> dict | None:
+                queue_batch: str | None = None,
+                home_fallback: bool = False) -> dict | None:
     """Atomically acquire the next job to apply to.
 
-    Three ways to choose a row, one way to claim it. The claim is a
+    Four ways to choose a row, one way to claim it. The claim is a
     BEGIN IMMEDIATE transaction that flips apply_status to 'in_progress' and
     stamps agent_id, which is the only thing keeping parallel workers off each
     other's jobs.
@@ -367,6 +401,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             this the same top-scoring job is handed back every iteration.
         queue_batch: Drain this user-selected batch in the order the user put
             it in, ignoring the ranked mode's gates entirely.
+        home_fallback: This is the dedicated home-fallback worker -- draw
+            exclusively from the captcha backlog (_select_captcha_backlog)
+            instead of target_url/queue_batch/ranked selection.
 
     Returns:
         Job dict, or None if there is nothing left to claim.
@@ -392,7 +429,9 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         try:
             conn.execute("BEGIN IMMEDIATE")
 
-            if target_url:
+            if home_fallback:
+                row = _select_captcha_backlog(conn, deferred)
+            elif target_url:
                 row = _select_target(conn, target_url)
             elif queue_batch:
                 row = _select_queued(conn, queue_batch, deferred)
@@ -904,13 +943,30 @@ _is_permanent_failure = outcomes.is_permanent_failure
 # Worker loop
 # ---------------------------------------------------------------------------
 
+def _relaunch_chrome(worker_id: int, port: int, headless: bool, humanizer_stop,
+                      home_fallback: bool = False):
+    """Launch (or relaunch) Chrome for a worker and restart its humanizer.
+
+    Stops the previous humanizer thread first if one was already running, so
+    it never keeps driving mouse/typing jitter against a browser that's been
+    torn down.
+    """
+    if humanizer_stop is not None:
+        humanizer.stop(humanizer_stop)
+    chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
+                                home_fallback=home_fallback)
+    update_state(worker_id, proxy_label=get_worker_proxy_label(worker_id))
+    return chrome_proc, humanizer.start(port)
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
                 backend: str = "goose",
                 fallback_backend: str | None = None,
-                queue_batch: str | None = None) -> tuple[int, int]:
+                queue_batch: str | None = None,
+                home_fallback: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -926,12 +982,19 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             up for a driver-side reason. None disables the retry.
         queue_batch: Drain this user-selected batch instead of the ranked
             queue. See acquire_job.
+        home_fallback: This is the dedicated home-fallback worker: launches
+            Chrome through the shared home-IP relay instead of a static
+            proxy, and only ever draws from the captcha backlog (see
+            acquire_job/_select_captcha_backlog) rather than the normal
+            queue. A captcha hit here is final -- there's no further tier
+            to escalate to.
 
     Returns:
         Tuple of (applied_count, failed_count).
     """
     applied = 0
     failed = 0
+    captcha_hits = 0  # this worker's static proxy hitting a captcha wall -- see below
     attempted: set[str] = set()  # this session only -- see acquire_job docstring
     continuous = limit == 0
     jobs_done = 0
@@ -947,7 +1010,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         job = acquire_job(target_url=target_url, min_score=min_score,
                           worker_id=worker_id, exclude_urls=attempted,
-                          queue_batch=queue_batch)
+                          queue_batch=queue_batch, home_fallback=home_fallback)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -973,11 +1036,31 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         empty_polls = 0
         attempted.add(job["url"])
 
+        if not dry_run:
+            # Catch a closed/expired listing with a plain page fetch before
+            # a worker spends browser-agent tokens discovering the same
+            # thing the hard way (see expiry_check.py). Skipped in dry runs,
+            # which must leave no trace -- same reasoning as _restore_status.
+            expiry_reason = check_listing_expired(job["application_url"] or job["url"])
+            if expiry_reason:
+                add_event(f"[W{worker_id}] Pre-check: expired -- {job['title'][:30]}")
+                mark_result(job["url"], "failed", expiry_reason, permanent=True)
+                update_state(worker_id, status="expired",
+                             last_action="expired (pre-check, no browser spend)")
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
+                jobs_done += 1
+                if target_url:
+                    break
+                continue
+
         chrome_proc = None
-        holding_proxy_slot = False
+        humanizer_stop = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            chrome_proc, humanizer_stop = _relaunch_chrome(
+                worker_id, port, headless, humanizer_stop, home_fallback=home_fallback)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                           model=model, dry_run=dry_run,
@@ -985,34 +1068,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             run_stats = get_backend(backend).pop_run_stats(worker_id)
             used_backend = backend
 
-            # One retry through APPLY_PROXY when the first (direct) attempt
-            # hit a captcha wall. Whether a job needs CapSolver's IP to match
-            # Chrome's is only knowable after a captcha actually shows up, so
-            # the proxy can't be decided at the first launch_chrome call --
-            # see chrome.launch_chrome's use_proxy docstring. This keeps the
-            # home-relay proxy off the vast majority of jobs that never see a
-            # captcha at all, instead of routing every session through it.
-            if (not dry_run
-                    and not _stop_event.is_set()
-                    and result.split(":", 1)[-1].strip().lower() == "captcha"
-                    and config.apply_proxy_configured()):
-                if chrome_proc:
-                    cleanup_worker(worker_id, chrome_proc)
-                    chrome_proc = None
-                # There's exactly one home relay IP behind APPLY_PROXY, so
-                # only one worker may be routed through it at a time -- wait
-                # our turn rather than stacking concurrent proxied sessions
-                # onto the same connection (see acquire_proxy_slot).
-                update_state(worker_id, last_action="waiting for proxy slot")
-                holding_proxy_slot = acquire_proxy_slot(stop_event=_stop_event)
-                if holding_proxy_slot:
-                    add_event(f"[W{worker_id}] Captcha wall, retrying via proxy")
-                    chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
-                                                use_proxy=True)
-                    result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                                  model=model, dry_run=dry_run,
-                                                  backend=backend)
-                    run_stats = get_backend(backend).pop_run_stats(worker_id)
+            if result.split(":", 1)[-1].strip().lower() == "captcha":
+                captcha_hits += 1
+                update_state(worker_id, captcha_hits=captcha_hits)
 
             # Second chance on the fallback backend. Only for failures that
             # mean the *driver* gave up (outcomes.should_fall_back) -- a job
@@ -1031,7 +1089,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 # mid-form, and the fallback prompt assumes a fresh start.
                 if chrome_proc:
                     cleanup_worker(worker_id, chrome_proc)
-                chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+                chrome_proc, humanizer_stop = _relaunch_chrome(
+                    worker_id, port, headless, humanizer_stop)
                 result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                               model=model, dry_run=dry_run,
                                               backend=fallback_backend)
@@ -1071,8 +1130,15 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
+                permanent = _is_permanent_failure(result)
+                if reason.strip().lower() == "captcha" and not home_fallback:
+                    # Leave this non-permanent -- the dedicated home-fallback
+                    # worker still owes it one retry via _select_captcha_backlog.
+                    # Only that worker's own captcha hit (home_fallback=True
+                    # here) is the true dead end.
+                    permanent = False
                 mark_result(job["url"], "failed", reason,
-                            permanent=_is_permanent_failure(result),
+                            permanent=permanent,
                             duration_ms=duration_ms, backend=used_backend,
                             llm_requests=llm_requests, stats=run_stats)
                 if reason.startswith("grad_date_mismatch"):
@@ -1095,10 +1161,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
+            humanizer.stop(humanizer_stop)
             if chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
-            if holding_proxy_slot:
-                release_proxy_slot()
 
         jobs_done += 1
         if target_url:
@@ -1184,7 +1249,20 @@ def main(limit: int = 1, target_url: str | None = None,
     for i in range(workers):
         init_worker(i)
 
+    # One dedicated worker permanently assigned to the home-IP relay,
+    # draining the captcha backlog every other worker's static proxy leaves
+    # behind (see worker_loop's home_fallback param). Only spun up when
+    # multi-worker (a single-worker run is dev/testing, not the real
+    # pipeline) and when there's actually a home relay configured to drain
+    # into -- otherwise captcha hits just sit in the backlog unclaimed,
+    # same as today when APPLY_PROXY is unset.
+    home_worker_id = workers if (workers > 1 and config.apply_proxy_configured()) else None
+    if home_worker_id is not None:
+        init_worker(home_worker_id)
+
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
+    if home_worker_id is not None:
+        worker_label += " + 1 home-fallback"
     console.print(
         f"Launching apply pipeline ({mode_label}, {worker_label}, "
         f"backend={backend}, poll every {POLL_INTERVAL}s)..."
@@ -1247,7 +1325,8 @@ def main(limit: int = 1, target_url: str | None = None,
                 else:
                     limits = [0] * workers  # continuous mode
 
-                with ThreadPoolExecutor(max_workers=workers,
+                pool_size = workers + (1 if home_worker_id is not None else 0)
+                with ThreadPoolExecutor(max_workers=pool_size,
                                         thread_name_prefix="apply-worker") as executor:
                     futures = {
                         executor.submit(
@@ -1265,6 +1344,23 @@ def main(limit: int = 1, target_url: str | None = None,
                         ): i
                         for i in range(workers)
                     }
+                    home_future = None
+                    if home_worker_id is not None:
+                        # Always continuous -- it just idle-polls an empty
+                        # backlog until the primary workers (above) start
+                        # feeding it captcha hits, or the run ends and
+                        # _stop_event below tells it to stop too.
+                        home_future = executor.submit(
+                            worker_loop,
+                            worker_id=home_worker_id,
+                            limit=0,
+                            headless=headless,
+                            model=model,
+                            dry_run=dry_run,
+                            backend=backend,
+                            fallback_backend=fallback_backend,
+                            home_fallback=True,
+                        )
 
                     results: list[tuple[int, int]] = []
                     for future in as_completed(futures):
@@ -1274,6 +1370,20 @@ def main(limit: int = 1, target_url: str | None = None,
                         except Exception:
                             logger.exception("Worker %d crashed", wid)
                             results.append((0, 0))
+
+                    if home_future is not None:
+                        # Primary workers are done -- nothing left to feed
+                        # the backlog, so signal the home worker to stop
+                        # polling instead of running forever. Safe to set
+                        # here regardless of how the run ended -- run()'s own
+                        # finally block below sets it again unconditionally.
+                        _stop_event.set()
+                        try:
+                            home_result = home_future.result()
+                        except Exception:
+                            logger.exception("Home-fallback worker crashed")
+                            home_result = (0, 0)
+                        results.append(home_result)
 
                 total_applied = sum(r[0] for r in results)
                 total_failed = sum(r[1] for r in results)

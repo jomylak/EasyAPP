@@ -24,10 +24,25 @@ back to raw ``browser_*`` tools instead of getting stuck on a false success.
 ``decline_eeo`` is the one exception -- it's inherently best-effort (a page
 may legitimately have no EEO section), so "nothing matched" is a valid,
 informative result rather than a disguised failure.
+
+``handle_captcha`` is a different kind of addition to this file: not friction
+from our own tooling, but ~15,000 characters of raw JavaScript that used to
+live directly in the prompt (detect + NoneCap solve/inject + CapSolver's
+3-step createTask/poll/inject, repeated per vendor type) -- the single
+largest chunk of the whole prompt, resent on every job regardless of whether
+that job's ATS ever shows a captcha. Moving the (unchanged) vendor-dispatch
+and budget logic into one deterministic tool cut prompt.py by about 18%.
+Vendor strategy is the other captcha/proxy work's territory; this only moved
+where the mechanics live, not what they do.
 """
 
 import argparse
+import asyncio
+import json
+import os
+import random
 import re
+import urllib.request
 
 from mcp.server.mcpserver import MCPServer
 from playwright.async_api import Page, async_playwright
@@ -119,11 +134,23 @@ def _label_variants(label_or_selector: str) -> list[str]:
     return variants
 
 
-async def _locate_combobox(page: Page, label_or_selector: str):
+async def _locate_combobox(page: Page, label_or_selector: str, occurrence: int = 0):
     """Best-effort trigger locator: label, then placeholder, then visible
     text -- each tried against the label as given and with a trailing
     required-marker stripped (see `_label_variants`) -- then a raw CSS
-    selector as the last resort."""
+    selector as the last resort.
+
+    ``occurrence`` picks the Nth match (0-indexed, DOM order) instead of
+    always the first -- needed when a label is ambiguous, e.g. a form with
+    both a Phone-group "Country" combobox and a mailing-address "Country"
+    combobox. Measured against real traces: without this, the model tried
+    to disambiguate by passing a snapshot-shorthand string as
+    ``label_or_selector`` instead (like ``'Phone >> combobox "Country"'``,
+    copied straight out of browser_snapshot's pretty-printed accessibility
+    tree) -- that's not a real CSS selector or accessible name, so it always
+    failed with "could not locate a combobox trigger", burning several turns
+    before falling back to manual browser_click/browser_find.
+    """
     for text in _label_variants(label_or_selector):
         candidates = [
             page.get_by_label(text),
@@ -132,54 +159,195 @@ async def _locate_combobox(page: Page, label_or_selector: str):
         ]
         for locator in candidates:
             try:
-                if await locator.count() > 0:
-                    return locator.first
+                if await locator.count() > occurrence:
+                    return locator.nth(occurrence)
             except Exception:
                 continue
     try:
         locator = page.locator(label_or_selector)
-        if await locator.count() > 0:
-            return locator.first
+        if await locator.count() > occurrence:
+            return locator.nth(occurrence)
     except Exception:
         pass
     return None
 
 
-@mcp.tool()
-async def fill_searchable_combobox(label_or_selector: str, value: str) -> str:
-    """Fill a searchable/custom combobox in one deterministic call.
+async def _click_jittered(locator, timeout: int = 5000) -> None:
+    """Click at a randomized point inside the element instead of dead-center.
 
-    Opens the combobox, types ``value`` into the filter input that appears,
-    waits for a matching option, and clicks it. Replaces the improvised
-    open-then-type-then-click sequence agents otherwise re-derive per ATS
-    (custom dropdown widgets vary by vendor but this pattern is consistent).
+    Real users don't click pixel-perfect centroids; a locator's default
+    .click() always does. Falls back to a plain center click when the
+    bounding box can't be read (zero-size/off-screen elements some ATS
+    widgets use for the real underlying input).
+    """
+    position = None
+    try:
+        box = await locator.bounding_box(timeout=timeout)
+        if box and box["width"] > 4 and box["height"] > 4:
+            position = {
+                "x": box["width"] * random.uniform(0.3, 0.7),
+                "y": box["height"] * random.uniform(0.3, 0.7),
+            }
+    except Exception:
+        pass
+    await locator.click(timeout=timeout, position=position)
+
+
+@mcp.tool()
+async def human_pause() -> str:
+    """Pause for a random ~2-6 seconds, simulating a final human review beat
+    before submitting. Call this once, right before clicking the final
+    Submit/Apply button -- not between every field, which would turn one
+    cheap tool call into many and burn real turns/cost for no benefit.
+
+    A programmatic fill-then-submit with zero pause between finishing the
+    form and clicking Submit is an unnatural, inhumanly fast pattern; this is
+    a genuine wall-clock delay (not a fake signal), costs one extra tool
+    call for the whole application, and adds no LLM tokens beyond that.
+    """
+    # Log-normal, not flat -- see humanizer._human_interval for why a
+    # uniform spread is itself a mild timing tell.
+    await asyncio.sleep(min(8.0, max(2.0, random.lognormvariate(1.15, 0.35))))
+    return "ok: paused"
+
+
+@mcp.tool()
+async def fill_searchable_combobox(label_or_selector: str, value: str, occurrence: int = 0) -> str:
+    """Fill a searchable OR static combobox/listbox in one deterministic call.
+
+    Opens the trigger, then looks for the matching option immediately --
+    static/native listboxes (confirmed on Ashby's EEO dropdowns) reveal every
+    option as soon as they're opened, with no filter input to type into.
+    Typing into one of these does nothing productive and previously burned a
+    full 5-second wait on every failure (measured: 6 of 12 real
+    fill_searchable_combobox calls on one Ashby form failed this way, on
+    Ethnicity/Gender fields specifically). Only if the option isn't there
+    within a short beat does this fall back to typing ``value`` as a filter
+    and waiting again -- the original behavior, for genuinely searchable/
+    typeahead comboboxes.
 
     Args:
         label_or_selector: Visible label text, placeholder text, or a raw
-            CSS selector for the combobox's clickable trigger element.
-        value: Text to type into the filter and match against options.
+            CSS selector for the combobox's clickable trigger element. Plain
+            text only -- do NOT paste a snapshot-shorthand fragment like
+            ``'Phone >> combobox "Country"'`` copied out of browser_snapshot,
+            that is not a real selector and will always fail to locate. If
+            the label is ambiguous (e.g. a page with both a phone-country and
+            a mailing-address-country combobox both labeled "Country"), pass
+            the plain label plus ``occurrence`` instead.
+        value: Text to match against options (and to type, for the
+            searchable-combobox fallback path).
+        occurrence: 0-indexed match to use when this label matches more than
+            one element on the page, in DOM order (0 = first/default). Check
+            a snapshot to see which position you want before guessing.
 
     Returns a short ``ok: ...`` / ``error: ...`` status string.
     """
     page = await _get_page()
-    trigger = await _locate_combobox(page, label_or_selector)
+    trigger = await _locate_combobox(page, label_or_selector, occurrence)
     if trigger is None:
-        return f"error: could not locate a combobox trigger for {label_or_selector!r}"
+        return f"error: could not locate a combobox trigger for {label_or_selector!r} (occurrence={occurrence})"
     try:
-        await trigger.click(timeout=5000)
-        await page.keyboard.type(value, delay=40)
-        await page.wait_for_timeout(400)
-        option = page.get_by_role("option", name=value, exact=False).first
-        await option.wait_for(state="visible", timeout=5000)
+        await _click_jittered(trigger)
+    except Exception as exc:
+        return f"error: could not open combobox {label_or_selector!r}: {exc}"
+
+    option = page.get_by_role("option", name=value, exact=False).first
+    try:
+        await option.wait_for(state="visible", timeout=1200)
+    except Exception:
+        try:
+            await page.keyboard.type(value, delay=40)
+            await page.wait_for_timeout(400)
+            await option.wait_for(state="visible", timeout=5000)
+        except Exception as exc:
+            return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}: {exc}"
+
+    try:
         option_text = (await option.text_content() or value).strip()
-        await option.click(timeout=5000)
+        await _click_jittered(option)
     except Exception as exc:
         return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}: {exc}"
     return f"ok: selected {option_text!r} in combobox {label_or_selector!r}"
 
 
+def _keystroke_delay_s() -> float:
+    """Per-character delay, gaussian around real fast-typist speed, not a
+    flat value -- flat inter-keystroke timing is a known bot-typing tell."""
+    return max(0.02, random.gauss(0.07, 0.03))
+
+
+async def _human_type(page: Page, value: str) -> None:
+    """Type value one character at a time with per-keystroke jitter.
+
+    Each call dispatches real keydown/keypress/input/keyup events, unlike
+    browser_fill_form's underlying locator.fill() (one JS value-set + a
+    single input event, no keystrokes at all -- the least human-looking
+    part of the whole apply flow, and out of this project's control since
+    it lives in the upstream @playwright/mcp package). This is the
+    alternative for the fields worth the realism.
+    """
+    for ch in value:
+        await page.keyboard.type(ch, delay=0)
+        await asyncio.sleep(_keystroke_delay_s())
+
+
 @mcp.tool()
-async def read_field(label_or_selector: str) -> str:
+async def human_fill_form(fields: list[dict]) -> str:
+    """Fill several text fields in one call, each with real per-keystroke
+    typing (jittered delay) and a jittered click position -- the human-typing
+    counterpart to browser_fill_form, which sets values instantly with no
+    keystroke events at all.
+
+    Same batching contract as browser_fill_form: pass every field you want
+    typed in ONE call, not one call per field -- that's what keeps this at
+    the same LLM turn/token cost as browser_fill_form. The only added cost
+    is real wall-clock time (typing at ~70ms/char), not tool calls or
+    tokens -- a handful of fields adds a couple of seconds, not minutes.
+
+    Not a wholesale browser_fill_form replacement: reach for this on the
+    fields worth the realism (e.g. right before a submit, or an ATS known to
+    fingerprint keystroke timing), and keep browser_fill_form for the bulk
+    of a long form where that's not worth the extra seconds.
+
+    Args:
+        fields: list of {"label_or_selector": str, "value": str,
+            "occurrence": int (optional, default 0)} -- same label/
+            placeholder/text/CSS-selector resolution as
+            fill_searchable_combobox.
+
+    Returns ``ok: filled N field(s)`` (with any per-field errors appended)
+    or ``error: ...`` if every field failed.
+    """
+    page = await _get_page()
+    filled: list[str] = []
+    errors: list[str] = []
+    for f in fields:
+        label = f.get("label_or_selector", "")
+        value = f.get("value", "")
+        occurrence = f.get("occurrence", 0)
+        locator = await _locate_combobox(page, label, occurrence)
+        if locator is None:
+            errors.append(f"{label!r}: not found")
+            continue
+        try:
+            await _click_jittered(locator)
+            await locator.fill("", timeout=3000)  # clear any existing/autofilled value
+            await _human_type(page, value)
+        except Exception as exc:
+            errors.append(f"{label!r}: {exc}")
+            continue
+        filled.append(label)
+    if not filled:
+        return "error: no fields filled -- " + "; ".join(errors)
+    out = f"ok: filled {len(filled)} field(s): {', '.join(filled)}"
+    if errors:
+        out += " | errors: " + "; ".join(errors)
+    return out
+
+
+@mcp.tool()
+async def read_field(label_or_selector: str, occurrence: int = 0) -> str:
     """Read one field's current value/state without a full-page snapshot.
 
     A `browser_snapshot` after every fill/click to confirm it landed dumps
@@ -191,16 +359,20 @@ async def read_field(label_or_selector: str) -> str:
 
     Args:
         label_or_selector: Visible label text, placeholder text, or a raw
-            CSS selector for the field to inspect.
+            CSS selector for the field to inspect. Plain text only -- see
+            `fill_searchable_combobox` for why a copied snapshot-shorthand
+            fragment will not resolve.
+        occurrence: 0-indexed match to use when this label matches more than
+            one element on the page, in DOM order (0 = first/default).
 
     Returns a short ``ok: <value>`` / ``error: ...`` status string, e.g.
     ``ok: value="Jane Doe" invalid=false`` or
     ``ok: checked=true`` for a checkbox/radio.
     """
     page = await _get_page()
-    locator = await _locate_combobox(page, label_or_selector)
+    locator = await _locate_combobox(page, label_or_selector, occurrence)
     if locator is None:
-        return f"error: could not locate a field for {label_or_selector!r}"
+        return f"error: could not locate a field for {label_or_selector!r} (occurrence={occurrence})"
     try:
         tag = await locator.evaluate("el => el.tagName.toLowerCase()")
         input_type = await locator.evaluate("el => el.type || ''")
@@ -390,7 +562,7 @@ async def find_and_click(text_or_selector: str) -> str:
     if locator is None:
         return f"error: could not locate a clickable element for {text_or_selector!r}"
     try:
-        await locator.click(timeout=5000)
+        await _click_jittered(locator)
     except Exception as exc:
         return f"error: click failed for {text_or_selector!r}: {exc}"
     return f"ok: clicked {text_or_selector!r}"
@@ -449,7 +621,7 @@ async def decline_eeo() -> str:
                     await el.check(timeout=3000)
                 except Exception:
                     try:
-                        await el.click(timeout=3000)
+                        await _click_jittered(el, timeout=3000)
                     except Exception:
                         continue
                 changed.append(text.strip().replace("\n", " ")[:60])
@@ -576,6 +748,335 @@ async def snapshot_diff() -> str:
     if removed:
         parts.append("REMOVED:\n" + "\n".join(removed[:40]))
     return "ok:\n" + "\n\n".join(parts)
+
+
+_CAPTCHA_DETECT_JS = """
+    () => {
+        const r = {};
+        const url = window.location.href;
+        const hc = document.querySelector('.h-captcha, [data-hcaptcha-sitekey]');
+        if (hc) { r.type = 'hcaptcha'; r.sitekey = hc.dataset.sitekey || hc.dataset.hcaptchaSitekey; }
+        if (!r.type && document.querySelector('script[src*="hcaptcha.com"], iframe[src*="hcaptcha.com"]')) {
+            const el = document.querySelector('[data-sitekey]');
+            if (el) { r.type = 'hcaptcha'; r.sitekey = el.dataset.sitekey; }
+        }
+        if (!r.type) {
+            const cf = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]');
+            if (cf) {
+                r.type = 'turnstile';
+                r.sitekey = cf.dataset.sitekey || cf.dataset.turnstileSitekey;
+                if (cf.dataset.action) r.action = cf.dataset.action;
+                if (cf.dataset.cdata) r.cdata = cf.dataset.cdata;
+            }
+        }
+        if (!r.type && document.querySelector('script[src*="challenges.cloudflare.com"]')) {
+            r.type = 'turnstile_script_only';
+        }
+        if (!r.type) {
+            const s = document.querySelector('script[src*="recaptcha"][src*="render="]');
+            if (s) {
+                const m = s.src.match(/render=([^&]+)/);
+                if (m && m[1] !== 'explicit') { r.type = 'recaptchav3'; r.sitekey = m[1]; }
+            }
+        }
+        if (!r.type) {
+            const rc = document.querySelector('.g-recaptcha');
+            if (rc) { r.type = 'recaptchav2'; r.sitekey = rc.dataset.sitekey; }
+        }
+        if (!r.type && document.querySelector('script[src*="recaptcha"]')) {
+            const el = document.querySelector('[data-sitekey]');
+            if (el) { r.type = 'recaptchav2'; r.sitekey = el.dataset.sitekey; }
+        }
+        if (!r.type) {
+            const fc = document.querySelector('#FunCaptcha, [data-pkey], .funcaptcha');
+            if (fc) { r.type = 'funcaptcha'; r.sitekey = fc.dataset.pkey; }
+        }
+        if (!r.type && document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) {
+            const el = document.querySelector('[data-pkey]');
+            if (el) { r.type = 'funcaptcha'; r.sitekey = el.dataset.pkey; }
+        }
+        if (r.type) { r.url = url; return r; }
+        return null;
+    }
+"""
+
+_HCAPTCHA_INJECT_JS = """
+    (token) => {
+        const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
+        if (ta) ta.value = token;
+        document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(
+            f => f.setAttribute('data-hcaptcha-response', token));
+        const cb = document.querySelector('[data-hcaptcha-widget-id]');
+        if (cb && window.hcaptcha) {
+            try { window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); } catch (e) {}
+        }
+        return 'injected';
+    }
+"""
+
+_RECAPTCHA_INJECT_JS = """
+    (token) => {
+        document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {
+            el.value = token; el.style.display = 'block';
+        });
+        if (window.___grecaptcha_cfg) {
+            const clients = window.___grecaptcha_cfg.clients;
+            for (const key in clients) {
+                const walk = (obj, d) => {
+                    if (d > 4 || !obj) return;
+                    for (const k in obj) {
+                        if (typeof obj[k] === 'function' && k.length < 3) {
+                            try { obj[k](token); } catch (e) {}
+                        } else if (typeof obj[k] === 'object') {
+                            walk(obj[k], d + 1);
+                        }
+                    }
+                };
+                walk(clients[key], 0);
+            }
+        }
+        return 'injected';
+    }
+"""
+
+_TURNSTILE_INJECT_JS = """
+    (token) => {
+        const inp = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
+        if (inp) inp.value = token;
+        if (window.turnstile) {
+            try {
+                const w = document.querySelector('.cf-turnstile');
+                if (w) window.turnstile.getResponse(w);
+            } catch (e) {}
+        }
+        return 'injected';
+    }
+"""
+
+_FUNCAPTCHA_INJECT_JS = """
+    (token) => {
+        const inp = document.querySelector('#FunCaptcha-Token, input[name="fc-token"]');
+        if (inp) inp.value = token;
+        if (window.ArkoseEnforcement) {
+            try { window.ArkoseEnforcement.setConfig({data: {blob: token}}); } catch (e) {}
+        }
+        return 'injected';
+    }
+"""
+
+_CAPSOLVER_TASK_TYPES_PROXY = {
+    "recaptchav2": "ReCaptchaV2Task",
+    "recaptchav3": "ReCaptchaV3Task",
+    "turnstile": "AntiTurnstileTask",
+    "funcaptcha": "FunCaptchaTask",
+}
+_CAPSOLVER_TASK_TYPES_PROXYLESS = {
+    "recaptchav2": "ReCaptchaV2TaskProxyLess",
+    "recaptchav3": "ReCaptchaV3TaskProxyLess",
+    "turnstile": "AntiTurnstileTaskProxyLess",
+    "funcaptcha": "FunCaptchaTaskProxyLess",
+}
+_CAPSOLVER_INJECT_JS = {
+    "recaptchav2": _RECAPTCHA_INJECT_JS,
+    "recaptchav3": _RECAPTCHA_INJECT_JS,
+    "turnstile": _TURNSTILE_INJECT_JS,
+    "funcaptcha": _FUNCAPTCHA_INJECT_JS,
+}
+
+# Per-session budget state -- this process lives for one job, so these reset
+# naturally between jobs. Enforced here (not just described in the prompt) so
+# a wayward agent can't exceed the policy by simply calling the tool again.
+_hcaptcha_attempted: set[str] = set()
+_captcha_instance_attempts: dict[str, int] = {}
+_capsolver_total_attempts = 0
+
+_CAPSOLVER_MAX_PER_INSTANCE = 2
+_CAPSOLVER_MAX_TOTAL = 3
+
+
+def _http_post_json(url: str, payload: dict, timeout: float, extra_headers: dict) -> dict:
+    data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", **extra_headers}
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+@mcp.tool()
+async def handle_captcha(proxy_string: str = "") -> str:
+    """Detect, solve, and inject a CAPTCHA on the current page -- one call.
+
+    Replaces what used to be ~15,000 characters of raw JavaScript in the
+    prompt (a DOM-detection function, NoneCap's solve+inject, and CapSolver's
+    3-step createTask/poll/inject repeated per vendor type) with a single
+    tool call. The vendor split is unchanged: hCaptcha -> NoneCap (one
+    attempt only, hard stop on failure -- its image challenges are built to
+    defeat exactly this kind of model, so don't retry or attempt it
+    visually); reCAPTCHA v2/v3, Turnstile, FunCaptcha -> CapSolver (up to 2
+    cycles per captcha instance, 3 total per job). This tool enforces both
+    budgets itself via module-level state, not just prompt instructions, so
+    it will refuse further attempts once exhausted rather than relying on the
+    agent to self-police.
+
+    Args:
+        proxy_string: This job's CapSolver-format proxy
+            ("type:host:port:user:pass"), if one is active for this job.
+            Passed to CapSolver as-is (so it solves through the same egress
+            IP the browser is using) and reformatted internally for NoneCap,
+            which wants a plain URL instead. Pass empty string if there's no
+            active proxy for this job.
+
+    Returns:
+        ``ok: no captcha detected`` -- nothing found, continue normally.
+        ``ok: <type> solved and injected`` -- success; click Submit/Verify/
+        Continue if the page didn't auto-advance on its own.
+        ``error: ...`` -- see the message. hCaptcha errors are always a hard
+        stop (output RESULT:FAILED:captcha, do not retry or solve visually).
+        CapSolver errors after budget exhaustion mean go to the manual
+        fallback (audio/accessibility button, or a simple text/logic puzzle)
+        or output RESULT:CAPTCHA if nothing applies.
+    """
+    page = await _get_page()
+    try:
+        detection = await page.evaluate(_CAPTCHA_DETECT_JS)
+    except Exception as exc:
+        return f"error: detection failed: {exc}"
+
+    if detection is not None and detection.get("type") == "turnstile_script_only":
+        await page.wait_for_timeout(3000)
+        try:
+            detection = await page.evaluate(_CAPTCHA_DETECT_JS)
+        except Exception as exc:
+            return f"error: re-detection failed: {exc}"
+
+    if detection is None:
+        return "ok: no captcha detected"
+
+    ctype = detection.get("type")
+    sitekey = detection.get("sitekey")
+    page_url = detection.get("url") or page.url
+    if not sitekey:
+        return f"error: detected {ctype} but no sitekey found -- cannot solve, try manual fallback"
+
+    instance_key = f"{ctype}:{sitekey}"
+
+    if ctype == "hcaptcha":
+        if instance_key in _hcaptcha_attempted:
+            return "error: hcaptcha already attempted once for this instance (hard stop, do not retry)"
+        _hcaptcha_attempted.add(instance_key)
+
+        nonecap_key = os.environ.get("NONECAP_API_KEY", "")
+        if not nonecap_key:
+            return "error: NONECAP_API_KEY not configured, cannot solve hCaptcha (hard stop)"
+
+        nonecap_proxy = ""
+        if proxy_string:
+            try:
+                ptype, phost, pport, puser, ppass = proxy_string.split(":", 4)
+                nonecap_proxy = f"{ptype}://{puser}:{ppass}@{phost}:{pport}"
+            except ValueError:
+                pass
+
+        payload = {"type": "hcaptcha", "sitekey": sitekey, "url": page_url}
+        if nonecap_proxy:
+            payload["proxy"] = nonecap_proxy
+
+        try:
+            result = await asyncio.to_thread(
+                _http_post_json,
+                "https://api.nonecap.com/v1/solves?wait=60",
+                payload,
+                65.0,
+                {"Authorization": f"Bearer {nonecap_key}"},
+            )
+        except Exception as exc:
+            return f"error: hcaptcha solve request failed: {exc} (hard stop, do not retry)"
+
+        token = result.get("token")
+        if result.get("status") != "solved" or not token:
+            return f"error: hcaptcha solve failed: {result} (hard stop, do not retry or attempt visually)"
+
+        try:
+            await page.evaluate(_HCAPTCHA_INJECT_JS, token)
+        except Exception as exc:
+            return f"error: hcaptcha token injection failed: {exc}"
+        await page.wait_for_timeout(2000)
+        return "ok: hcaptcha solved and injected"
+
+    if ctype not in _CAPSOLVER_TASK_TYPES_PROXY:
+        return f"error: unrecognized captcha type {ctype!r}, try manual fallback"
+
+    global _capsolver_total_attempts
+    instance_attempts = _captcha_instance_attempts.get(instance_key, 0)
+    if instance_attempts >= _CAPSOLVER_MAX_PER_INSTANCE or _capsolver_total_attempts >= _CAPSOLVER_MAX_TOTAL:
+        return "error: capsolver budget exhausted for this run -- go to manual fallback or RESULT:CAPTCHA"
+
+    capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    if not capsolver_key:
+        return "error: CAPSOLVER_API_KEY not configured, cannot solve -- try manual fallback"
+
+    _captcha_instance_attempts[instance_key] = instance_attempts + 1
+    _capsolver_total_attempts += 1
+
+    task_types = _CAPSOLVER_TASK_TYPES_PROXY if proxy_string else _CAPSOLVER_TASK_TYPES_PROXYLESS
+    task: dict = {
+        "type": task_types[ctype],
+        "websiteURL": page_url,
+        "websiteKey": sitekey,
+    }
+    if proxy_string:
+        task["proxy"] = proxy_string
+    if ctype == "recaptchav3":
+        task["pageAction"] = detection.get("action") or "submit"
+    if ctype == "turnstile":
+        meta = {k: detection[k] for k in ("action", "cdata") if detection.get(k)}
+        if meta:
+            task["metadata"] = meta
+
+    try:
+        create_result = await asyncio.to_thread(
+            _http_post_json,
+            "https://api.capsolver.com/createTask",
+            {"clientKey": capsolver_key, "task": task},
+            15.0,
+            {},
+        )
+    except Exception as exc:
+        return f"error: capsolver createTask failed: {exc}"
+    if create_result.get("errorId"):
+        return f"error: capsolver createTask error: {create_result}"
+    task_id = create_result.get("taskId")
+    if not task_id:
+        return f"error: capsolver createTask returned no taskId: {create_result}"
+
+    token = None
+    for _ in range(10):
+        await page.wait_for_timeout(3000)
+        try:
+            poll_result = await asyncio.to_thread(
+                _http_post_json,
+                "https://api.capsolver.com/getTaskResult",
+                {"clientKey": capsolver_key, "taskId": task_id},
+                15.0,
+                {},
+            )
+        except Exception as exc:
+            return f"error: capsolver poll failed: {exc}"
+        if poll_result.get("errorId"):
+            return f"error: capsolver solve error: {poll_result}"
+        if poll_result.get("status") == "ready":
+            solution = poll_result.get("solution") or {}
+            token = solution.get("gRecaptchaResponse") or solution.get("token")
+            break
+    if not token:
+        return "error: capsolver did not return a solution within 30s"
+
+    try:
+        await page.evaluate(_CAPSOLVER_INJECT_JS[ctype], token)
+    except Exception as exc:
+        return f"error: token injection failed: {exc}"
+    await page.wait_for_timeout(2000)
+    return f"ok: {ctype} solved and injected"
 
 
 def main() -> None:

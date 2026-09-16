@@ -1285,8 +1285,20 @@ _JOBRIGHT_NEXT_DATA_RE = re.compile(
     r'__NEXT_DATA__"\s*type="application/json">(.*?)</script>', re.S
 )
 
+# Set (to a wall-clock deadline) once this process sees a 303 challenge from
+# the per-job page endpoint -- see _fetch_jobright_publish_time. Once
+# tripped, every call short-circuits to None with zero network I/O until the
+# deadline passes, instead of every new job in the batch separately paying
+# for its own retries against a wall. Confirmed this endpoint's challenge
+# can stay up for 20+ minutes under real conditions (far longer than the
+# "recovers in seconds" seen in isolated single-request testing), and a
+# batch of ~150 new jobs each burning ~9s of retries turned one discover
+# pass into a 25-minute one and starved every other writer of the DB lock
+# for that whole time -- this exists specifically to stop that.
+_jobright_page_blocked_until = 0.0
 
-def _fetch_jobright_publish_time(job_id: str, retries: int = 2) -> str | None:
+
+def _fetch_jobright_publish_time(job_id: str, retries: int = 1) -> str | None:
     """Pull the precise, correct posting time for one Jobright job.
 
     The bulk `/swan/mini-sites/list` API's own `postedAt` field is wrong --
@@ -1302,12 +1314,15 @@ def _fetch_jobright_publish_time(job_id: str, retries: int = 2) -> str | None:
     rows.
 
     This endpoint has its own rate limiter, separate from the bulk API's:
-    a 303 to `/_jr/security/challenge` instead of the real page once
-    requests come in faster than ~1/2s. Measured recovering within a few
-    seconds, so retried with backoff rather than treated as a permanent
-    miss -- this only runs once per newly-discovered job here, so the
-    volume is low regardless.
+    a 303 to `/_jr/security/challenge` (an actual Cloudflare Turnstile page,
+    not a simple counter) once requests come in faster than ~1/2s. See
+    _jobright_page_blocked_until: the first 303 in a process trips a 5-
+    minute cooldown shared by every subsequent call, so one blocked job
+    doesn't cost the next 150 their own retries too.
     """
+    global _jobright_page_blocked_until
+    if time.time() < _jobright_page_blocked_until:
+        return None
     for attempt in range(retries + 1):
         try:
             resp = httpx.get(
@@ -1319,6 +1334,7 @@ def _fetch_jobright_publish_time(job_id: str, retries: int = 2) -> str | None:
                 if attempt < retries:
                     time.sleep(3 * (attempt + 1))
                     continue
+                _jobright_page_blocked_until = time.time() + 300
                 return None
             match = _JOBRIGHT_NEXT_DATA_RE.search(resp.text)
             if not match:

@@ -137,6 +137,12 @@ export const api = {
       { method: "POST", body: JSON.stringify({ url, note }) },
     ),
 
+  setPostApplyStatus: (url: string, status: string) =>
+    request<{ url: string; status: string }>("/api/post-apply-status", {
+      method: "POST",
+      body: JSON.stringify({ url, status }),
+    }),
+
   settings: () => request<Settings>("/api/settings"),
 
   updateSettings: (patch: Partial<Settings>) =>

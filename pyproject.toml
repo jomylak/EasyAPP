@@ -30,6 +30,10 @@ dependencies = [
     # applypilot/web/server.py for why there is deliberately no --host flag.
     "fastapi>=0.110",
     "uvicorn>=0.27",
+    # uvicorn's own dependencies don't include a websocket implementation
+    # unless installed as uvicorn[standard] -- without this, ASGI websocket
+    # routes (the Runs tab's live screencast) silently fail to upgrade.
+    "websockets>=12",
     # Custom MCP tool server (apply/mcp_tools) -- deterministic replacements
     # for generic environment-level friction (file upload, comboboxes) that
     # goose/Claude load as a third --with-extension alongside playwright/gmail.

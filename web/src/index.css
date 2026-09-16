@@ -639,23 +639,30 @@ tr.exp > td {
   border-bottom: none;
   background: var(--a-surface);
 }
-tr.exp .slide {
+tr.exp .slide,
+.worker-exp .slide {
   display: grid;
   grid-template-rows: 0fr;
   transition: grid-template-rows 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
-tr.exp.open .slide {
+tr.exp.open .slide,
+.worker-exp.open .slide {
   grid-template-rows: 1fr;
 }
-tr.exp .slide > div {
+tr.exp .slide > div,
+.worker-exp .slide-inner {
   overflow: hidden;
   min-height: 0;
 }
 tr.exp.open > td {
   border-bottom: 1px solid var(--a-line);
 }
+.worker-exp.open .slide-inner {
+  border-top: 1px solid var(--a-line);
+}
 @media (prefers-reduced-motion: reduce) {
-  tr.exp .slide {
+  tr.exp .slide,
+  .worker-exp .slide {
     transition: none;
   }
 }
@@ -701,7 +708,8 @@ tr.exp.open > td {
   max-width: 78ch;
   white-space: pre-wrap;
 }
-.expbox h4 {
+.expbox h4,
+.workerexp h4 {
   margin: 0 0 7px;
   font-size: 12px;
   font-family: var(--mono);
@@ -903,7 +911,6 @@ tr.exp.open > td {
   border-bottom: 1px solid var(--a-line-soft);
   font-size: 12.5px;
 }
-.worker-row:last-child { border-bottom: none; }
 .worker-id {
   font-family: var(--mono);
   color: var(--a-text-3);
@@ -929,6 +936,96 @@ tr.exp.open > td {
   white-space: nowrap;
   color: var(--a-text-3);
   font-size: 11.5px;
+}
+
+/* ---- worker row expansion (Runs tab live view) -------------------------- */
+/* Same open/shut animation as the jobs table's row expansion (see
+   `tr.exp` above), just rebuilt on plain divs since a live worker row isn't
+   a table row. Border-bottom now belongs to the wrapper, not `.worker-row`
+   itself, so it survives being reparented one level down. */
+.worker-exp {
+  border-bottom: 1px solid var(--a-line-soft);
+}
+.worker-exp:last-child {
+  border-bottom: none;
+}
+.worker-exp .worker-row {
+  border-bottom: none;
+}
+.worker-row-clickable {
+  cursor: pointer;
+}
+.worker-row-clickable:hover {
+  background: var(--a-surface);
+}
+.workerexp {
+  padding: 14px 16px 16px 52px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 360px);
+  gap: 20px;
+  background: var(--a-surface);
+}
+@media (max-width: 720px) {
+  .workerexp {
+    grid-template-columns: 1fr;
+    padding-left: 18px;
+  }
+}
+.workerexp-log {
+  max-height: 220px;
+  overflow-y: auto;
+}
+.workerexp-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--a-text-3);
+  margin-bottom: 10px;
+}
+.actionlog {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--a-text-2);
+}
+.actionlog li {
+  border-left: 2px solid var(--a-line);
+  padding-left: 10px;
+  margin-bottom: 3px;
+}
+.actionlog-reasoning {
+  border-left-color: var(--a-sel);
+  color: var(--a-text-3);
+  font-style: italic;
+}
+.actionlog-ts {
+  color: var(--a-text-3);
+}
+.livebox {
+  position: relative;
+  aspect-ratio: 3 / 2;
+  border-radius: 6px;
+  border: 1px solid var(--a-line);
+  background: var(--a-ground);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.livebox-frame {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.livebox-status {
+  font-size: 12px;
+  color: var(--a-text-3);
+  font-family: var(--mono);
 }
 
 /* Status badges -- reused by both the live worker rows and the applications
@@ -959,6 +1056,10 @@ tr.exp.open > td {
 .badge.queued,
 .badge.in_progress { color: var(--a-warn); border-color: color-mix(in srgb, var(--a-warn) 40%, var(--a-line)); }
 .badge.manual { color: var(--a-text-3); }
+.badge.oa,
+.badge.interview { color: var(--a-warn); border-color: color-mix(in srgb, var(--a-warn) 40%, var(--a-line)); }
+.badge.offer { color: var(--a-good); border-color: color-mix(in srgb, var(--a-good) 40%, var(--a-line)); }
+.badge.rejected { color: var(--a-bad); border-color: color-mix(in srgb, var(--a-bad) 40%, var(--a-line)); }
 
 /* Grad-date-safety signal shown inline before the title in the browse table
    -- see TerminalBadge in DayTable.tsx. Confirmed/remote-spring share a

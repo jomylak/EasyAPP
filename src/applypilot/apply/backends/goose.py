@@ -45,7 +45,7 @@ from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 from applypilot.ats import detect_ats
 from applypilot.apply.chrome import get_worker_proxy, reset_worker_dir, _kill_process_tree
-from applypilot.apply.dashboard import add_event, get_state, update_state
+from applypilot.apply.dashboard import accumulate_usage, add_event, add_worker_action, update_state
 from applypilot.scoring.router import resume_paths_for_job
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,25 @@ def _extension_args(cdp_port: int) -> list[str]:
 
 
 def _build_command(cdp_port: int, model: str, provider: str, settings: dict | None = None) -> list[str]:
-    """Assemble the full ``goose run`` argv."""
+    """Assemble the full ``goose run`` argv.
+
+    Deliberately does NOT pass ``-n/--name`` to set a readable Langfuse trace
+    name (e.g. "Tebra - Software Engineer I") even though that would make
+    traces far easier to find in the Langfuse UI than the bare epoch
+    timestamp they get by default -- confirmed 2026-09-14 that goose's CLI
+    rejects `-n` combined with `--no-session` outright ("cannot be used
+    with"), and `--no-session` is load-bearing (every job must start with no
+    prior session state). Dropping `--no-session` to allow `-n` is a real
+    behavior change (session files start accumulating on disk, and it's
+    unverified whether that combination actually renames the Langfuse trace
+    at all -- two live smoke tests produced no trace either way, inconclusive
+    rather than confirmed-working). Don't ship that swap without dedicated
+    testing. See [[applypilot-known-quirks]] for the safer alternative
+    (Langfuse's own trace `input` already contains the full job info, so
+    finding a job's trace by searching/filtering on it, rather than by
+    goose-assigned name, may already solve this without touching this
+    command at all).
+    """
     settings = settings or {}
     return [
         "goose", "run",
@@ -205,7 +223,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                  company=job.get("company") or job.get("site", ""),
                  company_tier=job.get("company_tier"),
                  url=job.get("url", ""), score=job.get("fit_score", 0),
-                 start_time=time.time(), actions=0, last_action="starting")
+                 start_time=time.time(), actions=0, last_action="starting",
+                 recent_actions=[])
     add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
@@ -308,7 +327,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.close()
 
         text_parts: list[str] = []
+        # Mirrors text_parts but gets cleared every time it's flushed to the
+        # worker's live log -- text_parts itself has to keep everything for
+        # the final `output` string the rest of this function parses for
+        # RESULT:/QUIRK:/ISSUE: markers.
+        pending_reasoning: list[str] = []
         navigated_urls: list[str] = []
+        # Last few tool descriptions, for a synthesized known_issue if the run
+        # gets killed before the model prints its own ISSUE: line (see below).
+        last_actions: list[str] = []
+
+        def _flush_reasoning() -> None:
+            text = "".join(pending_reasoning).strip()
+            pending_reasoning.clear()
+            if text:
+                add_worker_action(worker_id, f"\U0001f4ad {text[:200]}")
+
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
@@ -342,7 +376,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     if bt == "text":
                         # Streamed one token per envelope; join at the end.
                         text_parts.append(block.get("text", ""))
+                        pending_reasoning.append(block.get("text", ""))
                     elif bt == "toolRequest":
+                        # Whatever the model said before deciding on this
+                        # tool call goes into the log first, so the log
+                        # reads as reasoning -> action rather than losing
+                        # the reasoning entirely.
+                        _flush_reasoning()
                         call = (block.get("toolCall") or {}).get("value") or {}
                         name = call.get("name", "")
                         args = call.get("arguments") or {}
@@ -354,6 +394,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         lf.write(f"  >> {desc}\n")
                         update_state(worker_id, actions=tool_calls,
                                      last_action=desc[:35])
+                        add_worker_action(worker_id, desc[:120])
+                        last_actions.append(desc[:80])
+                        if len(last_actions) > 6:
+                            last_actions.pop(0)
+
+            _flush_reasoning()
 
         proc.wait(timeout=30)
         returncode = proc.returncode
@@ -410,9 +456,37 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # than quirks (see append_known_issue): a wrong "watch out for X" only
         # wastes a little of the next run's attention, so any model's report
         # is trusted, not just the trusted quirk writers.
+        self_reported_issue = False
         if "RESULT:APPLIED" not in output and job_ats:
             for m in re.finditer(r"ISSUE:\s*(.+?)(?:\n|$)", output):
+                self_reported_issue = True
                 config.append_known_issue(job_ats, m.group(1).strip())
+
+        # A run cut off mid-loop -- by the wall-clock cap, a dead CDP port, or
+        # goose's own --max-turns/--max-tool-repetitions limits -- never gets
+        # to print an ISSUE: line; it's just stopped, not given the chance to
+        # summarize. Those are exactly the runs most worth a heads-up for the
+        # next attempt (a real stuck loop, not a graceful give-up), so
+        # synthesize one from what was actually observed instead of silently
+        # recording nothing. Detected as "no RESULT: marker at all" rather
+        # than checking the kill flags directly, so this also catches goose's
+        # own turn/repetition caps firing (no watchdog flag for those -- the
+        # process just exits once goose decides to stop). Only for a run that
+        # got far enough to have real signal -- a handful of tool calls before
+        # stopping is more likely a slow page than a pattern worth caching.
+        if not self_reported_issue and job_ats and "RESULT:" not in output and tool_calls >= 8:
+            if timed_out.is_set():
+                reason = "wall-clock timeout"
+            elif cdp_dead.is_set():
+                reason = "Chrome DevTools connection died"
+            else:
+                reason = "goose's own turn/tool-repetition limit"
+            trail = "; ".join(last_actions) or "no tool calls recorded"
+            config.append_known_issue(
+                job_ats,
+                f"Run cut off by {reason} after {tool_calls} tool calls, never reached "
+                f"RESULT: -- last actions before the cutoff: {trail}",
+            )
 
         if stats:
             with _goose_lock:
@@ -426,10 +500,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "cache_read_tokens": stats.get("cache_read"),
                     "cost_usd": stats.get("cost_usd"),
                 }
-            cost = stats.get("cost_usd", 0) or 0
-            ws = get_state(worker_id)
-            prev_cost = ws.total_cost if ws else 0.0
-            update_state(worker_id, total_cost=prev_cost + cost)
+            accumulate_usage(worker_id, stats.get("cost_usd", 0) or 0, stats)
         elif timed_out.is_set() or cdp_dead.is_set():
             # Goose only emits its "complete" stats line at graceful end of
             # session -- a run we killed ourselves (wall-clock or dead CDP
@@ -453,9 +524,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "cost_usd": estimated_cost,
                 }
             if estimated_cost:
-                ws = get_state(worker_id)
-                prev_cost = ws.total_cost if ws else 0.0
-                update_state(worker_id, total_cost=prev_cost + estimated_cost)
+                accumulate_usage(worker_id, estimated_cost, {})
 
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
