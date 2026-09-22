@@ -23,6 +23,13 @@ blocked:
     - "%google.jobs%"
     - "%accenture%"
     - "%workopolis.com/out%"
+    # Never apply to SpaceX, even in a dry run (2026-09-18: explicit
+    # standing instruction, not a captcha/reliability issue like the rest
+    # of this list). Note this only guards the ranked/queued job-selection
+    # path (acquire_job's _is_blocked check) -- `applypilot apply --url`
+    # bypasses this list entirely via _select_target, so a direct --url
+    # invocation must still exclude SpaceX by hand.
+    - "%for=spacex%"
 
 # ── Blocked SSO domains — cannot authenticate through these ──────────────
 blocked_sso:
@@ -69,31 +76,23 @@ sites:
     type: static
 
   # ── AIML / DE category tags ─────────────────────────────────────────
-  # Unlike the SWE category above, these category tags (?k=aiml, ?k=de on
-  # the site) are NOT additional slugs on Jobright's minisite API -- each
-  # is backed by its own genuine Airtable shared grid view (confirmed live:
-  # tab title is literally "Airtable - Grid view", not the Jobright-branded
-  # widget). That means these route through _scrape_airtable_button_grid
-  # (matched by "airtable.com/embed/" in the url below), NOT the API path.
-  # FIXED (was a known limitation): _scrape_airtable_button_grid now scrolls
-  # the grid's own scroll container round by round instead of reading only
-  # the ~18-30 rows rendered on first load, and does reach the bottom of a
-  # 600+ record grid (verified live, 2026-09). Live spot-checks the same
-  # month found cumulative DB row counts for all three of these boards
-  # exceeding their current live record count, the same healthy pattern as
-  # the two fully API-verified SWE boards -- i.e. not stuck on a small
-  # recency-biased slice. See _scrape_airtable_button_grid's own docstring
-  # for the scroll mechanics.
+  # These boards are Airtable grids on the sites themselves, but the same
+  # records are served by Jobright's minisite API under their own category
+  # slugs (ml_ai, data_engineer) -- verified live 2026-09-21: intern:us:ml_ai
+  # 1145 jobs, newgrad:us:ml_ai 314, newgrad:us:data_engineer 107. The API
+  # returns the whole list in one request with company and salary included,
+  # so it replaces the scroll-and-read grid scraper (_scrape_airtable_button_grid),
+  # whose coverage couldn't be checked against anything.
   - name: "Intern List - AIML"
-    url: "https://airtable.com/embed/appjSXAWiVF4d1HoZ/shrf04yGbrK3IebAl?viewControls=on"
+    url: "jobright-category:intern:us:ml_ai"
     type: static
 
   - name: "NewGrad Jobs - AIML"
-    url: "https://airtable.com/embed/appoxNzAIRReFCzZV/shrmDBF1vNPtzNjzl?viewControls=on"
+    url: "jobright-category:newgrad:us:ml_ai"
     type: static
 
   - name: "NewGrad Jobs - DE"
-    url: "https://airtable.com/embed/appqYfRGKpLQ8UsdH/shrFnvW20reJCEkYZ?viewControls=on"
+    url: "jobright-category:newgrad:us:data_engineer"
     type: static
 
   # ── Everything below is disabled for this profile. ────────────────────

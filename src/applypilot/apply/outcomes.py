@@ -31,6 +31,12 @@ PERMANENT_FAILURES: set[str] = {
     # refused to fabricate a DOB rather than risk the offer-rescission
     # warning those forms carry.
     "dob_required",
+    # Same two-tier retry shape as "captcha" below: permanent by default, but
+    # launcher.py's worker_loop leaves a primary (proxy) worker's own hit
+    # non-permanent so the dedicated home-fallback worker gets one retry on
+    # a clean connection. Only final when the home-fallback worker itself
+    # hits it -- there's no further tier to escalate to.
+    "proxy_dropped",
 }
 
 # Clean, understood reasons this job will never be applicable -- no human
@@ -85,22 +91,13 @@ def is_permanent_failure(result: str) -> bool:
     )
 
 
-# Failures worth one retry on the fallback backend (settings.json:
-# `apply_fallback_backend`). These all mean "the engine driving the browser
-# gave up", not "this job cannot be applied to" -- a stronger model may well
-# get through where a cheap one lost the thread.
-#
-# Deliberately excludes every PERMANENT_FAILURE, and also the walls that are
-# about the site rather than the driver: sso_required, unsafe_permissions and
-# unsafe_verification block any agent equally, so retrying just burns quota.
+# Failures that mean "the engine driving the browser gave up", not "this job
+# cannot be applied to" -- grouped here so the failure-reasons dashboard
+# (failure_taxonomy.py) can report them as one category instead of one bar
+# per phrasing. Deliberately excludes every PERMANENT_FAILURE, and also the
+# walls that are about the site rather than the driver: sso_required,
+# unsafe_permissions and unsafe_verification block any agent equally.
 FALLBACK_REASONS: set[str] = {
     "stuck", "no_result_line", "unknown", "page_error", "timeout",
+    "bandwidth", "orphaned",
 }
-
-
-def should_fall_back(result: str) -> bool:
-    """Whether a failed run should be retried on the fallback backend."""
-    if not result.startswith("failed:"):
-        return False
-    reason = result.split(":", 1)[1].strip().lower()
-    return reason in FALLBACK_REASONS and not is_permanent_failure(result)

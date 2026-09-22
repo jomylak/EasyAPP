@@ -289,6 +289,16 @@ class LLMClient:
         # doesn't recognize the field.
         if self.base_url == _OPENROUTER_BASE:
             payload["usage"] = {"include": True}
+            # Pin to xiaomi's own backend when it serves the requested model
+            # (allow_fallbacks keeps this a no-op, not a hard failure, for
+            # models xiaomi doesn't host). Prompt caching lives on whichever
+            # physical machine served the previous call, so letting
+            # OpenRouter round-robin across providers -- GMICloud, DeepInfra,
+            # xiaomi itself, etc. -- kills the cache hit rate even though the
+            # account-level provider allowlist in OpenRouter's dashboard is
+            # already set; that setting can't express ordering/fallback, only
+            # this per-request field can. See [[applypilot-llm-provider-limits]].
+            payload["provider"] = {"order": ["xiaomi"], "allow_fallbacks": True}
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",

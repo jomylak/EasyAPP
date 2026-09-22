@@ -166,18 +166,14 @@ def apply(
              "OpenRouter model) or 'claude' (Claude Code CLI, uses your "
              "subscription quota). Defaults to apply_backend in settings.json.",
     ),
-    fallback: Optional[str] = typer.Option(
-        None, "--fallback",
-        help="Backend to retry a job on when the primary one gives up. "
-             "Defaults to apply_fallback_backend in settings.json. "
-             "Pass 'none' to disable.",
-    ),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
-    queued: Optional[str] = typer.Option(
-        None, "--queued",
-        help="Apply to the jobs in this queue batch, in the order they were "
-             "selected. Set by the web UI; ignores --min-score and the other "
-             "ranked-queue filters, because a person already chose these.",
+    queued: bool = typer.Option(
+        False, "--queued",
+        help="Drain the manual queue -- every batch the web UI has queued, "
+             "FIFO across batches, in the order each was selected. Exits "
+             "once the queue is empty and every worker is done; queue more "
+             "and launch again. Ignores --min-score and the other ranked-queue "
+             "filters, because a person already chose these.",
     ),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
@@ -224,18 +220,16 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    # Check 3: there is actually something to apply to. For a queued batch the
-    # question is whether that batch has anything left in it, not whether the
-    # ranked queue does -- a batch can be perfectly valid while the ranked
-    # queue is empty, and vice versa.
+    # Check 3: there is actually something to apply to. For --queued the
+    # question is whether the manual queue has anything in it, not whether
+    # the ranked queue does -- one can be non-empty while the other isn't.
     if queued:
         conn = get_connection()
         pending = conn.execute(
-            "SELECT COUNT(*) FROM jobs WHERE queue_batch = ? AND apply_status = 'queued'",
-            (queued,),
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'queued'"
         ).fetchone()[0]
         if pending == 0:
-            console.print(f"[red]Batch {queued} has no jobs waiting.[/red]")
+            console.print("[red]Nothing in the manual queue.[/red]")
             raise typer.Exit(code=1)
     elif not (gen and url):
         conn = get_connection()
@@ -274,8 +268,8 @@ def apply(
     if limit is not None:
         effective_limit = limit
     elif queued:
-        # The batch is the limit. Defaulting to 1 here would apply to the first
-        # job the user picked and silently drop the other nineteen.
+        # The manual queue runs forever (new batches can land in it any
+        # time), so there's no fixed limit to default to.
         effective_limit = 0
     else:
         effective_limit = 0 if continuous else 1
@@ -292,19 +286,7 @@ def apply(
         )
         raise typer.Exit(code=1)
 
-    raw_fallback = fallback if fallback is not None else _settings.get("apply_fallback_backend")
-    effective_fallback = (raw_fallback or "").strip().lower() or None
-    if effective_fallback in ("none", "off"):
-        effective_fallback = None
-    if effective_fallback and effective_fallback not in BACKEND_NAMES:
-        console.print(
-            f"[red]Unknown fallback backend {effective_fallback!r}.[/red] "
-            f"Expected one of: {', '.join(BACKEND_NAMES)}, or 'none'"
-        )
-        raise typer.Exit(code=1)
-    if effective_fallback == effective_backend:
-        effective_fallback = None
-
+    continuous = continuous or bool(queued)
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
@@ -318,13 +300,12 @@ def apply(
         console.print(f"  Model:    {_gm} [dim]({_gp})[/dim]")
     else:
         console.print(f"  Model:    {model}")
-    console.print(f"  Fallback: {effective_fallback or '[dim]none[/dim]'}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
         console.print(f"  Target:   {url}")
     if queued:
-        console.print(f"  Batch:    {queued}")
+        console.print("  Queue:    manual (all queued batches)")
     console.print()
 
     apply_main(
@@ -337,8 +318,7 @@ def apply(
         continuous=continuous,
         workers=workers,
         backend=effective_backend,
-        fallback_backend=effective_fallback,
-        queue_batch=queued,
+        manual_queue=queued,
     )
 
 
@@ -553,15 +533,11 @@ def rescore_stale(
 
 @app.command(name="dedup-backfill")
 def dedup_backfill_cmd() -> None:
-    """Retroactively re-run duplicate detection over every enriched job.
+    """Rebuild every duplicate/group link from scratch under the current rules.
 
-    Safe to run any time -- dedup.check_duplicate always re-derives from
-    current column values, so this catches rows that predate a
-    matching-logic change (e.g. the company-normalized cross-tenant check)
-    or were enriched before check_duplicate first ran on them. The pipeline
-    already calls this at the end of the score stage; this command is for
-    running it on demand (e.g. right after landing a matching-threshold
-    change) without a full pipeline pass.
+    Only needed after changing dedup rules: each new row is linked once as it
+    is discovered, enriched and scored, and the pipeline no longer reruns this.
+    Resets duplicate_of/duplicate_reason/group_id on every row first.
     """
     _bootstrap()
     from applypilot.database import get_connection
@@ -569,7 +545,8 @@ def dedup_backfill_cmd() -> None:
 
     conn = get_connection()
     stats = dedup.backfill(conn)
-    typer.echo(f"Processed {stats['processed']} jobs, found {stats['duplicates_found']} duplicates")
+    typer.echo(f"Processed {stats['processed']} jobs, {stats['duplicates_found']} hidden duplicates, "
+               f"{stats['grouped_rows']} rows in groups")
     for reason, count in stats["by_reason"].items():
         typer.echo(f"  {reason}: {count}")
 
@@ -798,17 +775,12 @@ def doctor() -> None:
 
     # --- Tier 3 checks ---
     # Apply backend: whichever one is actually configured is the one that has
-    # to be present. The other is reported as the fallback it is.
+    # to be present.
     _s = load_settings()
     primary = (_s.get("apply_backend") or "goose").lower()
-    fallback = (_s.get("apply_fallback_backend") or "").lower() or None
 
     def _role(name: str) -> str:
-        if name == primary:
-            return "apply backend"
-        if name == fallback:
-            return "apply fallback"
-        return "unused"
+        return "apply backend" if name == primary else "unused"
 
     # Goose CLI
     goose_bin = shutil.which("goose")
@@ -823,7 +795,7 @@ def doctor() -> None:
                         "https://block.github.io/goose/docs/getting-started/installation/"))
 
     # OpenRouter key -- what Goose runs on
-    if primary == "goose" or fallback == "goose":
+    if primary == "goose":
         if os.environ.get("OPENROUTER_API_KEY"):
             model = _s.get("goose_model") or DEFAULTS["goose_model"]
             results.append(("OpenRouter key", ok_mark, f"Goose model: {model}"))

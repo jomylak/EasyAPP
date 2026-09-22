@@ -296,3 +296,87 @@ def test_day_expression_matches_the_indexed_one(db):
     ).fetchall()
     assert any("idx_jobs_day" in str(tuple(r)) for r in plan), plan
     assert _DAY_EXPR in queries._ROW_COLUMNS
+
+
+def test_data_stats(tmp_path):
+    import json
+    from applypilot.web import queries
+    f = tmp_path / "n.jsonl"
+    rows = [{"ats": "Ashby", "total_bytes": 2_000_000, "ts": "2026-09-18T00:00:00"},
+            {"ats": "Ashby", "total_bytes": 4_000_000, "ts": "2026-09-18T01:00:00"},
+            {"ats": "Lever", "total_bytes": 9_000_000, "ts": "2026-09-17T01:00:00"},
+            {"ats": "Lever", "total_bytes": 50_000_000, "dry_run": True, "ts": "2026-09-17"}]
+    f.write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
+    d = queries.data_stats(f)
+    assert d["jobs"] == 3 and d["avg_by_ats"]["Ashby"] == 3.0
+    assert d["p50_mb"] == 4.0 and d["max_mb"] == 9.0
+    assert sum(b["n"] for b in d["histogram"]) == 3
+    assert queries.data_stats(tmp_path / "missing")["jobs"] == 0
+
+
+def test_ip_stats(tmp_path):
+    import json
+
+    p = tmp_path / "ip.jsonl"
+    base = {"provider": "px", "isp": "Comcast", "country": "US", "city": "Austin"}
+    recs = [
+        {**base, "ip": "1.1.1.1", "fraud_score": 5, "applied": True, "blocked": False},
+        {**base, "ip": "2.2.2.2", "fraud_score": 90, "applied": False, "blocked": True},
+        {"provider": "direct", "applied": False, "blocked": False},  # no lookup: still counted
+    ]
+    p.write_text("\n".join(json.dumps(r) for r in recs))
+    out = queries.ip_stats(p, cutoff=75)
+    assert out["jobs"] == 3 and out["ips"] == 2 and out["scored"] == 2
+    assert out["avg_score"] == 47.5 and out["pct_over_cutoff"] == 0.5
+    assert out["histogram"][0] == 1 and out["histogram"][9] == 1
+    px = next(g for g in out["groups"]["provider"] if g["name"] == "px")
+    assert px["n"] == 2 and px["block_rate"] == 0.5
+    assert queries.ip_stats(tmp_path / "missing")["jobs"] == 0
+
+
+def _mk(conn, url, **cols):
+    row = {"url": url, "title": "SWE Intern", "company": "Acme", "site": "Intern List - SWE",
+           "full_description": "x" * 40, "posted_date": "2026-09-10T00:00:00"}
+    row.update(cols)
+    conn.execute(f"INSERT INTO jobs ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                 list(row.values()))
+    conn.commit()
+
+
+def _counts(conn, url):
+    r = conn.execute(f"SELECT {queries._ROW_COLUMNS} FROM jobs WHERE url = ?", (url,)).fetchone()
+    return r["dup_count"], r["location_count"]
+
+
+def test_badge_counts_listings_not_rows(tmp_path):
+    conn = init_db(tmp_path / "b.db")
+    aa = "a" * 24
+    bb = "b" * 24
+    # Our own twin: the same Jobright listing stored under two URL forms.
+    _mk(conn, f"https://jobright.ai/jobs/info/{aa}", group_id="g")
+    _mk(conn, f"https://jobright.ai/jobs/info/{aa}?utm_source=x", duplicate_of=f"https://jobright.ai/jobs/info/{aa}", group_id="g")
+    assert _counts(conn, f"https://jobright.ai/jobs/info/{aa}") == (0, 0)
+    # A genuine reissue (different Jobright id) does count, once.
+    _mk(conn, f"https://jobright.ai/jobs/info/{bb}", duplicate_of=f"https://jobright.ai/jobs/info/{aa}", group_id="g")
+    _mk(conn, f"https://jobright.ai/jobs/info/{bb}?utm_source=y", duplicate_of=f"https://jobright.ai/jobs/info/{aa}", group_id="g")
+    assert _counts(conn, f"https://jobright.ai/jobs/info/{aa}") == (1, 0)
+    # A sibling location is its own count, and the hidden rows don't inflate it.
+    _mk(conn, f"https://jobright.ai/jobs/info/{'c' * 24}", location="Austin, TX", group_id="g")
+    assert _counts(conn, f"https://jobright.ai/jobs/info/{aa}") == (1, 1)
+    members = queries.job_group(f"https://jobright.ai/jobs/info/{aa}", conn)
+    assert len(members) == 2
+
+
+def test_same_job_reissued_same_day_is_one_sighting(tmp_path):
+    conn = init_db(tmp_path / "c.db")
+    new, a, b, old = ("https://jobright.ai/jobs/info/" + c * 24 for c in "nabo")
+    kw = {"ats_job_id": "monumenthealth:27_1439", "group_id": "g"}
+    _mk(conn, new, posted_date="2026-09-21T10:00:00", **kw)
+    # Two Jobright ids issued 4 hours apart the same day: one earlier sighting.
+    _mk(conn, a, posted_date="2026-09-12T03:00:00", duplicate_of=new, **kw)
+    _mk(conn, b, posted_date="2026-09-12T07:00:00", duplicate_of=new, **kw)
+    assert _counts(conn, new) == (1, 0)
+    # A sighting on another day is its own entry.
+    _mk(conn, old, posted_date="2026-09-07T22:00:00", duplicate_of=new, **kw)
+    assert _counts(conn, new) == (2, 0)
+    assert len(queries.job_group(new, conn)) == 2

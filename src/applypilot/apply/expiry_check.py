@@ -40,6 +40,30 @@ _CLOSED_PHRASES = [
     "this req has been closed",
     "requisition has been closed",
     "job is no longer accepting",
+    # ATS "gone" pages that return a 4xx with real body text instead of a
+    # bare 404 -- seen live on Avature (Slalom) returning 403 + "Page not
+    # found" for a pulled listing.
+    "page not found",
+    "job not found",
+    "position not found",
+    "listing not found",
+    "job listing not found",
+    "requisition not found",
+    "vacancy has been filled",
+    "this vacancy is closed",
+]
+
+# A 4xx with one of these is a bot wall (Cloudflare/DataDome challenge, not
+# the ATS's own content) and must never be read as evidence of anything --
+# seen live on ZipRecruiter returning 403 + "Just a moment..." for a
+# perfectly live listing.
+_BOT_CHALLENGE_MARKERS = [
+    "just a moment",
+    "checking your browser",
+    "enable javascript and cookies to continue",
+    "attention required",
+    "verify you are human",
+    "cf-chl",
 ]
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApplyPilotExpiryCheck/1.0)"}
@@ -47,12 +71,17 @@ _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApplyPilotExpiryCheck/1.0)"}
 
 def _heuristic(status_code: int, text: str) -> str:
     """Return 'expired', 'open', or 'inconclusive'."""
+    lowered = text.lower()
     if status_code in (404, 410):
         return "expired"
     if status_code >= 400:
-        # A server hiccup or a bot-block isn't evidence either way.
+        if any(marker in lowered for marker in _BOT_CHALLENGE_MARKERS):
+            return "inconclusive"
+        if any(phrase in lowered for phrase in _CLOSED_PHRASES):
+            return "expired"
+        # A server hiccup or an unrecognized bot-block isn't evidence
+        # either way.
         return "inconclusive"
-    lowered = text.lower()
     if any(phrase in lowered for phrase in _CLOSED_PHRASES):
         return "expired"
     if len(text.strip()) < _MIN_TEXT_LEN:

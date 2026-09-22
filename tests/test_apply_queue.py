@@ -53,20 +53,28 @@ def test_queued_drains_in_user_order(db):
     _insert(db, "https://a.example/2", queue_position=0, fit_score=3)
     _insert(db, "https://a.example/3", queue_position=1, fit_score=7)
 
-    row = launcher._select_queued(db, "batch-1", set())
+    row = launcher._select_queued(db, set())
     assert row["url"] == "https://a.example/2"
 
 
-def test_queued_ignores_other_batches(db):
-    _insert(db, "https://a.example/1", queue_batch="batch-2")
-    assert launcher._select_queued(db, "batch-1", set()) is None
+def test_queued_merges_batches_fifo_by_queued_at(db):
+    """Every batch the web UI has ever queued is one backlog: an earlier
+    batch drains completely before a later one starts, even though each
+    batch's own queue_position resets to 0."""
+    _insert(db, "https://a.example/1", queue_batch="batch-2",
+            queue_position=0, queued_at="2026-09-02T00:00:00")
+    _insert(db, "https://a.example/2", queue_batch="batch-1",
+            queue_position=0, queued_at="2026-09-01T00:00:00")
+
+    row = launcher._select_queued(db, set())
+    assert row["url"] == "https://a.example/2"
 
 
 def test_queued_skips_deferred_rows(db):
     _insert(db, "https://a.example/1", queue_position=0)
     _insert(db, "https://a.example/2", queue_position=1)
 
-    row = launcher._select_queued(db, "batch-1", {"https://a.example/1"})
+    row = launcher._select_queued(db, {"https://a.example/1"})
     assert row["url"] == "https://a.example/2"
 
 
@@ -82,14 +90,14 @@ def test_queued_skips_deferred_rows(db):
 ])
 def test_queued_ignores_every_ranked_gate(db, gate):
     _insert(db, "https://a.example/1", **gate)
-    row = launcher._select_queued(db, "batch-1", set())
+    row = launcher._select_queued(db, set())
     assert row is not None, f"a user-selected job was dropped by {gate}"
 
 
 def test_queued_only_takes_rows_still_marked_queued(db):
     """A row already claimed or finished is not handed out again."""
     _insert(db, "https://a.example/1", apply_status="in_progress")
-    assert launcher._select_queued(db, "batch-1", set()) is None
+    assert launcher._select_queued(db, set()) is None
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +129,7 @@ def test_is_blocked(site, url, blocked):
 
 def test_acquire_claims_the_row(db):
     _insert(db, "https://a.example/1")
-    job = launcher.acquire_job(queue_batch="batch-1", worker_id=3)
+    job = launcher.acquire_job(manual_queue=True, worker_id=3)
 
     assert job["url"] == "https://a.example/1"
     status, agent = db.execute(
@@ -143,7 +151,7 @@ def test_unusable_row_does_not_strand_the_rest_of_the_batch(db):
             application_url="https://ibegin.tcsapps.com/x")
     _insert(db, "https://a.example/2", queue_position=1)
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
 
     assert job is not None, "batch stalled on the first unusable row"
     assert job["url"] == "https://a.example/2"
@@ -162,7 +170,7 @@ def test_blocked_row_is_failed_not_silently_skipped(db):
             application_url="https://www.glassdoor.com/job/1")
     _insert(db, "https://a.example/2", queue_position=1)
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
 
     assert job["url"] == "https://a.example/2"
     status, err = db.execute(
@@ -175,16 +183,17 @@ def test_blocked_row_is_failed_not_silently_skipped(db):
 def test_duplicate_row_is_failed_when_sibling_already_applied(db):
     """A confirmed duplicate (dedup.check_duplicate) must never be applied
     to when its sibling has genuinely already been submitted -- even in
-    queue_batch mode where the ranked branch's gates are deliberately
+    manual_queue mode where the ranked branch's gates are deliberately
     skipped, since this one isn't a ranking gate, it's "don't apply to the
     same posting twice under two URLs." A canonical row not flagged as a
-    duplicate of anything is unaffected and still gets claimed."""
+    duplicate of anything is unaffected and still gets claimed.
+    """
     _insert(db, "https://a.example/1", apply_status="applied")
     _insert(db, "https://a.example/2", queue_position=0,
             duplicate_of="https://a.example/1")
     _insert(db, "https://a.example/3", queue_position=1)
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
 
     assert job["url"] == "https://a.example/3", "batch stalled on the duplicate row"
     status, err = db.execute(
@@ -202,11 +211,11 @@ def test_duplicate_row_is_still_tried_when_sibling_never_applied(db):
     double apply (the sibling hasn't been applied to either) and just wastes
     the whole cluster's only chance to be tried, so it must still be
     claimed normally."""
-    _insert(db, "https://a.example/1", apply_status="queued", queue_batch="other-batch")
+    _insert(db, "https://a.example/1", apply_status=None)
     _insert(db, "https://a.example/2", queue_position=0,
             duplicate_of="https://a.example/1")
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
 
     assert job["url"] == "https://a.example/2"
 
@@ -242,7 +251,7 @@ def test_gap_window_duplicate_is_failed_not_applied_to(db):
     _insert(db, "https://a.example/2", queue_position=1,
             company="TikTok", full_description="A" * 50, location="Remote")
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
 
     assert job is None, "the only queued row was the gap-window duplicate"
     status, err = db.execute(
@@ -253,7 +262,7 @@ def test_gap_window_duplicate_is_failed_not_applied_to(db):
 
 
 def test_empty_batch_returns_none(db):
-    assert launcher.acquire_job(queue_batch="batch-1") is None
+    assert launcher.acquire_job(manual_queue=True) is None
 
 
 def test_targeted_unusable_url_returns_none_instead_of_looping(db):
@@ -315,12 +324,12 @@ def test_acquire_job_stops_once_daily_cap_hit(db, monkeypatch):
     db.commit()
 
     monkeypatch.setattr(launcher.config, "load_settings", lambda: {"max_daily_applications": 1})
-    assert launcher.acquire_job(queue_batch="batch-1") is None
+    assert launcher.acquire_job(manual_queue=True) is None
 
     # Confirm it really was the cap, not an empty queue: raise the cap and the
     # same still-queued row is claimable again.
     monkeypatch.setattr(launcher.config, "load_settings", lambda: {"max_daily_applications": 5})
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
     assert job["url"] == "https://a.example/2"
 
 
@@ -374,5 +383,5 @@ def test_acquire_job_skips_a_queued_row_at_its_company_cap(db):
             queue_position=0)
     _insert(db, "https://a.example/ok", company="Other Co", queue_position=1)
 
-    job = launcher.acquire_job(queue_batch="batch-1")
+    job = launcher.acquire_job(manual_queue=True)
     assert job["url"] == "https://a.example/ok"

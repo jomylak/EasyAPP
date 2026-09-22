@@ -156,22 +156,21 @@ the same Playwright + Gmail MCP servers, and the same Chrome.
 
 | Backend | Model | Cost | Role |
 |---|---|---|---|
-| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and effectively the only engine in normal use.** Tries every job first. |
-| `claude` | Claude Code CLI | Claude subscription quota | Rare fallback only, for jobs Goose can't finish. |
+| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and the only engine in normal use.** |
+| `claude` | Claude Code CLI | Claude subscription quota | Selectable via `--backend claude`, but not used in practice. |
 
 Because both apply as the same candidate and record the same outcome codes, their
-completion rates are directly comparable.
+completion rates are directly comparable if you do choose to run Claude directly.
 
-The fallback is narrow on purpose: Claude retries a job only when Goose gave up for
-a reason that means the *driver* lost the thread (stuck, timed out, broken page, no
-outcome reported). A posting that is expired, already applied to, or behind an SSO
-wall is just as dead for the stronger model, so it is never retried. In practice this
-fires rarely -- Goose on `xiaomi/mimo-v2.5` finishes the large majority of jobs itself,
-so budget for Claude usage as an occasional safety net, not a co-equal path.
+There is no automatic fallback between backends -- a job gets one attempt, on
+whichever backend it ran with, and a failure just goes to `failed`. (A
+captcha hit is the one exception: it gets a second attempt from a dedicated
+home-IP worker, when `APPLY_PROXY` is configured.) An earlier version
+retried a stuck Goose run on Claude automatically; it was removed because it
+essentially never fired.
 
 ```bash
 applypilot apply --backend claude       # skip Goose entirely
-applypilot apply --fallback none        # Goose only, no second attempt
 applypilot apply --url URL --dry-run    # fill the form without submitting
 ```
 

@@ -30,8 +30,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from applypilot import config, costs
+from applypilot.apply import fingerprint_history
 from applypilot.database import get_connection, init_db
 from applypilot.web import queries
+from applypilot.web import login_session
 from applypilot.web.screencast import stream_worker
 
 logger = logging.getLogger(__name__)
@@ -153,8 +155,29 @@ app = FastAPI(title="ApplyPilot", docs_url=None, redoc_url=None,
 # --- reading ---------------------------------------------------------------
 
 @app.get("/api/days")
-def api_days() -> dict:
-    return {"days": queries.list_days()}
+def api_days(
+    job_type: str | None = None,
+    site: str | None = None,
+    ats: str | None = None,
+    q: str | None = None,
+    above_pay_floor: bool = False,
+    terminal_only: bool = False,
+    likely_terminal_only: bool = False,
+    eligible_only: bool = False,
+    tier_only: bool = False,
+    location: str | None = None,
+    term: str | None = None,
+) -> dict:
+    """Day buckets with counts under the same global filters the tables use, so
+    a search or filter that matches nothing on a day doesn't leave an empty
+    table behind with a stale total."""
+    return {"days": queries.list_days(filters={
+        "job_type": job_type, "site": site,
+        "ats": [a for a in ats.split(",") if a] if ats else None,
+        "q": q, "above_pay_floor": above_pay_floor, "terminal_only": terminal_only,
+        "likely_terminal_only": likely_terminal_only, "eligible_only": eligible_only,
+        "tier_only": tier_only, "location": location, "term": term,
+    })}
 
 
 @app.get("/api/jobs")
@@ -228,6 +251,11 @@ def api_job(url: str = Query(..., description="The job's URL (its primary key)")
     return job
 
 
+@app.get("/api/job/group")
+def api_job_group(url: str = Query(..., description="The job's URL (its primary key)")) -> dict:
+    return {"members": queries.job_group(url)}
+
+
 @app.get("/api/facets")
 def api_facets() -> dict:
     return queries.facets()
@@ -270,17 +298,22 @@ def api_applications(status: str | None = None, limit: int = 200) -> dict:
     return {"rows": queries.applications(status=status, limit=limit)}
 
 
-@app.get("/api/queue/pending")
-def api_queue_pending() -> dict:
-    return {"batches": queries.pending_batches()}
-
-
 @app.get("/api/ats-stats")
 def api_ats_stats() -> dict:
     # Dashboard-only filter to goose -- costs.ats_stats() itself stays
     # backend-inclusive since `applypilot ats-stats` and estimate_batch's
     # per-(ats, backend) sampling both still want Claude's historical rows.
     return {"rows": [r for r in costs.ats_stats() if r["backend"] == "goose"]}
+
+
+@app.get("/api/data-stats")
+def api_data_stats() -> dict:
+    return queries.data_stats()
+
+
+@app.get("/api/ip-stats")
+def api_ip_stats() -> dict:
+    return queries.ip_stats()
 
 
 @app.get("/api/company-limits")
@@ -291,6 +324,21 @@ def api_company_limits() -> dict:
 @app.get("/api/failure-reasons")
 def api_failure_reasons() -> dict:
     return {"rows": costs.failure_reasons()}
+
+
+@app.get("/api/fingerprint-history")
+def api_fingerprint_history() -> dict:
+    """CreepJS "like headless" % over time -- see scripts/fingerprint_check.py
+    (run manually or by the daily applypilot-fingerprint.timer) and
+    applypilot.apply.fingerprint_history for what's actually being measured
+    and why a per-job check would be wasteful.
+    """
+    rows = fingerprint_history.load_rows()
+    keys = ("time", "label", "route", "headless_pct", "webrtc_leak", "webgl_renderer")
+    return {
+        "rows": [dict(zip(keys, r)) for r in rows],
+        "trend": fingerprint_history.trend(rows),
+    }
 
 
 @app.get("/api/resume")
@@ -486,7 +534,15 @@ def api_post_apply_status(payload: dict = Body(...)) -> dict:
 
 @app.post("/api/launch")
 def api_launch(payload: dict = Body(...)) -> dict:
-    """Start applying to a queued batch, in the background.
+    """Make sure the manual queue is being drained, in the background.
+
+    The manual queue (every batch anyone has ever queued) is drained by a
+    single always-on `applypilot apply --queued` process that never exits on
+    its own -- see worker_loop/main in launcher.py. So there's nothing batch-
+    specific to launch here: if that process is already running, the rows
+    /api/queue just inserted are picked up on its next poll for free: this
+    call is then a no-op rather than a 409, no manual "launch this batch"
+    click required. Only start a new process if none is live.
 
     Spawned as a child process rather than run here: launcher.main() installs
     a process-global SIGINT handler and atexit hooks, and would take the
@@ -494,25 +550,22 @@ def api_launch(payload: dict = Body(...)) -> dict:
     """
     global _run_proc
 
-    if run_is_live():
-        raise HTTPException(409, "A run is already in progress")
-
     batch = payload.get("batch")
-    if not batch:
-        raise HTTPException(400, "No batch given")
-
     conn = get_connection()
     pending = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE queue_batch = ? AND apply_status = 'queued'",
-        (batch,),
+        "SELECT COUNT(*) FROM jobs WHERE apply_status = 'queued'"
     ).fetchone()[0]
+
+    if run_is_live():
+        return {"batch": batch, "pid": None, "jobs": pending, "already_running": True}
+
     if not pending:
-        raise HTTPException(400, f"Batch {batch} has nothing waiting")
+        raise HTTPException(400, "Nothing in the manual queue")
 
     cmd = [
         sys.executable, "-m", "applypilot.cli", "apply",
-        "--queued", batch,
-        "--workers", str(int(payload.get("workers", 1))),
+        "--queued",
+        "--workers", "8",
     ]
     if payload.get("backend"):
         cmd += ["--backend", str(payload["backend"])]
@@ -526,7 +579,7 @@ def api_launch(payload: dict = Body(...)) -> dict:
     if payload.get("headless"):
         cmd.append("--headless")
 
-    log_path = config.LOG_DIR / f"web-run-{batch}.log"
+    log_path = config.LOG_DIR / "web-run-queue.log"
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "a")
 
@@ -536,7 +589,7 @@ def api_launch(payload: dict = Body(...)) -> dict:
         # processes it spawned with it instead of orphaning them.
         start_new_session=(os.name != "nt"),
     )
-    logger.info("Launched batch %s as pid %d", batch, _run_proc.pid)
+    logger.info("Launched manual queue worker pool as pid %d", _run_proc.pid)
     return {"batch": batch, "pid": _run_proc.pid, "jobs": pending, "log": str(log_path)}
 
 
@@ -686,6 +739,62 @@ def api_set_env_keys(payload: dict = Body(...)) -> dict:
 async def ws_screencast(websocket: WebSocket, worker_id: int) -> None:
     """Live-view a worker's headful Chrome -- see web/screencast.py."""
     await stream_worker(websocket, worker_id)
+
+
+@app.post("/api/credential-check")
+async def api_credential_check() -> dict:
+    """Settings page's "Check now" button -- runs scripts/credential_health_check.py
+    on demand instead of waiting for its daily timer. Shells out rather than
+    importing it: it's a standalone script (no __init__.py under scripts/),
+    and this is exactly the invocation the timer itself uses, so the button
+    can never drift from what the scheduled run actually checks. --dry-run
+    so a manual click doesn't also spam ntfy for something already on screen.
+    """
+    script = Path(__file__).resolve().parents[3] / "scripts" / "credential_health_check.py"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script), "--dry-run",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    text = stdout.decode("utf-8", "replace").strip()
+    if text == "credential_health_check: all clear":
+        return {"alerts": []}
+    return {"alerts": [line for line in text.splitlines() if line.strip()]}
+
+
+@app.post("/api/login-session/open")
+async def api_login_session_open(url: str = Body(..., embed=True)) -> dict:
+    """Launch (or reuse) an interactive Chrome window on the persistent
+    enrichment profile, navigated to `url` -- see web/login_session.py.
+    Don't run this while enrichment is scraping: they share one Chrome
+    profile dir, and Chromium refuses a second launch on a locked one.
+    """
+    await login_session.open_session(url)
+    return {"ok": True}
+
+
+@app.post("/api/login-session/close")
+async def api_login_session_close(reseed_workers: bool = Body(False, embed=True)) -> dict:
+    """Closes the interactive session. `reseed_workers=true` also re-clones
+    every already-initialized apply-worker profile from whatever's now in
+    the enrichment profile -- the "log in once, it propagates" flow. Refused
+    while a run is live: copying into a worker's profile dir while its
+    Chrome has that dir open corrupts it.
+    """
+    await login_session.close_session()
+    if not reseed_workers:
+        return {"ok": True, "reseeded": []}
+    if run_is_live():
+        raise HTTPException(409, "a run is live -- can't safely touch worker profiles right now")
+    from applypilot.apply.chrome import reseed_worker_profiles
+    reseeded = await asyncio.to_thread(reseed_worker_profiles, config.ENRICHMENT_PROFILE_DIR)
+    return {"ok": True, "reseeded": reseeded}
+
+
+@app.websocket("/ws/login-session")
+async def ws_login_session(websocket: WebSocket) -> None:
+    """Interactive: screencast frames out, click/key events in."""
+    await login_session.stream(websocket)
 
 
 @app.get("/api/events")

@@ -14,6 +14,7 @@ import atexit
 import json
 import logging
 import platform
+import random
 import signal
 import sys
 import threading
@@ -32,9 +33,10 @@ from applypilot.apply.failure_taxonomy import normalize_failure_reason
 from applypilot.apply.ineligibility import sweep_company_siblings
 from applypilot.apply.backends import get_backend, interrupt_all_backends
 from applypilot.apply.chrome import (
-    launch_chrome, cleanup_worker, kill_all_chrome,
+    launch_chrome, cleanup_worker, kill_all_chrome, get_worker_ip_info,
     cleanup_on_exit, BASE_CDP_PORT, get_worker_proxy_label,
 )
+from applypilot.apply import ip_health, network_stats, routing
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, render_full, get_totals,
     begin_run, end_run,
@@ -54,6 +56,16 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
+# Set once every primary worker has finished; lets the home-fallback worker
+# exit after draining the captcha backlog those workers left behind, instead
+# of being cut off (which _stop_event would do) or polling forever.
+_primaries_done = threading.Event()
+# Workers currently holding a claimed job. Added inside acquire_job before the
+# claim commits, so a worker that finds the queue empty can never miss a peer
+# that is mid-claim. A queued run stays alive while this is non-empty.
+_busy: set[int] = set()
+# How often an idle queued worker re-checks for new jobs while a peer is busy.
+IDLE_POLL = 10
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -76,13 +88,6 @@ _JOB_COLUMNS = """url, title, site, company, application_url,
 # set aside before giving up. Bounded so a selection made entirely of unusable
 # rows ends the worker instead of spinning against the database.
 _MAX_DEFERRALS = 50
-
-# A --queued batch never gains new rows mid-run, unlike the ranked queue's
-# continuous mode. So once it goes empty, the only things that could still
-# unblock it are transient (another worker's company lock clearing) -- a
-# lifetime/daily company cap never will. Give locks a few minutes, then stop,
-# rather than polling a permanently-stuck batch forever (see worker_loop).
-_QUEUE_BATCH_IDLE_POLLS = 5
 
 
 def _daily_cap_reason(conn, settings: dict) -> str | None:
@@ -181,48 +186,29 @@ def _is_blocked(site: str | None, url: str | None,
 
 
 def _live_duplicate_already_committed(conn, row) -> str | None:
-    """URL of a same-content sibling row that has already reached
-    'applied'/'in_progress', or None.
+    """URL of another row in this job's duplicate cluster that has already
+    reached 'applied'/'manual'/'in_progress', or None.
 
-    row["duplicate_of"] only reflects what checkpoint 2/3 had computed the
-    last time they ran on this row -- a row queued before enrichment or
-    scoring ever touched it has duplicate_of NULL regardless of whether a
-    duplicate exists. This is a live, narrow recheck at claim time, not a
-    replacement for those checkpoints: it only fails the claim when the
-    matched sibling has genuinely been submitted, or is being submitted
-    right now by another worker -- never against a merely similar row
-    that's still pending/queued, since that could be a legitimately
-    different req (or could just as easily be THIS row's own duplicate
-    cluster where neither side has been applied to yet -- in which case one
-    of them should simply be tried, not both permanently blocked). Excludes
-    'queued': being queued isn't having applied, and blocking on it here
-    previously meant two never-applied duplicates could deadlock each other
-    out of ever being tried. 'in_progress' stays in, to avoid two workers
-    racing to double-submit the same underlying job under different URLs
-    at the same moment.
+    Duplicates share one visible row (dedup.link keeps the newest visible and
+    points the older ones at it), so a repost is a new row for a job that may
+    already have been applied to under the old one. Checked live at claim time
+    rather than trusting stale status: only a member that has genuinely been
+    submitted, or is being submitted right now, blocks the claim. Merely
+    'related' rows (same company, similar title) never block anything.
     """
-    from applypilot.dedup import find_company_duplicate, find_exact_text_duplicate
+    from applypilot import dedup
 
-    candidate = None
-    if row["full_description"]:
-        candidate = find_exact_text_duplicate(
-            conn, row["title"], row["full_description"], row["location"],
-            text_column="full_description", exclude_url=row["url"],
-        )
-    if not candidate and row["company"] and row["full_description"]:
-        candidate = find_company_duplicate(
-            conn, row["company"], row["title"], row["full_description"], row["location"],
-            exclude_url=row["url"],
-        )
-    if not candidate:
-        return None
-
-    already = conn.execute(
-        "SELECT apply_status FROM jobs WHERE url = ?", (candidate,),
+    # A row queued before enrichment/scoring reached it has no links yet, so
+    # link it now rather than trusting whatever duplicate_of said when it was read.
+    dedup.link(conn, row["url"])
+    cur = conn.execute("SELECT duplicate_of FROM jobs WHERE url = ?", (row["url"],)).fetchone()
+    rep = (cur["duplicate_of"] if cur else None) or row["url"]
+    hit = conn.execute(
+        "SELECT url FROM jobs WHERE url != ? AND (url = ? OR duplicate_of = ?) "
+        "AND apply_status IN ('applied', 'manual', 'in_progress') LIMIT 1",
+        (row["url"], rep, rep),
     ).fetchone()
-    if already and already["apply_status"] in ("applied", "in_progress"):
-        return candidate
-    return None
+    return hit["url"] if hit else None
 
 
 def _select_target(conn, target_url: str):
@@ -238,14 +224,19 @@ def _select_target(conn, target_url: str):
     """, (target_url, target_url, like, like)).fetchone()
 
 
-def _select_queued(conn, queue_batch: str, deferred: set):
-    """Pick the next job from a batch the user selected in the web UI.
+def _select_queued(conn, deferred: set, limit: int = 1):
+    """Pick the next job off the manual queue -- every batch the web UI has
+    ever queued, merged into one FIFO backlog.
 
     Deliberately applies none of the ranked branch's gates -- not the fit
     threshold, not the pay floor, not eligibility, not age decay. A human
     looked at these rows and chose them, so their selection *is* the ranking,
-    and re-filtering it here would silently drop jobs they explicitly picked
-    and leave the batch permanently short of finishing.
+    and re-filtering it here would silently drop jobs they explicitly picked.
+
+    Ordered by queued_at first, not just queue_position: position only
+    resets to 0 within a single /api/queue call, so ordering on it alone
+    would replay every batch's start at once instead of draining batches in
+    the order they were queued.
 
     Confirmed duplicates (duplicate_of) are still selected here rather than
     excluded in SQL -- acquire_job turns them into a terminal 'failed' status
@@ -253,24 +244,24 @@ def _select_queued(conn, queue_batch: str, deferred: set):
     checks below), instead of leaving them stuck in 'queued' forever with no
     row this query would ever return to let anyone clear them.
     """
-    params = [queue_batch]
+    params: list = []
     skip_clause = ""
     if deferred:
         skip_clause = f"AND url NOT IN ({','.join('?' * len(deferred))})"
         params.extend(sorted(deferred))
-    return conn.execute(f"""
+    cur = conn.execute(f"""
         SELECT {_JOB_COLUMNS}
         FROM jobs
-        WHERE queue_batch = ?
-          AND apply_status = 'queued'
+        WHERE apply_status = 'queued'
           {skip_clause}
-        ORDER BY queue_position, url
-        LIMIT 1
-    """, params).fetchone()
+        ORDER BY queued_at, queue_position, url
+        LIMIT ?
+    """, params + [limit])
+    return cur.fetchone() if limit == 1 else cur.fetchall()
 
 
 def _select_ranked(conn, min_score: int, skip: set,
-                   blocked_sites: list, blocked_patterns: list):
+                   blocked_sites: list, blocked_patterns: list, limit: int = 1):
     """Pick the highest-ranked job the pipeline thinks is worth applying to."""
     _settings = config.load_settings()
     # Build parameterized filters to avoid SQL injection
@@ -290,7 +281,7 @@ def _select_ranked(conn, min_score: int, skip: set,
     if blocked_patterns:
         url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
         params.extend(blocked_patterns)
-    return conn.execute(f"""
+    cur = conn.execute(f"""
         SELECT {_JOB_COLUMNS}
         FROM jobs
         WHERE tailored_resume_path IS NOT NULL
@@ -345,23 +336,31 @@ def _select_ranked(conn, min_score: int, skip: set,
           (CASE company_tier WHEN 'tier1' THEN 2
                              WHEN 'adjacent' THEN 1 ELSE 0 END) DESC,
           COALESCE(desirability_score, fit_score)
-          - (julianday('now') - julianday(COALESCE(employer_posted_date, posted_date, discovered_at))) * ? DESC,
+          - (julianday('now') - julianday(COALESCE(posted_date, discovered_at))) * ? DESC,
           fit_score DESC,
-          COALESCE(employer_posted_date, posted_date, discovered_at) DESC,
+          COALESCE(posted_date, discovered_at) DESC,
           url
-        LIMIT 1
+        LIMIT ?
     """, [_settings.get("max_apply_attempts") or config.DEFAULTS["max_apply_attempts"]] + params
-         + [config.DEFAULTS["job_age_decay_per_day"]]).fetchone()
+         + [config.DEFAULTS["job_age_decay_per_day"], limit])
+    return cur.fetchone() if limit == 1 else cur.fetchall()
 
 
 def _select_captcha_backlog(conn, deferred: set):
-    """Jobs whose primary-tier static proxy hit a captcha wall, waiting for
-    the dedicated home-fallback worker's retry (see worker_loop's
-    home_fallback lane). mark_result leaves these non-permanent (apply_attempts
-    below the 99 sentinel) specifically so this query can find them --
-    _select_ranked excludes them so a different primary worker never grabs
-    one first. If this retry also hits a captcha, it's marked permanent
+    """Jobs whose primary-tier static proxy hit a captcha wall -- or had its
+    proxy connection drop mid-run -- waiting for the dedicated home-fallback
+    worker's retry (see worker_loop's home_fallback lane). mark_result leaves
+    these non-permanent (apply_attempts below the 99 sentinel) specifically
+    so this query can find them -- _select_ranked excludes them so a
+    different primary worker never grabs one first. If this retry also hits
+    a captcha or a dropped connection, it's marked permanent
     (apply_attempts=99) and drops out of both queues for good.
+
+    Both reasons share one backlog/one drain worker rather than getting
+    separate lanes -- proxy_dropped is rare enough on its own (a rotating
+    residential IP timing out mid-session) that a dedicated tier for it
+    would sit idle almost always; the home-IP worker is already the "clean
+    connection, one retry" escape hatch either way.
     """
     skip_clause = ""
     params: list = []
@@ -372,7 +371,7 @@ def _select_captcha_backlog(conn, deferred: set):
         SELECT {_JOB_COLUMNS}
         FROM jobs
         WHERE apply_status = 'failed'
-          AND apply_error = 'captcha'
+          AND apply_error IN ('captcha', 'proxy_dropped')
           AND apply_attempts < 99
           {skip_clause}
         ORDER BY COALESCE(last_attempted_at, applied_at)
@@ -380,10 +379,21 @@ def _select_captcha_backlog(conn, deferred: set):
     """, params).fetchone()
 
 
+def _route(conn, rows, worker_id: int):
+    """Drop rows another worker's company lock or a company cap rules out,
+    then let routing.pick prefer an ATS this worker's IP isn't already on.
+    Filtering first means the window isn't wasted on rows the checks in
+    acquire_job would only defer. Those checks still run on the pick."""
+    usable = [r for r in rows
+              if not _company_locked_reason(conn, r["company"], worker_id)
+              and not _company_cap_reason(conn, r["company"])]
+    return routing.pick(conn, usable, worker_id) or (rows[0] if rows else None)
+
+
 def acquire_job(target_url: str | None = None, min_score: int = 7,
                 worker_id: int = 0,
                 exclude_urls: set[str] | None = None,
-                queue_batch: str | None = None,
+                manual_queue: bool = False,
                 home_fallback: bool = False) -> dict | None:
     """Atomically acquire the next job to apply to.
 
@@ -399,11 +409,12 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         exclude_urls: URLs already attempted in this session. Needed because a
             dry run deliberately leaves the job's status untouched, so without
             this the same top-scoring job is handed back every iteration.
-        queue_batch: Drain this user-selected batch in the order the user put
-            it in, ignoring the ranked mode's gates entirely.
+        manual_queue: Drain the manual queue (every batch the web UI has
+            queued, FIFO) instead of the ranked queue, ignoring the ranked
+            mode's gates entirely.
         home_fallback: This is the dedicated home-fallback worker -- draw
             exclusively from the captcha backlog (_select_captcha_backlog)
-            instead of target_url/queue_batch/ranked selection.
+            instead of target_url/manual_queue/ranked selection.
 
     Returns:
         Job dict, or None if there is nothing left to claim.
@@ -433,12 +444,14 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 row = _select_captcha_backlog(conn, deferred)
             elif target_url:
                 row = _select_target(conn, target_url)
-            elif queue_batch:
-                row = _select_queued(conn, queue_batch, deferred)
+            elif manual_queue:
+                row = _route(conn, _select_queued(
+                    conn, deferred, routing.ROUTING_WINDOW), worker_id)
             else:
-                row = _select_ranked(conn, min_score,
-                                     set(exclude_urls or ()) | deferred,
-                                     blocked_sites, blocked_patterns)
+                row = _route(conn, _select_ranked(
+                    conn, min_score, set(exclude_urls or ()) | deferred,
+                    blocked_sites, blocked_patterns, routing.ROUTING_WINDOW),
+                    worker_id)
 
             if not row:
                 conn.rollback()
@@ -501,7 +514,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 ).fetchone()
                 duplicate_sibling_status = sibling["apply_status"] if sibling else None
             if row["duplicate_of"] and duplicate_sibling_status in ("applied", "in_progress"):
-                # Only reachable via queue_batch/target_url: the ranked
+                # Only reachable via manual_queue/target_url: the ranked
                 # branch's fit_gate_sql() already excludes duplicate_of rows
                 # from selection. A human can still queue one from the web UI
                 # (Browse hides confirmed duplicates, but the flag can be set
@@ -564,8 +577,11 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                                last_attempted_at = ?
                 WHERE url = ?
             """, (f"worker-{worker_id}", now, row["url"]))
+            _busy.add(worker_id)
             conn.commit()
 
+            if not (home_fallback or target_url):
+                routing.record_claim(worker_id, row)
             return dict(row)
         except Exception:
             conn.rollback()
@@ -918,9 +934,52 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
-    return get_backend(backend).run(
-        job, port=port, worker_id=worker_id, model=model, dry_run=dry_run,
-    )
+    network_stats.reset(port)
+    t0 = time.time()
+    status = "error"
+    try:
+        status, duration_ms = get_backend(backend).run(
+            job, port=port, worker_id=worker_id, model=model, dry_run=dry_run,
+        )
+    finally:
+        stats = network_stats.read(port)
+        stats["elapsed_s"] = round(time.time() - t0, 1)
+        _log_network_stats(job, worker_id, backend, dry_run, stats)
+        ip_health.log_job(job, worker_id, status, dry_run, get_worker_ip_info(worker_id))
+    return status, duration_ms
+
+
+_NETWORK_STATS_LOG = Path("logs/network_stats.jsonl")
+
+
+def _log_network_stats(job: dict, worker_id: int, backend: str,
+                        dry_run: bool, stats: dict) -> None:
+    """Append one apply run's network-usage breakdown as a JSONL line.
+
+    Read-only telemetry, no schema migration -- see network_stats.py's
+    docstring for why this costs nothing to collect.
+    """
+    try:
+        _NETWORK_STATS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "url": job.get("url"),
+            "company": job.get("company"),
+            "ats": job.get("ats") or job.get("site"),
+            "worker_id": worker_id,
+            "backend": backend,
+            "dry_run": dry_run,
+            **stats,
+        }
+        with _NETWORK_STATS_LOG.open("a") as f:
+            f.write(json.dumps(record) + "\n")
+        mb = stats.get("total_bytes", 0) / 1_000_000
+        add_event(
+            f"worker {worker_id}: {mb:.1f}MB / {stats.get('requests', 0)} reqs "
+            f"({stats.get('pages', 0)} pages)"
+        )
+    except Exception:
+        logger.debug("network_stats: failed to log", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -964,8 +1023,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 min_score: int = 7, headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
                 backend: str = "goose",
-                fallback_backend: str | None = None,
-                queue_batch: str | None = None,
+                manual_queue: bool = False,
                 home_fallback: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
@@ -978,10 +1036,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         model: Claude model name.
         dry_run: Don't click Submit.
         backend: Primary apply backend name -- 'goose' or 'claude'.
-        fallback_backend: Backend to retry a job on when the primary one gives
-            up for a driver-side reason. None disables the retry.
-        queue_batch: Drain this user-selected batch instead of the ranked
-            queue. See acquire_job.
+        manual_queue: Drain the manual queue instead of the ranked queue. See
+            acquire_job. Unlimited (limit=0 from main()). An idle worker
+            stays alive, polling, for as long as any peer is holding a job, so
+            jobs queued mid-run are picked up; once every worker is idle and
+            the queue is empty the run ends and the next launch starts fresh.
         home_fallback: This is the dedicated home-fallback worker: launches
             Chrome through the shared home-IP relay instead of a static
             proxy, and only ever draws from the captcha backlog (see
@@ -1002,6 +1061,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     port = BASE_CDP_PORT + worker_id
 
     while not _stop_event.is_set():
+        _busy.discard(worker_id)  # back at the top of the loop = not holding a job
         if not continuous and jobs_done >= limit:
             break
 
@@ -1010,20 +1070,22 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         job = acquire_job(target_url=target_url, min_score=min_score,
                           worker_id=worker_id, exclude_urls=attempted,
-                          queue_batch=queue_batch, home_fallback=home_fallback)
+                          manual_queue=manual_queue, home_fallback=home_fallback)
         if not job:
-            if not continuous:
+            if manual_queue and (_busy - {worker_id}):
+                # Peers are still working, so the run is still alive: stay
+                # idle, and pick up anything queued in the meantime.
+                update_state(worker_id, status="idle",
+                             last_action=f"waiting for jobs ({len(_busy)} running)")
+                if _stop_event.wait(timeout=IDLE_POLL):
+                    break
+                continue
+            if not continuous or manual_queue or (
+                    home_fallback and _primaries_done.is_set()):
                 add_event(f"[W{worker_id}] Queue empty")
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
             empty_polls += 1
-            if queue_batch and empty_polls >= _QUEUE_BATCH_IDLE_POLLS:
-                add_event(f"[W{worker_id}] Queue batch idle for "
-                          f"{empty_polls * POLL_INTERVAL}s (remaining rows "
-                          f"permanently blocked, e.g. company cap) -- stopping")
-                update_state(worker_id, status="done",
-                             last_action="batch idle, stopping")
-                break
             update_state(worker_id, status="idle",
                          last_action=f"polling ({empty_polls})")
             if empty_polls == 1:
@@ -1055,8 +1117,27 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     break
                 continue
 
+        # Jitter before every job start, not just at pipeline boot -- several
+        # idle workers all waking up on the same freshly-queued batch is the
+        # same synchronized-burst shape as a cold boot, and produced real
+        # OpenRouter "provider timed out" failures in a concurrency benchmark
+        # (2026-09-18: 3 of 8 simultaneous first-turn calls to the same cheap
+        # model timed out). Unconditional and per-job rather than trying to
+        # detect "are other workers also idle right now" -- correct either
+        # way, and 10-20s is nothing against jobs that run for minutes.
+        if _stop_event.wait(timeout=random.uniform(10, 20)):
+            break
+
         chrome_proc = None
         humanizer_stop = None
+        if not home_fallback:
+            try:  # re-validate this worker's proxy IP before every job
+                from applypilot.apply import webshare
+                webshare.before_job(worker_id, log=lambda m: add_event(
+                    f"[W{worker_id}] proxy pool: {m}"))
+            except Exception as e:
+                logger.warning("proxy pool pre-job check failed: %s", e)
+
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc, humanizer_stop = _relaunch_chrome(
@@ -1071,31 +1152,6 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             if result.split(":", 1)[-1].strip().lower() == "captcha":
                 captcha_hits += 1
                 update_state(worker_id, captcha_hits=captcha_hits)
-
-            # Second chance on the fallback backend. Only for failures that
-            # mean the *driver* gave up (outcomes.should_fall_back) -- a job
-            # that is expired, already applied to, or behind an SSO wall is
-            # just as dead for the stronger model, and retrying it would burn
-            # Claude quota for nothing.
-            if (not dry_run
-                    and fallback_backend
-                    and fallback_backend != backend
-                    and not _stop_event.is_set()
-                    and outcomes.should_fall_back(result)):
-                first_reason = result.split(":", 1)[-1]
-                add_event(f"[W{worker_id}] {backend} gave up ({first_reason[:20]}), "
-                          f"retrying on {fallback_backend}")
-                # Give the retry a clean browser. Goose may have left the page
-                # mid-form, and the fallback prompt assumes a fresh start.
-                if chrome_proc:
-                    cleanup_worker(worker_id, chrome_proc)
-                chrome_proc, humanizer_stop = _relaunch_chrome(
-                    worker_id, port, headless, humanizer_stop)
-                result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                              model=model, dry_run=dry_run,
-                                              backend=fallback_backend)
-                run_stats = get_backend(fallback_backend).pop_run_stats(worker_id)
-                used_backend = fallback_backend
 
             llm_requests = run_stats.get("llm_requests")
 
@@ -1131,16 +1187,25 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 permanent = _is_permanent_failure(result)
-                if reason.strip().lower() == "captcha" and not home_fallback:
+                if reason.strip().lower() in ("captcha", "proxy_dropped") and not home_fallback:
                     # Leave this non-permanent -- the dedicated home-fallback
-                    # worker still owes it one retry via _select_captcha_backlog.
-                    # Only that worker's own captcha hit (home_fallback=True
-                    # here) is the true dead end.
+                    # worker still owes it one retry via _select_captcha_backlog
+                    # (proxy_dropped rides the same backlog as captcha; see its
+                    # docstring). Only that worker's own hit (home_fallback=True
+                    # here) is the true dead end -- no further tier to escalate to.
                     permanent = False
                 mark_result(job["url"], "failed", reason,
                             permanent=permanent,
                             duration_ms=duration_ms, backend=used_backend,
                             llm_requests=llm_requests, stats=run_stats)
+                if (not home_fallback and normalize_failure_reason(reason)
+                        in ip_health._BLOCK_CATEGORIES):
+                    try:  # re-score this worker's IP; swap it if it went bad
+                        from applypilot.apply import webshare
+                        webshare.on_block(worker_id, log=lambda m: add_event(
+                            f"[W{worker_id}] proxy pool: {m}"))
+                    except Exception as e:
+                        logger.warning("proxy pool re-check failed: %s", e)
                 if reason.startswith("grad_date_mismatch"):
                     note = reason[len("grad_date_mismatch"):].lstrip(" -:").strip()
                     _clear_terminal_flags_on_grad_date_mismatch(job["url"], note)
@@ -1170,6 +1235,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             break
 
     update_state(worker_id, status="done", last_action="finished")
+    _busy.discard(worker_id)
     return applied, failed
 
 
@@ -1182,8 +1248,7 @@ def main(limit: int = 1, target_url: str | None = None,
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          backend: str = "goose",
-         fallback_backend: str | None = None,
-         queue_batch: str | None = None) -> None:
+         manual_queue: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -1198,20 +1263,21 @@ def main(limit: int = 1, target_url: str | None = None,
         workers: Number of parallel workers (default 1).
         backend: Primary apply backend -- 'goose' (Goose CLI on a cheap
             OpenRouter model) or 'claude' (Claude Code CLI).
-        fallback_backend: Backend to retry a job on when the primary one gives
-            up for a driver-side reason. None disables the retry.
-        queue_batch: Apply only to the jobs the user selected under this batch
-            id, in the order they were selected. Set by the web UI; ignores
-            min_score and every other ranked-queue gate.
+        manual_queue: Drain every batch the web UI has queued, FIFO across
+            batches, in the order each was selected within its own batch.
+            Set by the web UI; ignores min_score and every other ranked-queue
+            gate. The run ends once the queue is empty and every worker is
+            idle (see worker_loop); jobs queued after that need a new launch.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
+    _primaries_done.clear()
 
     # Mirror live progress to disk only when something is watching. A plain
     # terminal run writes no file and behaves exactly as it always has.
-    if queue_batch:
-        begin_run(batch=queue_batch, backend=backend, dry_run=dry_run)
+    if manual_queue:
+        begin_run(batch="queue", backend=backend, dry_run=dry_run)
 
     config.ensure_dirs()
     console = Console()
@@ -1225,25 +1291,21 @@ def main(limit: int = 1, target_url: str | None = None,
         console.print(f"[red]Cannot use --backend {backend}:[/red]\n{escape(str(exc))}")
         raise SystemExit(1)
 
-    # The fallback is a nice-to-have, so a missing one is a warning rather than
-    # a hard stop -- but it is checked here, not on the first job that needs it,
-    # so the run doesn't discover the problem an hour in.
-    if fallback_backend and fallback_backend != backend:
-        try:
-            get_backend(fallback_backend).preflight()
-        except (ValueError, RuntimeError) as exc:
-            console.print(
-                f"[yellow]Fallback backend {fallback_backend!r} unavailable, "
-                f"continuing without it:[/yellow]\n{escape(str(exc))}"
-            )
-            fallback_backend = None
-
     if continuous:
         effective_limit = 0
         mode_label = "continuous"
     else:
         effective_limit = limit
         mode_label = f"{limit} jobs"
+
+    # Webshare pool: swap out any IP with a bad fraud score before workers
+    # read APPLY_PROXY_<n>. Best-effort -- a failure keeps the current proxies.
+    try:
+        from applypilot.apply import webshare
+        if webshare.enabled():
+            webshare.ensure(log=lambda m: console.print(f"[dim]proxy pool: {m}[/dim]"))
+    except Exception as e:
+        console.print(f"[yellow]proxy pool check skipped: {e}[/yellow]")
 
     # Initialize dashboard for all workers
     for i in range(workers):
@@ -1312,8 +1374,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     model=model,
                     dry_run=dry_run,
                     backend=backend,
-                    fallback_backend=fallback_backend,
-                    queue_batch=queue_batch,
+                    manual_queue=manual_queue,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1339,17 +1400,16 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             backend=backend,
-                            fallback_backend=fallback_backend,
-                            queue_batch=queue_batch,
+                            manual_queue=manual_queue,
                         ): i
                         for i in range(workers)
                     }
                     home_future = None
                     if home_worker_id is not None:
-                        # Always continuous -- it just idle-polls an empty
-                        # backlog until the primary workers (above) start
-                        # feeding it captcha hits, or the run ends and
-                        # _stop_event below tells it to stop too.
+                        # Idle-polls an empty backlog while the primary workers
+                        # (above) may still feed it captcha hits; once they're
+                        # all done it drains what's left and exits
+                        # (_primaries_done, set below).
                         home_future = executor.submit(
                             worker_loop,
                             worker_id=home_worker_id,
@@ -1358,7 +1418,6 @@ def main(limit: int = 1, target_url: str | None = None,
                             model=model,
                             dry_run=dry_run,
                             backend=backend,
-                            fallback_backend=fallback_backend,
                             home_fallback=True,
                         )
 
@@ -1373,11 +1432,8 @@ def main(limit: int = 1, target_url: str | None = None,
 
                     if home_future is not None:
                         # Primary workers are done -- nothing left to feed
-                        # the backlog, so signal the home worker to stop
-                        # polling instead of running forever. Safe to set
-                        # here regardless of how the run ended -- run()'s own
-                        # finally block below sets it again unconditionally.
-                        _stop_event.set()
+                        # the backlog, so the home worker drains it and exits.
+                        _primaries_done.set()
                         try:
                             home_result = home_future.result()
                         except Exception:

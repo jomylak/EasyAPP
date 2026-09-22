@@ -24,6 +24,10 @@ a cooperative lock so the two never run Chromium at the same time. This
 script takes it non-blocking and skips its turn if the Zoom bot holds it;
 the Zoom bot (joiner.py) takes it blocking, since joining a meeting on time
 matters more than a perfectly clean handoff.
+
+Before blocking on the lock, the Zoom bot touches BROWSER_YIELD_PATH as a
+"wrap up now" signal -- checked here via stop_check so a batch already in
+flight bails after its current job instead of grinding through the rest.
 """
 
 import fcntl
@@ -47,6 +51,8 @@ log = logging.getLogger("pi_enrich")
 
 BASE_URL = os.environ.get("APPLYPILOT_BASE_URL", "http://applypilot.tail92c9fc.ts.net:8420")
 BROWSER_LOCK_PATH = Path(os.environ.get("BROWSER_LOCK_PATH", str(Path.home() / ".applypilot" / "browser.lock")))
+BROWSER_YIELD_PATH = Path(os.environ.get(
+    "BROWSER_YIELD_PATH", str(Path.home() / ".applypilot" / "browser_yield_requested")))
 # Slightly more conservative than Oracle's old 2.0s default -- this is now
 # the only source of enrichment traffic, and getting THIS ip flagged too
 # would be a much worse problem than enrichment running a bit slower.
@@ -126,7 +132,7 @@ def run_once(client: httpx.Client) -> int:
             log.info("%s -- %d jobs", site, len(jobs))
             stats = scrape_site_batch(
                 None, site, jobs, delay=DEFAULT_DELAY, remote_report=reporter,
-                jitter=DEFAULT_JITTER,
+                jitter=DEFAULT_JITTER, stop_check=BROWSER_YIELD_PATH.exists,
             )
             log.info(
                 "%s summary: %d ok, %d partial, %d error | T1=%d T2=%d T3=%d",

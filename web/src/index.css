@@ -796,22 +796,20 @@ tr.exp.open > td {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 12px;
 }
-/* Outcomes and Failure reasons stack in the left column, each pinned to
-   --dash-box-h (Outcomes' own original height) via an explicit row track --
-   `auto` here would let a long failure-category list grow the row instead of
-   scrolling inside it. ATS and Company caps each span both rows, so a fixed
-   row track also fixes *their* total height at exactly 2x --dash-box-h + the
-   gap between -- "stop at the bottom of the two boxes on the left" -- with
-   .dash-scroll (flex:1 inside each flex-column panel) taking whatever's left
-   after that panel's own header. */
+/* Two fixed --dash-box-h row tracks (`auto` would let a long list grow the
+   row instead of scrolling inside it). ATS and Failure reasons stack in the
+   middle column, one track each, so they're the same size; Outcomes and
+   Company caps each span both tracks, so all three columns start and end at
+   the same line. .dash-scroll (flex:1 inside each flex-column panel) takes
+   whatever's left after that panel's own header. */
 .dash-grid {
-  --dash-box-h: 270px;
+  --dash-box-h: 320px;
   display: grid;
   grid-template-columns: repeat(3, minmax(340px, 1fr));
   grid-template-rows: var(--dash-box-h) var(--dash-box-h);
   grid-template-areas:
     "outcomes ats caps"
-    "failures ats caps";
+    "outcomes failures caps";
   gap: 18px;
 }
 @media (max-width: 1150px) {
@@ -820,8 +818,8 @@ tr.exp.open > td {
     grid-template-rows: repeat(4, var(--dash-box-h));
     grid-template-areas:
       "outcomes"
-      "failures"
       "ats"
+      "failures"
       "caps";
   }
 }
@@ -1028,6 +1026,57 @@ tr.exp.open > td {
   font-family: var(--mono);
 }
 
+.loginwin-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.loginwin {
+  width: min(1280px, 92vw);
+  background: var(--a-panel);
+  border: 1px solid var(--a-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.loginwin-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--a-line);
+  font-size: 13px;
+}
+.loginwin-body {
+  position: relative;
+  aspect-ratio: 1280 / 800;
+  background: var(--a-ground);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.loginwin-frame {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  cursor: default;
+}
+.loginwin-status {
+  position: absolute;
+  font-size: 12px;
+  color: var(--a-text-3);
+  font-family: var(--mono);
+}
+.loginwin-reseed-note {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--a-text-2);
+  border-bottom: 1px solid var(--a-line);
+}
+
 /* Status badges -- reused by both the live worker rows and the applications
    table, so a status reads the same color everywhere it appears. */
 .badge {
@@ -1041,6 +1090,7 @@ tr.exp.open > td {
   padding: 2px 8px;
   border-radius: 3px;
   border: 1px solid var(--a-line);
+  background: var(--a-surface);
   color: var(--a-text-2);
   white-space: nowrap;
 }
@@ -1050,6 +1100,28 @@ tr.exp.open > td {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+}
+select.badge {
+  color-scheme: dark;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 20px;
+  transition: background-color 0.1s, border-color 0.1s;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='currentColor' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+}
+select.badge:hover:not(:disabled) {
+  background-color: var(--a-hover);
+  border-color: color-mix(in srgb, currentColor 55%, var(--a-line));
+}
+select.badge:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+select.badge option {
+  background: var(--a-surface);
+  color: var(--a-text);
 }
 .badge.applied { color: var(--a-good); border-color: color-mix(in srgb, var(--a-good) 40%, var(--a-line)); }
 .badge.failed { color: var(--a-bad); border-color: color-mix(in srgb, var(--a-bad) 40%, var(--a-line)); }
@@ -1108,9 +1180,9 @@ tr.exp.open > td {
 
 .ats-row {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) minmax(80px, 2fr) 40px 56px 90px;
+  grid-template-columns: minmax(80px, 1fr) minmax(30px, 70px) 34px 44px 44px 52px;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   padding: 7px 0;
   border-bottom: 1px solid var(--a-line-soft);
   font-size: 12.5px;
@@ -1282,6 +1354,13 @@ tr.exp.open > td {
   color: var(--a-text-3);
   margin: -2px 0 12px;
   max-width: 62ch;
+}
+.cred-ok {
+  color: var(--a-ok, #3a9d5d);
+}
+.cred-alert {
+  color: var(--a-danger, #c0392b);
+  font-size: 12px;
 }
 .setting-row {
   display: flex;
@@ -1467,3 +1546,27 @@ tr.exp.open > td {
   color: var(--a-text-3);
   margin-top: 6px;
 }
+
+.ats-mb { text-align: right; color: var(--a-text-2); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.data-usage { padding: 10px 16px 12px; border-top: 1px solid var(--a-line-soft); margin-top: 4px; }
+.data-usage-stats { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.data-label { font-size: 10.5px; color: var(--a-text-3); text-transform: uppercase; letter-spacing: 0.04em; }
+.data-value { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--a-text); margin-top: 2px; }
+.hist-bars { position: relative; display: flex; align-items: flex-end; gap: 3px; height: 44px; border-bottom: 1px solid var(--a-line); }
+.hist-bar { flex: 1; background: var(--a-good); opacity: 0.55; border-radius: 2px 2px 0 0; }
+.hist-bar:hover { opacity: 0.9; }
+.hist-marker { position: absolute; top: 0; bottom: 0; border-left: 1px dashed var(--a-text-3); pointer-events: none; }
+.hist-marker span { position: absolute; top: -1px; left: 4px; font-family: var(--mono); font-size: 9.5px; color: var(--a-text-2); }
+.hist-marker:last-child span { left: auto; right: 4px; }
+.hist-axis { display: flex; justify-content: space-between; margin-top: 3px; font-family: var(--mono); font-size: 9.5px; color: var(--a-text-3); }
+.data-usage-title { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--a-text); margin-bottom: 8px; }
+.data-usage-title span { font-family: var(--sans); font-weight: 400; font-size: 11px; color: var(--a-text-3); margin-left: 6px; }
+
+.hist-bar.bad { background: var(--a-bad); }
+.ip-tabs { display: flex; gap: 4px; margin: 12px 0 4px; }
+.ip-tab { font-family: var(--mono); font-size: 10.5px; padding: 2px 8px; border-radius: 4px; border: 1px solid var(--a-line); background: none; color: var(--a-text-3); cursor: pointer; }
+.ip-tab.on { color: var(--a-text); border-color: var(--a-text-3); }
+.ip-row { display: grid; grid-template-columns: 1fr 44px 44px 60px 44px; gap: 6px; padding: 4px 0; border-bottom: 1px solid var(--a-line-soft); font-family: var(--mono); font-size: 11px; color: var(--a-text-2); text-align: right; }
+.ip-row .ip-name { text-align: left; color: var(--a-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ip-head { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--a-text-3); }
+.ip-bad { color: var(--a-bad); }

@@ -171,24 +171,21 @@ Playwright + Gmail MCP servers, and the same Chrome:
 
 | Backend | Model | Cost | Role |
 |---|---|---|---|
-| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and effectively the only engine in normal use.** Runs every job first. |
-| `claude` | Claude Code CLI | Your Claude subscription quota | Rare fallback only. Retries only the jobs Goose couldn't finish. |
+| `goose` | OpenRouter (`xiaomi/mimo-v2.5`) | ~$0.05/application | **Default, and the only engine in normal use.** |
+| `claude` | Claude Code CLI | Your Claude subscription quota | Selectable via `--backend claude`, but not used in practice. |
 
-The fallback is deliberately narrow. Claude gets a second attempt only when
-Goose gave up for a reason that means *the driver* lost the thread — it got
-stuck, timed out, hit a broken page, or never reported an outcome. A posting
-that's expired, already applied to, or behind an SSO wall is just as dead for
-the stronger model, so those are never retried. In practice Goose on
-`xiaomi/mimo-v2.5` finishes the large majority of jobs itself, so Claude usage
-should stay occasional — if it isn't, that's a sign something regressed on
-the Goose side, not that Claude should become the primary engine.
+A job gets exactly one attempt, on whichever backend it ran with -- a
+failure just goes to `failed`, no automatic retry on the other backend. (A
+captcha hit is the one exception: it gets a second attempt from a dedicated
+home-IP worker, when `APPLY_PROXY` is configured.) An earlier version
+retried a stuck Goose run on Claude automatically; it was removed because it
+essentially never fired in practice.
 
-Change any of it in `~/.applypilot/settings.json`:
+Change the backend in `~/.applypilot/settings.json`:
 
 ```jsonc
 {
   "apply_backend": "goose",           // or "claude"
-  "apply_fallback_backend": "claude", // or null to disable the retry
   "goose_model": "xiaomi/mimo-v2.5",  // any OpenRouter model
   "goose_writes_quirks": true
 }
@@ -198,7 +195,6 @@ Or per run:
 
 ```bash
 applypilot apply --backend claude       # skip Goose entirely
-applypilot apply --fallback none        # Goose only, no second attempt
 ```
 
 ### The known-quirks cache
@@ -251,5 +247,4 @@ Get your own keys. Gemini's is free and takes about a minute.
 | Apply hangs at a verification email | Gmail MCP not authorized (see step 5) |
 | `Goose CLI MISSING` | Install it, then confirm `~/.local/bin` is on your PATH |
 | `OpenRouter key MISSING` | Set `OPENROUTER_API_KEY` in `~/.applypilot/.env` |
-| Every job falls back to Claude | Goose isn't finishing forms — check `~/.applypilot/logs/worker-*.log`, and try a stronger `goose_model` |
-| Want to stop using Claude quota entirely | `applypilot apply --fallback none` |
+| Jobs failing that Goose should handle | Check `~/.applypilot/logs/worker-*.log`, and try a stronger `goose_model` |

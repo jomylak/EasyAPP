@@ -15,8 +15,11 @@ Two conventions matter here:
   rather than a feature.
 """
 
+import json
+import os
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 from applypilot import company_limits
 from applypilot.database import _DAY_EXPR, get_connection
@@ -32,10 +35,20 @@ _ROW_COLUMNS = f"""
     is_remote_spring_internship,
     pay_min_hourly, pay_max_hourly, pay_below_floor,
     apply_status, applied_at, apply_error, apply_cost_usd,
-    post_apply_status, post_apply_status_at, post_apply_evidence,
+    post_apply_status, post_apply_status_at, post_apply_evidence, post_apply_event_date,
     queue_batch, queue_position, tailored_resume_path,
     {_DAY_EXPR} AS day,
-    COALESCE(employer_posted_date, posted_date, discovered_at) AS posted
+    COALESCE(posted_date, discovered_at) AS posted,
+    (SELECT COUNT(DISTINCT COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at))) FROM jobs d WHERE d.duplicate_of = jobs.url
+       AND COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at)) != COALESCE(NULLIF(jobs.ats_job_id, ''), CASE WHEN instr(jobs.url, 'info/') > 0 THEN substr(jobs.url, instr(jobs.url, 'info/') + 5, 24) ELSE jobs.url END) || '|' || date(COALESCE(jobs.posted_date, jobs.discovered_at))) AS dup_count,
+    (SELECT COUNT(DISTINCT COALESCE(NULLIF(g.ats_job_id, ''), CASE WHEN instr(g.url, 'info/') > 0 THEN substr(g.url, instr(g.url, 'info/') + 5, 24) ELSE g.url END) || '|' || date(COALESCE(g.posted_date, g.discovered_at))) FROM jobs g WHERE jobs.group_id IS NOT NULL
+       AND g.group_id = jobs.group_id AND g.duplicate_of IS NULL AND g.url != jobs.url
+       AND COALESCE(NULLIF(g.ats_job_id, ''), CASE WHEN instr(g.url, 'info/') > 0 THEN substr(g.url, instr(g.url, 'info/') + 5, 24) ELSE g.url END) || '|' || date(COALESCE(g.posted_date, g.discovered_at)) != COALESCE(NULLIF(jobs.ats_job_id, ''), CASE WHEN instr(jobs.url, 'info/') > 0 THEN substr(jobs.url, instr(jobs.url, 'info/') + 5, 24) ELSE jobs.url END) || '|' || date(COALESCE(jobs.posted_date, jobs.discovered_at))) AS location_count,
+    (EXISTS(SELECT 1 FROM jobs d WHERE d.duplicate_of = jobs.url
+            AND d.apply_status IN ('applied', 'manual', 'in_progress'))
+     OR EXISTS(SELECT 1 FROM jobs g WHERE g.group_id = jobs.group_id AND g.url != jobs.url
+               AND g.title = jobs.title
+               AND g.apply_status IN ('applied', 'manual', 'in_progress'))) AS applied_earlier
 """
 
 # Sortable columns, mapped to SQL. A whitelist rather than interpolation --
@@ -58,7 +71,7 @@ _SORT_COLUMNS: dict[str, dict] = {
     "company": {"expr": "company COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
     "title": {"expr": "title COLLATE NOCASE", "tiebreak": None, "default_dir": "asc"},
     "location": {"expr": "location COLLATE NOCASE", "tiebreak": None, "default_dir": "asc", "nulls": "LAST"},
-    "posted": {"expr": "COALESCE(employer_posted_date, posted_date, discovered_at)", "tiebreak": None, "default_dir": "desc"},
+    "posted": {"expr": "COALESCE(posted_date, discovered_at)", "tiebreak": None, "default_dir": "desc"},
     # Never sort on the `salary` text: it compares "$9" against "$110500"
     # lexically and puts the nine first. NULLS LAST regardless of direction --
     # an unstated pay should never sort to the top just because the user
@@ -248,7 +261,8 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     return (" AND ".join(clauses) if clauses else "1"), params
 
 
-def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
+def list_days(conn: sqlite3.Connection | None = None,
+              filters: dict | None = None) -> list[dict]:
     """Every day that has postings, newest first, with the chip counts.
 
     The counts come back with the days rather than from three more round
@@ -259,7 +273,7 @@ def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
     which reads as "10 jobs vanished" the moment you open that day.
     """
     conn = conn or get_connection()
-    visible_where, _ = _filter_clauses({})
+    visible_where, params = _filter_clauses(filters or {})
     rows = conn.execute(f"""
         SELECT {_DAY_EXPR} AS day,
                COUNT(*) AS total,
@@ -271,7 +285,7 @@ def list_days(conn: sqlite3.Connection | None = None) -> list[dict]:
         WHERE {_DAY_EXPR} IS NOT NULL AND ({visible_where})
         GROUP BY day
         ORDER BY day DESC
-    """).fetchall()
+    """, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -303,6 +317,50 @@ def list_jobs(filters: dict, sort: str = DEFAULT_SORT, direction: str | None = N
         "sort": sort if sort in SORTS else DEFAULT_SORT,
         "dir": dir_used,
     }
+
+
+def job_group(url: str, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Every other posting dedup.link tied to this one: hidden duplicates
+    (older postings/reissues of the same job) and visible related postings
+    (same company, similar or same title). Newest first."""
+    conn = conn or get_connection()
+    row = conn.execute("SELECT group_id, duplicate_of FROM jobs WHERE url = ?", (url,)).fetchone()
+    if row is None:
+        return []
+    rep = row["duplicate_of"] or url
+    rows = conn.execute(
+        f"""SELECT url, title, company, location, site, apply_status, fit_score,
+                   duplicate_of, duplicate_reason, ats_job_id, {_DAY_EXPR} AS day,
+                   COALESCE(posted_date, discovered_at) AS posted
+            FROM jobs
+            WHERE url != ? AND (url = ? OR duplicate_of = ?
+                  OR (group_id IS NOT NULL AND group_id = ?))
+            ORDER BY posted DESC""",
+        (url, rep, rep, row["group_id"]),
+    ).fetchall()
+    def key(r) -> str:
+        # One entry per job per day. Jobright reissues an id, and two boards
+        # can carry the same listing, but they are one sighting of one job:
+        # identity is the employer's own id when we have it, else the Jobright
+        # id in the URL.
+        u = r["url"]
+        ident = r["ats_job_id"] or (u.split("info/")[1][:24] if "info/" in u else u)
+        return f"{ident}|{(r['posted'] or '')[:10]}"
+
+    me = conn.execute("SELECT url, ats_job_id, COALESCE(posted_date, discovered_at) AS posted "
+                      "FROM jobs WHERE url = ?", (url,)).fetchone()
+    own = key(me)
+    seen: dict[str, dict] = {}
+    for r in rows:
+        if key(r) == own:
+            continue
+        d = dict(r)
+        d["relation"] = ("applied" if r["apply_status"] in ("applied", "manual", "in_progress")
+                         else "duplicate" if (r["duplicate_of"] or r["url"] == rep) else "related")
+        prev = seen.get(key(r))
+        if prev is None or (d["relation"] == "applied" and prev["relation"] != "applied"):
+            seen[key(r)] = d
+    return list(seen.values())
 
 
 def job_detail(url: str, conn: sqlite3.Connection | None = None) -> dict | None:
@@ -391,12 +449,21 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
     row = conn.execute("""
         SELECT COUNT(*)                                                  AS total,
                SUM(apply_status = 'applied')                             AS applied,
+               -- Excludes apply_backend='manual' (self-reported applications
+               -- the candidate made by hand, found via scan_gmail_status.py's
+               -- NEWJOB detection) -- those aren't a bot attempt, so folding
+               -- them into 'applied' here would inflate the success-rate
+               -- donut with jobs the bot never touched. 'applied' above still
+               -- includes them, since that tile is meant to show total jobs
+               -- applied to this cycle regardless of who did it.
+               SUM(apply_status = 'applied' AND (apply_backend IS NULL OR apply_backend != 'manual'))
+                                                                          AS bot_applied,
                SUM(apply_status = 'failed')                              AS failed,
                SUM(apply_status = 'queued')                              AS queued,
                SUM(apply_status = 'in_progress')                         AS in_progress,
                SUM(apply_status = 'manual')                              AS manual,
                SUM(fit_score IS NOT NULL)                                AS scored,
-               SUM(detail_scraped_at IS NULL)                            AS pending_enrich,
+               SUM(detail_scraped_at IS NULL AND duplicate_of IS NULL)      AS pending_enrich,
                SUM(review_status = 'needs_review')                       AS needs_review,
                COALESCE(SUM(apply_cost_usd) FILTER (WHERE apply_backend = 'goose'), 0)
                                                                           AS spend,
@@ -420,7 +487,7 @@ def applications(status: str | None = None, limit: int = 200,
         params.append(status)
     rows = conn.execute(
         f"""SELECT {_ROW_COLUMNS}, apply_attempts, apply_backend, review_status,
-                   last_attempted_at, apply_duration_ms, resume_variant
+                   last_attempted_at, apply_duration_ms, resume_variant, application_url
             FROM jobs WHERE {where}
             ORDER BY COALESCE(last_attempted_at, applied_at) DESC, url
             LIMIT ?""",
@@ -450,7 +517,7 @@ def pending_enrich_sites(conn: sqlite3.Connection | None = None) -> list[str]:
     conn = conn or get_connection()
     skip_filter = " AND ".join(f"site != '{s}'" for s in _SKIP_DETAIL_SITES)
     rows = conn.execute(
-        f"SELECT DISTINCT site FROM jobs WHERE detail_scraped_at IS NULL AND {skip_filter}"
+        f"SELECT DISTINCT site FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL AND {skip_filter}"
     ).fetchall()
     return [r[0] for r in rows if r[0]]
 
@@ -464,7 +531,7 @@ def pending_enrich_batch(site: str, limit: int = 100,
     """
     conn = conn or get_connection()
     rows = conn.execute(
-        "SELECT url, title FROM jobs WHERE detail_scraped_at IS NULL AND site = ? "
+        "SELECT url, title FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL AND site = ? "
         "ORDER BY discovered_at ASC LIMIT ?",
         (site, max(1, min(limit, 500))),
     ).fetchall()
@@ -483,13 +550,12 @@ def report_enrich_result(url: str, outcome: dict,
     status = outcome.get("status")
 
     if status == "success":
-        from applypilot.ats import detect_ats
         from applypilot.dedup import check_duplicate
         full_description = outcome.get("full_description")
         application_url = outcome.get("application_url")
         employer_posted_date = outcome.get("employer_posted_date")
         posted_date = outcome.get("posted_date")
-        detected = detect_ats(application_url or url, full_description)
+        detected = outcome.get("ats")
         conn.execute(
             "UPDATE jobs SET full_description = ?, application_url = ?, "
             "employer_posted_date = ?, posted_date = COALESCE(posted_date, ?), "
@@ -532,22 +598,104 @@ def report_enrich_result(url: str, outcome: dict,
     return {"ok": True, "attempts": attempts, "gave_up": attempts >= 3}
 
 
-def pending_batches(conn: sqlite3.Connection | None = None) -> list[dict]:
-    """Queued batches nobody has launched yet, oldest first.
+NETWORK_STATS_LOG = Path("logs/network_stats.jsonl")  # same file launcher._log_network_stats appends to
 
-    Exists so a queue attempt that raced a live run (POST /api/queue
-    succeeded, POST /api/launch then 409'd because a run was already going)
-    is recoverable from the Dashboard once that run ends, instead of only
-    from the batch id in a toast the user has to remember or the CLI
-    fallback (`applypilot apply --queued <batch>`) the error message points
-    at.
+
+def data_stats(path: Path | None = None, bins: int = 12) -> dict:
+    """Per-job proxy bytes from network_stats.jsonl (dry runs excluded).
+
+    Read straight from the JSONL rather than a jobs column: it already carries
+    ats/url/ts, so no migration. Ceiling: re-reads the whole file per request.
     """
-    conn = conn or get_connection()
-    rows = conn.execute("""
-        SELECT queue_batch AS batch, COUNT(*) AS count, MIN(queued_at) AS queued_at
-        FROM jobs
-        WHERE apply_status = 'queued' AND queue_batch IS NOT NULL
-        GROUP BY queue_batch
-        ORDER BY MIN(queued_at) ASC
-    """).fetchall()
-    return [dict(r) for r in rows]
+    path = path or NETWORK_STATS_LOG
+    mbs: list[float] = []
+    by_ats: dict[str, list[float]] = {}
+    by_day: dict[str, float] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        b = r.get("total_bytes")
+        if r.get("dry_run") or not b:
+            continue
+        mb = b / 1e6
+        mbs.append(mb)
+        by_ats.setdefault(r.get("ats") or "unknown", []).append(mb)
+        day = (r.get("ts") or "")[:10]
+        by_day[day] = by_day.get(day, 0.0) + mb / 1000
+    out: dict = {"jobs": len(mbs), "total_gb": sum(mbs) / 1000,
+                 "avg_by_ats": {a: sum(v) / len(v) for a, v in by_ats.items()},
+                 "daily_gb": [{"day": d, "gb": g} for d, g in sorted(by_day.items())[-14:]]}
+    if not mbs:
+        return {**out, "avg_mb": 0, "p50_mb": 0, "p90_mb": 0, "max_mb": 0, "histogram": []}
+    s = sorted(mbs)
+    pct = lambda q: s[min(len(s) - 1, int(q * len(s)))]
+    # Equal-width bins up to p95 (last bin also holds the outlier tail), so one
+    # 40MB job doesn't flatten the whole 2-3MB distribution into a single bar.
+    hi = max(pct(0.95), 0.1)
+    width = hi / bins
+    hist = [0] * bins
+    for m in s:
+        hist[min(bins - 1, int(m / width))] += 1
+    return {**out, "avg_mb": sum(s) / len(s), "p50_mb": pct(0.5), "p90_mb": pct(0.9),
+            "max_mb": s[-1],
+            "histogram": [{"lo": i * width, "hi": (i + 1) * width, "n": n} for i, n in enumerate(hist)]}
+
+
+IP_HEALTH_LOG = Path("logs/ip_health.jsonl")  # same file apply/ip_health.log_job appends to
+# IPQS calls 75+ "suspicious"; scores above this render red. Override per deploy.
+FRAUD_CUTOFF = int(os.environ.get("IP_FRAUD_CUTOFF", 75))
+
+
+def ip_stats(path: Path | None = None, cutoff: int = FRAUD_CUTOFF) -> dict:
+    """Exit-IP health from ip_health.jsonl: fraud-score distribution plus
+    block/success rate sliced by provider, ISP, country and city.
+
+    Block rate is the number that matters -- the fraud score is only a proxy
+    for it. Ceiling: re-reads the whole file per request, like data_stats.
+    """
+    path = path or IP_HEALTH_LOG
+    try:
+        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    except FileNotFoundError:
+        rows = []
+    rows = [r for r in rows if isinstance(r, dict)]
+    scores = [r["fraud_score"] for r in rows if r.get("fraud_score") is not None]
+    hist = [0] * 10
+    for s in scores:
+        hist[min(9, int(s // 10))] += 1
+
+    def group(field: str) -> list[dict]:
+        g: dict[str, list[dict]] = {}
+        for r in rows:
+            g.setdefault(r.get(field) or "unknown", []).append(r)
+        out = []
+        for name, rs in g.items():
+            sc = [r["fraud_score"] for r in rs if r.get("fraud_score") is not None]
+            out.append({
+                "name": name, "n": len(rs),
+                "ips": len({r["ip"] for r in rs if r.get("ip")}),
+                "success_rate": sum(r["applied"] for r in rs) / len(rs),
+                "block_rate": sum(r["blocked"] for r in rs) / len(rs),
+                "avg_score": sum(sc) / len(sc) if sc else None,
+            })
+        return sorted(out, key=lambda x: -x["n"])[:15]
+
+    # Shown as soon as Webshare is configured, before the first swap exists.
+    from applypilot.apply import webshare
+    swaps = webshare.state() if webshare.enabled() else None
+    return {
+        "swaps": swaps,
+        "jobs": len(rows), "ips": len({r["ip"] for r in rows if r.get("ip")}),
+        "scored": len(scores), "cutoff": cutoff,
+        "avg_score": sum(scores) / len(scores) if scores else None,
+        "pct_over_cutoff": sum(s >= cutoff for s in scores) / len(scores) if scores else None,
+        "block_rate": sum(r["blocked"] for r in rows) / len(rows) if rows else None,
+        "histogram": hist,
+        "groups": {f: group(f) for f in ("provider", "isp", "country", "city")},
+    }

@@ -41,6 +41,7 @@ FAILURE_LABELS: dict[str, str] = {
     "duplicate": "Duplicate posting",
     "expired": "Posting expired",
     "captcha": "Captcha",
+    "proxy_dropped": "Proxy connection dropped",
     "login_issue": "Login required",
     "not_eligible_location": "Not eligible (location)",
     "not_eligible_salary": "Not eligible (salary)",
@@ -56,6 +57,8 @@ FAILURE_LABELS: dict[str, str] = {
     "unknown": "Unknown",
     "page_error": "Page error",
     "timeout": "Timed out",
+    "bandwidth": "Over byte cap",
+    "orphaned": "Worker died mid-run",
     "other": "Other",
 }
 

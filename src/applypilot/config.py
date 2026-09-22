@@ -254,13 +254,24 @@ def load_known_issues(ats: str | None) -> str:
     to act on blindly. Keyed by platform for the same reason quirks are: the
     same CAPTCHA vendor or widget bug recurs across every tenant on a
     platform, but the literal DOM structure does not.
+
+    Capped at the last ~4KB of the file -- known_issues/greenhouse.md grew to
+    29KB of near-duplicate lines, all of which got replayed into every
+    Greenhouse prompt regardless of relevance. Newest entries (appended last)
+    are the ones worth keeping; older ones are more likely already folded
+    into a known_quirks fix or superseded.
     """
     if not ats:
         return ""
     path = _issues_path(ats)
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8").strip()
+    text = path.read_text(encoding="utf-8").strip()
+    max_bytes = 4096
+    if len(text.encode("utf-8")) > max_bytes:
+        text = text.encode("utf-8")[-max_bytes:].decode("utf-8", errors="ignore")
+        text = text.split("\n", 1)[-1]  # drop a truncated partial first line
+    return text
 
 
 def append_known_issue(ats: str | None, entry: str) -> None:
@@ -296,7 +307,10 @@ def load_base_urls() -> dict[str, str | None]:
 
 DEFAULTS = {
     "min_score": 7,
-    "max_apply_attempts": 3,
+    # A failed job lands in the manual pile rather than burning proxy GB on a
+    # retry; captcha/proxy_dropped retries go through the home-fallback backlog
+    # (launcher._select_captcha_backlog) and ignore this cap.
+    "max_apply_attempts": 1,
     # Queue ordering only -- never rewrites the stored fit_score. A job's
     # real chance of still being open falls off the longer it's sat in the
     # queue, but the LLM's skill-match judgment doesn't change, so age is
@@ -360,6 +374,8 @@ DEFAULTS = {
     # a cheap model can sit in a slow tool call well past the point of use.
     # ~20s per action on a cheap model, with 45+ actions in a real form.
     "goose_timeout": 2400,
+    # Kill a run that has pulled this many MB through the browser (norm ~2-3).
+    "goose_max_mb": 25,
     # --- Post-apply Gmail status scan (scripts/scan_gmail_status.py) ---
     # Gemini's free API tier (same GEMINI_API_KEY used for scoring), via
     # goose's native "google" provider -- read-and-classify doesn't need the
@@ -403,12 +419,6 @@ DEFAULT_SETTINGS: dict = {
     # and costs.estimate_batch stops consulting these the moment there are
     # enough real runs to take a median from.
     "cost_defaults": {"goose": 0.04, "claude": 1.20},
-    # Backend to retry a job on when the primary one fails for a reason that
-    # looks like the *engine* gave up rather than the job being genuinely
-    # inapplicable (see outcomes.FALLBACK_REASONS). Claude is the stronger,
-    # more expensive driver, so it is worth one attempt on the jobs Goose
-    # could not finish -- but only those. Set to null to disable the retry.
-    "apply_fallback_backend": "claude",
     # Soft daily stops, checked once per acquire_job() call (launcher.py).
     # None means no cap. Hitting either just stops new jobs from being
     # claimed for the rest of the day -- a job already in_progress finishes
@@ -426,6 +436,7 @@ DEFAULT_SETTINGS: dict = {
     "goose_timeout": None,
     "goose_max_turns": None,
     "goose_max_tool_repetitions": None,
+    "goose_max_mb": None,
     # Whether a Goose run may write to the per-ATS known-quirks cache when it
     # reports RESULT:APPLIED with a QUIRK line.
     #
@@ -712,8 +723,17 @@ def apply_proxy_configured() -> bool:
     return bool(os.environ.get("APPLY_PROXY", "").strip())
 
 
-def _parse_proxy_string(raw: str, session_id: str | None = None) -> dict:
-    """host:port:user:pass -> {"host","port","user","pass","capsolver"}.
+def _parse_proxy_string(raw: str, session_id: str | None = None,
+                        home_relay: bool = False) -> dict:
+    """host:port:user:pass -> {"host","port","user","pass","capsolver","socks5"}.
+
+    "socks5://host:port" is also accepted (no-auth SOCKS5, e.g. a device on
+    the tailnet). Its capsolver string is empty -- CapSolver's servers can't
+    reach a private address, so captchas there are solved proxyless.
+
+    home_relay: only the home-IP relay (APPLY_PROXY) is fronted by the VM's
+    public relay, so only it may take the APPLY_PROXY_PUBLIC_* override. A
+    static per-worker proxy is already reachable as-is.
 
     A literal "{session}" in the user field is substituted with session_id
     when given, so a provider's sticky-session syntax (each spells it
@@ -721,7 +741,10 @@ def _parse_proxy_string(raw: str, session_id: str | None = None) -> dict:
     configured without hardcoding any one vendor's format. Static per-worker
     proxies have no session_id -- they're one fixed IP, not a rotating one.
     """
-    parts = raw.split(":")
+    socks5 = raw.startswith("socks5://")
+    parts = raw.removeprefix("socks5://").split(":")
+    if socks5 and len(parts) == 2:
+        parts += ["", ""]
     if len(parts) != 4:
         raise ValueError(
             f"Proxy format not recognized: {raw!r}. "
@@ -735,14 +758,15 @@ def _parse_proxy_string(raw: str, session_id: str | None = None) -> dict:
     # this against CapSolver's current docs before relying on it; "http" is
     # the common case but some providers require "socks5".
     proxy_type = os.environ.get("APPLY_PROXY_TYPE", "http").strip() or "http"
-    public_host = os.environ.get("APPLY_PROXY_PUBLIC_HOST", "").strip() or host
-    public_port = os.environ.get("APPLY_PROXY_PUBLIC_PORT", "").strip() or port
+    public_host = (os.environ.get("APPLY_PROXY_PUBLIC_HOST", "").strip() if home_relay else "") or host
+    public_port = (os.environ.get("APPLY_PROXY_PUBLIC_PORT", "").strip() if home_relay else "") or port
     return {
         "host": host,
         "port": port,
         "user": user,
         "pass": passwd,
-        "capsolver": f"{proxy_type}:{public_host}:{public_port}:{user}:{passwd}",
+        "capsolver": "" if socks5 else f"{proxy_type}:{public_host}:{public_port}:{user}:{passwd}",
+        "socks5": socks5,
     }
 
 
@@ -774,24 +798,33 @@ def get_apply_proxy(session_id: str) -> dict | None:
     raw = os.environ.get("APPLY_PROXY", "").strip()
     if not raw:
         return None
-    return _parse_proxy_string(raw, session_id)
+    return _parse_proxy_string(raw, session_id, home_relay=True)
 
 
-def get_worker_proxy_config(worker_id: int) -> dict | None:
-    """Parse APPLY_PROXY_<worker_id> into this worker's permanently-assigned
-    static residential proxy. Format: host:port:user:pass -- no "{session}"
-    templating, since a static IP isn't a rotating sticky session.
+def get_worker_proxy_config(worker_id: int, session_id: str | None = None) -> dict | None:
+    """Parse APPLY_PROXY_<worker_id> into this worker's proxy for the job
+    it's about to run. Format: host:port:user:pass, same as APPLY_PROXY --
+    a literal "{session}" in the user field is templated with session_id
+    when given (see _parse_proxy_string).
 
     This is the primary proxy tier: every worker launches through its own
     entry here from the start (see chrome.launch_chrome). Returns None if
     APPLY_PROXY_<worker_id> isn't set, in which case the caller falls back
     to launching direct.
+
+    A fixed dedicated-IP string (no "{session}" in it) ignores session_id
+    entirely -- the substitution is a no-op on a string with nothing to
+    replace, so this same call works unchanged whether this worker's proxy
+    is a permanent static IP or a rotating-residential vendor's sticky-
+    session format. Callers should still pass a fresh session_id per job
+    (chrome.launch_chrome does) so the rotating case gets a new identity
+    each job rather than reusing one indefinitely.
     """
     load_env()
     raw = os.environ.get(f"APPLY_PROXY_{worker_id}", "").strip()
     if not raw:
         return None
-    return _parse_proxy_string(raw)
+    return _parse_proxy_string(raw, session_id)
 
 
 def static_proxy_configured(worker_id: int) -> bool:

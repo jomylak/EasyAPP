@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from applypilot import config
-from applypilot.apply import geo_fingerprint, proxy_forwarder
+from applypilot.apply import geo_fingerprint, ip_health, proxy_forwarder
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ _worker_forwarder_stops: dict[int, callable] = {}
 # ("static (America/Los_Angeles)", "home (...)", "direct") -- dashboard-only,
 # doesn't affect routing.
 _worker_proxy_labels: dict[int, str] = {}
+# Exit-IP identity + fraud score for this worker's current launch (ip_health.lookup).
+_worker_ip_info: dict[int, dict | None] = {}
 _chrome_lock = threading.Lock()
 
 # APPLY_PROXY is the home-IP fallback: one relay on one real IP. Exactly one
@@ -58,6 +60,11 @@ def get_worker_proxy(worker_id: int) -> str | None:
     """
     with _chrome_lock:
         return _worker_proxies.get(worker_id)
+
+
+def get_worker_ip_info(worker_id: int) -> dict | None:
+    with _chrome_lock:
+        return _worker_ip_info.get(worker_id)
 
 
 def get_worker_proxy_label(worker_id: int) -> str:
@@ -203,38 +210,69 @@ def setup_worker_profile(worker_id: int) -> Path:
     if source.exists():
         logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
                     worker_id, source)
-
-        # Copy essential profile dirs -- skip caches and heavy transient data
-        skip = {
-            "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-            "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-            "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-            "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-            "SingletonLock", "SingletonSocket", "SingletonCookie",
-            # Chrome is launched with --disable-extensions, so extension
-            # data is never read -- skip it to avoid wasting space.
-            "Extensions", "Local Extension Settings", "Extension State",
-            "Sync Extension Settings",
-        }
-
-        for item in source.iterdir():
-            if item.name in skip:
-                continue
-            dst = dst_default / item.name
-            try:
-                if item.is_dir():
-                    shutil.copytree(
-                        str(item), str(dst), dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns(
-                            "Cache", "Code Cache", "GPUCache", "Service Worker",
-                        ),
-                    )
-                else:
-                    shutil.copy2(str(item), str(dst))
-            except (PermissionError, OSError):
-                pass  # skip locked files
+        _copy_profile_default(source, dst_default)
 
     return profile_dir
+
+
+# Skip caches and heavy transient data -- only session/login state (cookies,
+# local storage, login data) needs to survive a clone. Chrome is always
+# launched with --disable-extensions, so extension data is never read either.
+_PROFILE_COPY_SKIP = {
+    "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
+    "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
+    "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
+    "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
+    "SingletonLock", "SingletonSocket", "SingletonCookie",
+    "Extensions", "Local Extension Settings", "Extension State",
+    "Sync Extension Settings",
+}
+
+
+def _copy_profile_default(source: Path, dst_default: Path) -> None:
+    """Copy one Chrome profile's `Default` dir contents into another,
+    skipping caches/locks. Shared by setup_worker_profile's first-time clone
+    and reseed_worker_profiles' after-the-fact re-clone."""
+    for item in source.iterdir():
+        if item.name in _PROFILE_COPY_SKIP:
+            continue
+        dst = dst_default / item.name
+        try:
+            if item.is_dir():
+                shutil.copytree(
+                    str(item), str(dst), dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        "Cache", "Code Cache", "GPUCache", "Service Worker",
+                    ),
+                )
+            else:
+                shutil.copy2(str(item), str(dst))
+        except (PermissionError, OSError):
+            pass  # skip locked files
+
+
+def reseed_worker_profiles(source_dir: Path, worker_ids: range = range(8)) -> list[int]:
+    """Re-clone every already-initialized worker's `Default` profile from
+    `source_dir` (e.g. the enrichment profile, right after a fresh manual
+    login there) -- unlike setup_worker_profile, this OVERWRITES an
+    existing worker profile rather than skipping it. Call only when no
+    worker is actually running (the caller is responsible for that check --
+    this does not itself touch a live Chrome process, but copying into a
+    profile directory a running Chrome has open corrupts it).
+
+    Returns the worker_ids actually reseeded (i.e. that already existed).
+    """
+    source = source_dir / "Default"
+    if not source.exists():
+        return []
+    done = []
+    for wid in worker_ids:
+        dst_default = config.CHROME_WORKER_DIR / f"worker-{wid}" / "Default"
+        if not dst_default.exists():
+            continue  # never initialized -- setup_worker_profile will seed it fresh
+        _copy_profile_default(source, dst_default)
+        done.append(wid)
+    return done
 
 
 def _suppress_restore_nag(profile_dir: Path) -> None:
@@ -343,20 +381,23 @@ def launch_chrome(worker_id: int, port: int | None = None,
 
     chrome_exe = config.get_chrome_path()
 
-    # home_fallback mints a fresh sticky session on the single shared home
-    # relay (this worker's Chrome and the CAPTCHA solve for whatever job it
-    # runs must share one egress IP -- see get_apply_proxy's docstring).
-    # Otherwise this worker's own static proxy is permanent, no session
-    # templating needed since the IP never rotates.
+    # Every branch mints a fresh sticky-session id per launch -- i.e. per
+    # job, since worker_loop calls launch_chrome once per job it picks up.
+    # A plain dedicated-IP proxy string ignores this (no "{session}" to
+    # substitute, see get_worker_proxy_config), so this is a no-op today;
+    # it's what makes a rotating-residential vendor's sticky-session format
+    # work the moment APPLY_PROXY_<id> is switched to one, with the session
+    # held for exactly one job's Chrome instance and rotated on the next --
+    # no code change needed at that point.
+    import secrets
+    session_id = f"w{worker_id}-{secrets.token_hex(4)}"
     proxy = None
     proxy_kind = None
     if home_fallback:
-        import secrets
-        session_id = f"w{worker_id}-{secrets.token_hex(4)}"
         proxy = config.get_apply_proxy(session_id)
         proxy_kind = "home"
     elif use_proxy:
-        proxy = config.get_worker_proxy_config(worker_id)
+        proxy = config.get_worker_proxy_config(worker_id, session_id)
         proxy_kind = "static"
 
     _stop_forwarder_for_worker(worker_id)
@@ -370,18 +411,22 @@ def launch_chrome(worker_id: int, port: int | None = None,
             upstream_port=proxy["port"],
             user=proxy["user"],
             passwd=proxy["pass"],
+            socks5=proxy["socks5"],
         )
         with _chrome_lock:
             _worker_proxies[worker_id] = proxy["capsolver"]
             _worker_forwarder_stops[worker_id] = stop
         geo = geo_fingerprint.lookup_geo(f"{proxy['host']}:{proxy['port']}", proxy_port)
         label = f"{proxy_kind} ({geo['timezone']})" if geo else proxy_kind
+        ip_info = ip_health.lookup(proxy_port, proxy["host"], proxy_kind)
         with _chrome_lock:
             _worker_proxy_labels[worker_id] = label
+            _worker_ip_info[worker_id] = ip_info
     else:
         with _chrome_lock:
             _worker_proxies.pop(worker_id, None)
             _worker_proxy_labels[worker_id] = "direct"
+            _worker_ip_info[worker_id] = None
 
     cmd = [
         chrome_exe,

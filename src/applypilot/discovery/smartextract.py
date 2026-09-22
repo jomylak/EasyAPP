@@ -29,9 +29,9 @@ from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from applypilot import config
-from applypilot.config import CONFIG_DIR
+from applypilot.config import CONFIG_DIR, normalize_company
 from applypilot.database import init_db, get_stats, get_connection
-from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, normalize_location
+from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, link, normalize_location
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -186,6 +186,13 @@ def title_suggests_new_grad(title: str | None) -> bool:
     return bool(_TITLE_NEW_GRAD_RE.search(title))
 
 
+def _safe_link(conn: sqlite3.Connection, url: str) -> None:
+    try:
+        link(conn, url)
+    except Exception as e:  # dedup must never abort a discovery pass
+        log.warning("dedup.link failed for %s: %s", url, e)
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -221,23 +228,20 @@ def _store_jobs_filtered(
         url = canonicalize_url(url)
         location = normalize_location(job.get("location"))
 
-        # Content-match check first: this is what catches Jobright reissuing
-        # a fresh internal job id for the same posting on re-crawl (same
-        # title/description/location, a genuinely different URL) -- the
-        # IntegrityError branch below only catches a literal same-URL repost,
-        # a different case (see its comment).
-        if find_exact_text_duplicate(conn, job.get("title"), job.get("description"), location):
-            existing += 1
-            continue
-
+        # Every job is stored, even one that looks like a re-crawl (Jobright
+        # reissues a fresh id for the same posting). dedup.link() below marks a
+        # certain duplicate and hands the visible row the older one's
+        # enrichment/score, so nothing is re-scraped and nothing is dropped.
+        company = (job.get("company") or "").strip() or None
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date, airtable_record_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, job_type, posted_date, airtable_record_id, company, company_normalized) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
                  location, site, strategy, now, row_job_type,
                  normalized_posted,
-                 job.get("airtable_record_id")),
+                 job.get("airtable_record_id"),
+                 company, normalize_company(company) if company else None),
             )
             new += 1
             # jobright_minisite_api rows deliberately arrive with
@@ -253,6 +257,9 @@ def _store_jobs_filtered(
                         "UPDATE jobs SET posted_date = ? WHERE url = ?",
                         (publish_time, url),
                     )
+            # After posted_date is final: the newest cluster member is elected
+            # visible by it.
+            _safe_link(conn, url)
         except sqlite3.IntegrityError:
             existing += 1
             # Jobright (and presumably other sources) re-touch a listing's
@@ -272,6 +279,7 @@ def _store_jobs_filtered(
                 )
                 if cur.rowcount:
                     reposted += 1
+                    _safe_link(conn, url)
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
@@ -1445,6 +1453,7 @@ def _scrape_jobright_minisite_api(category: str, on_job=None) -> list[dict]:
                     "salary": salary,
                     "description": props.get("qualifications"),
                     "location": props.get("location"),
+                    "company": props.get("company"),
                     "url": f"https://jobright.ai/jobs/info/{job_id}",
                     # Deliberately not using this item's "postedAt": spot-checked
                     # against Jobright's own job pages and it runs ~7h behind what

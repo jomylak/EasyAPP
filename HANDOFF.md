@@ -12,11 +12,13 @@ Last updated: 2026-09-03
 (`ssh oracle-applypilot`), not locally. Check there for real run state, logs,
 and the actual `applypilot.db` -- local checkouts are for development only.
 
-**Apply agent (Goose on `xiaomi/mimo-v2.5` + Playwright MCP):** this is the
-primary and effectively only engine in regular use now. Claude Code is kept
-wired up as a narrow, rarely-firing fallback (see `apply_fallback_backend`)
-for jobs where Goose itself lost the thread -- it is not a co-equal path and
-should not be treated as one in cost/behavior reasoning. Real confirmed
+**Apply agent (Goose on `xiaomi/mimo-v2.5` + Playwright MCP):** the only
+engine in regular use. The Claude Code fallback backend (`--backend claude`)
+still exists in the code but the automatic retry-on-fallback mechanism was
+removed (2026-09-18) -- it basically never fired in practice, so it wasn't
+worth the complexity. A stuck/timeout/unknown-reason Goose failure now just
+goes to 'failed' like any other, no second attempt on a different engine.
+Real confirmed
 applications on Workday, SAP SuccessFactors, and simple-form ATS platforms.
 Cost/turn data is real, not estimated -- see the per-ATS cost table below.
 

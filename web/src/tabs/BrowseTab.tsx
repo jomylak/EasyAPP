@@ -8,7 +8,7 @@ import { SplitCounter } from "@/components/SplitCounter"
 import { api } from "@/lib/api"
 import type { DayBucket, Facets, GlobalFilters } from "@/lib/types"
 import { EMPTY_GLOBAL_FILTERS } from "@/lib/types"
-import { defaultPageSize } from "@/lib/utils"
+import { defaultPageSize, useDebounced } from "@/lib/utils"
 
 // Default window for the "needs attention" panels -- a week is a reasonable
 // "haven't looked in a while" horizon; the user can widen or clear it.
@@ -28,7 +28,6 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    api.days().then((d) => setDays(d.days)).catch((e) => setError(String(e)))
     api.facets().then(setFacets).catch(() => {})
     // Seed the "Eligible for me" pill from this install's own default --
     // a candidate who can only honestly apply to terminal/likely-terminal
@@ -46,6 +45,30 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
       })
       .catch(() => {})
   }, [])
+
+  // Typing in the search box (or flipping any filter) used to refetch every
+  // day table on every keystroke, and each table blanked itself while
+  // loading. Everything below reads this debounced copy instead, and the day
+  // list itself is re-queried under the same filters, so a day with no match
+  // disappears rather than leaving an empty table behind.
+  const filters = useDebounced(globalFilters, 300)
+  useEffect(() => {
+    api
+      .days({
+        job_type: filters.job_type, site: filters.site,
+        ats: filters.ats.length ? filters.ats.join(",") : undefined,
+        q: filters.q, above_pay_floor: filters.above_pay_floor,
+        terminal_only: filters.terminal_only,
+        likely_terminal_only: filters.likely_terminal_only,
+        eligible_only: filters.eligible_only, tier_only: filters.tier_only,
+        location: filters.location, term: filters.term,
+      })
+      .then((d) => {
+        setDays(d.days)
+        setError(null)
+      })
+      .catch((e) => setError(String(e)))
+  }, [filters])
 
   // Decrement the originating day's own `total` badge so it doesn't read one
   // higher than the rows actually shown once DayTable drops the removed
@@ -129,7 +152,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             minPay={INTERNSHIP_PAY_FLOOR}
             jobType="internship"
             postedWithinDays={attentionWindowDays}
-            globalFilters={globalFilters}
+            globalFilters={filters}
             selected={selected}
             onToggleSelect={onToggleSelect}
             boxHeight={attentionBoxHeight}
@@ -143,7 +166,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             minPay={NEW_GRAD_PAY_FLOOR}
             jobType="new_grad"
             postedWithinDays={attentionWindowDays}
-            globalFilters={globalFilters}
+            globalFilters={filters}
             selected={selected}
             onToggleSelect={onToggleSelect}
             boxHeight={attentionBoxHeight}
@@ -160,7 +183,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
         <div style={{ padding: 16, color: "var(--a-text-3)" }}>Loading days…</div>
       )}
       {days !== null && days.length === 0 && (
-        <div style={{ padding: 16, color: "var(--a-text-3)" }}>No jobs in the database yet.</div>
+        <div style={{ padding: 16, color: "var(--a-text-3)" }}>No jobs match{filters.q ? ` "${filters.q}"` : " these filters"}.</div>
       )}
 
       <div className="daylist">
@@ -169,7 +192,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             key={day.day}
             day={day}
             defaultPageSize={defaultPageSize(index)}
-            globalFilters={globalFilters}
+            globalFilters={filters}
             selected={selected}
             onToggleSelect={onToggleSelect}
             removedUrls={removedUrls}

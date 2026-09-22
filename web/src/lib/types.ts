@@ -65,11 +65,24 @@ export interface JobRow {
   post_apply_status: string | null
   post_apply_status_at: string | null
   post_apply_evidence: string | null
+  // OA deadline while post_apply_status='oa', interview date once
+  // post_apply_status='interview' -- meaning shifts with status, see
+  // apply/post_apply_status.py.
+  post_apply_event_date: string | null
   queue_batch: string | null
   queue_position: number | null
   tailored_resume_path: string | null
   day: string | null
   posted: string | null
+  // Distinct other postings dedup.link tied to this one: earlier reposts of
+  // this exact job (dup_count of them, hidden) plus the same posting in other
+  // cities. applied_earlier is 1
+  // when one of them was already applied to.
+  // dup_count: earlier reposts of this exact job (distinct listings, hidden);
+  // location_count: the same posting still listed for other locations.
+  dup_count?: number | null
+  location_count?: number | null
+  applied_earlier?: number | null
 }
 
 export interface JobDetail extends JobRow {
@@ -209,6 +222,9 @@ export interface GlobalFilters {
 export interface Stats {
   total: number
   applied: number
+  // Same as `applied` but excludes apply_backend='manual' (self-reported
+  // applications) -- use this one for a success-rate calc, not `applied`.
+  bot_applied: number
   failed: number
   queued: number
   in_progress: number
@@ -225,6 +241,7 @@ export interface Stats {
 export interface ApplicationRow extends JobRow {
   apply_attempts: number | null
   apply_backend: string | null
+  application_url: string | null
   review_status: string | null
   last_attempted_at: string | null
   apply_duration_ms: number | null
@@ -295,6 +312,19 @@ export interface AtsStat {
   median_duration_s: number | null
 }
 
+// src/applypilot/web/queries.py:data_stats() -- proxy bytes per apply run.
+export interface DataStats {
+  jobs: number
+  total_gb: number
+  avg_mb: number
+  p50_mb: number
+  p90_mb: number
+  max_mb: number
+  avg_by_ats: Record<string, number>
+  daily_gb: { day: string; gb: number }[]
+  histogram: { lo: number; hi: number; n: number }[]
+}
+
 // src/applypilot/costs.py:failure_reasons() -- count of failed apply
 // attempts per canonical category (apply.failure_taxonomy normalizes the raw
 // apply_error string down to `category` so near-duplicate phrasings collapse
@@ -302,6 +332,28 @@ export interface AtsStat {
 export interface FailureReasonStat {
   category: string
   label: string
+  n: number
+}
+
+// src/applypilot/apply/fingerprint_history.py -- CreepJS "like headless" %
+// from scripts/fingerprint_check.py runs (manual, or the daily
+// applypilot-fingerprint.timer). This is an environment health check, not
+// per-job telemetry: the score only moves when Chrome, the stealth
+// extension, or a proxy's reputation actually changes.
+export interface FingerprintRun {
+  time: string
+  label: string
+  route: "direct" | "proxy"
+  headless_pct: number | null
+  webrtc_leak: string
+  webgl_renderer: string
+}
+
+export interface FingerprintTrend {
+  latest: number
+  prior_avg: number
+  delta: number
+  direction: "rising" | "falling" | "flat"
   n: number
 }
 
@@ -335,7 +387,6 @@ export interface LaneWeights {
 // (config.DEFAULTS) for the per-job knobs, or "no cap" for the daily ones.
 export interface Settings {
   apply_backend: "goose" | "claude"
-  apply_fallback_backend: string | null
   cost_defaults: Record<string, number>
   max_daily_spend_usd: number | null
   max_daily_applications: number | null
@@ -380,4 +431,48 @@ export const EMPTY_GLOBAL_FILTERS: GlobalFilters = {
   location: null,
   term: null,
   q: "",
+}
+
+export interface IpGroupStat {
+  name: string
+  n: number
+  ips: number
+  success_rate: number
+  block_rate: number
+  avg_score: number | null
+}
+
+export interface ProxySwaps {
+  month: string
+  remaining: number
+  quota: number
+  swaps: { ts: string; old_ip: string; old_score: number | null; new_ip: string | null; new_score: number | null }[]
+}
+
+export interface IpStats {
+  swaps: ProxySwaps | null
+  jobs: number
+  ips: number
+  scored: number
+  cutoff: number
+  avg_score: number | null
+  pct_over_cutoff: number | null
+  block_rate: number | null
+  histogram: number[]
+  groups: Record<"provider" | "isp" | "country" | "city", IpGroupStat[]>
+}
+
+export interface GroupMember {
+  url: string
+  title: string | null
+  company: string | null
+  location: string | null
+  site: string | null
+  apply_status: string | null
+  fit_score: number | null
+  posted: string | null
+  // "duplicate": certainly the same posting (older/reissued); "related":
+  // same company, similar or same title, kept visible in its own right.
+  relation: "duplicate" | "related" | "applied"
+  duplicate_reason: string | null
 }

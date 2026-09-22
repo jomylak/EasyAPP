@@ -1,0 +1,9 @@
+[Unit]
+Description=Reap orphaned apply-worker Chrome processes and recover stale in_progress jobs
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ApplyPilot
+Environment=PATH=/home/ubuntu/ApplyPilot/.venv/bin:/usr/bin:/bin
+ExecStart=/home/ubuntu/ApplyPilot/.venv/bin/python scripts/orphan_reaper.py

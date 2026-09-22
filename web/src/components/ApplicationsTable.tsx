@@ -30,7 +30,9 @@ const STATUS_PILLS: { id: string | null; label: string }[] = [
   { id: "manual", label: "Manual" },
 ]
 
-type SortKey = "when" | "applied_at" | "cost" | "status" | "backend" | "company" | "queue"
+type SortKey = "when" | "applied_at" | "cost" | "status" | "backend" | "company" | "queue" | "outcome"
+
+const OUTCOME_RANK: Record<string, number> = { offer: 4, interview: 3, oa: 2, none: 1, rejected: 0 }
 
 const SORT_LABEL: Record<SortKey, string> = {
   when: "Last attempt",
@@ -40,6 +42,7 @@ const SORT_LABEL: Record<SortKey, string> = {
   backend: "Backend",
   company: "Company",
   queue: "Priority",
+  outcome: "Outcome",
 }
 
 function formatCost(v: number | null): string {
@@ -52,6 +55,13 @@ function formatWhen(iso: string | null): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+}
+
+function formatDateOnly(iso: string | null): string {
+  if (!iso) return "—"
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
 }
 
 function sortValue(r: ApplicationRow, key: SortKey): string | number {
@@ -70,6 +80,8 @@ function sortValue(r: ApplicationRow, key: SortKey): string | number {
       return (r.company ?? "").toLowerCase()
     case "queue":
       return r.queue_position ?? Number.MAX_SAFE_INTEGER
+    case "outcome":
+      return OUTCOME_RANK[r.post_apply_status ?? "none"] ?? -1
   }
 }
 
@@ -307,7 +319,9 @@ export function ApplicationsTable({ live }: { live: boolean }) {
               <th className="col-when sortable" onClick={() => setSort("applied_at")} title={`Sort by ${SORT_LABEL.applied_at}`}>
                 Applied{sortIndicator("applied_at")}
               </th>
-              <th className="col-status">Outcome</th>
+              <th className="col-status sortable" onClick={() => setSort("outcome")} title={`Sort by ${SORT_LABEL.outcome}`}>
+                Outcome{sortIndicator("outcome")}
+              </th>
               <th className="col-cost num sortable" onClick={() => setSort("cost")} title={`Sort by ${SORT_LABEL.cost}`}>
                 Cost{sortIndicator("cost")}
               </th>
@@ -338,6 +352,11 @@ export function ApplicationsTable({ live }: { live: boolean }) {
             )}
             {visible.map((r, i) => {
               const status = r.apply_status ?? "—"
+              // Self-reported via scan_gmail_status.py's NEWJOB detection --
+              // no full_description/scoring/etc. exists for these, so the
+              // usual JobExpansion has nothing to show. See
+              // scripts/scan_gmail_status.py's module docstring.
+              const isSelfReported = r.apply_backend === "manual" && status === "applied"
               return (
                 <Fragment key={r.url}>
                 <tr
@@ -346,7 +365,8 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                   onDragStart={isQueueView ? () => setDraggedIndex(i) : undefined}
                   onDragOver={isQueueView ? (e) => e.preventDefault() : undefined}
                   onDrop={isQueueView ? () => handleDrop(i) : undefined}
-                  onClick={() => !isQueueView && toggleOpen(r.url)}
+                  onClick={() => !isQueueView && !isSelfReported && toggleOpen(r.url)}
+                  style={isSelfReported ? { cursor: "default" } : undefined}
                 >
                   <td className="idx" style={isQueueView ? { cursor: "grab" } : undefined}>
                     {isQueueView ? `⠿ ${i + 1}` : i + 1}
@@ -360,7 +380,21 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                       "—"
                     )}
                   </td>
-                  <td className="ti" title={r.title ?? undefined}>{r.title || "—"}</td>
+                  <td className="ti" title={r.title ?? undefined}>
+                    {r.title || (isSelfReported ? "(role unknown)" : "—")}
+                    {isSelfReported && r.application_url && (
+                      <a
+                        href={r.application_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        style={{ marginLeft: 6, color: "var(--a-sel)" }}
+                        title="Careers page"
+                      >
+                        ↗
+                      </a>
+                    )}
+                  </td>
                   <td>
                     <span className={`badge ${status}`}>{STATUS_LABEL[status] ?? status}</span>
                     {status === "failed" && r.apply_error && (
@@ -399,6 +433,11 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                       </select>
                     ) : (
                       "—"
+                    )}
+                    {r.post_apply_event_date && (r.post_apply_status === "oa" || r.post_apply_status === "interview") && (
+                      <div style={{ fontSize: 11, color: "var(--a-text-3)", marginTop: 2 }}>
+                        {r.post_apply_status === "oa" ? "Due" : "Interview"} {formatDateOnly(r.post_apply_event_date)}
+                      </div>
                     )}
                   </td>
                   <td className="num">{formatCost(r.apply_cost_usd)}</td>

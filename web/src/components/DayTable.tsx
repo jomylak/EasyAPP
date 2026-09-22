@@ -723,6 +723,41 @@ function TerminalBadge({ row }: { row: JobRow }) {
   return null
 }
 
+function RelatedBadge({ row }: { row: JobRow }) {
+  const reposts = row.dup_count ?? 0
+  const cities = row.location_count ?? 0
+  if (!reposts && !cities && !row.applied_earlier) return null
+  return (
+    <>
+      {row.applied_earlier ? (
+        <span
+          className="tbadge tbadge-likely"
+          style={{ background: "var(--a-bad)", color: "#fff" }}
+          title="You already applied to this job, an earlier posting of it, or the same posting in another location. Open the row to see which."
+        >
+          APPLIED?
+        </span>
+      ) : null}
+      {reposts > 0 && (
+        <span
+          className="tbadge tbadge-likely"
+          title={`Seen before: ${reposts} earlier posting${reposts > 1 ? "s" : ""} of this same job (same ATS requisition or identical text). This row is the newest.`}
+        >
+          {"\u21BB"}{reposts}
+        </span>
+      )}
+      {cities > 0 && (
+        <span
+          className="tbadge tbadge-likely"
+          title={`The same posting is also listed for ${cities} other location${cities > 1 ? "s" : ""}. Open the row to see them.`}
+        >
+          {"\u2316"}{cities}
+        </span>
+      )}
+    </>
+  )
+}
+
 export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen, onDetailLoaded }: RowPairProps) {
   const cellsById = new Map(row.getVisibleCells().map((c) => [c.column.id, c]))
   return (
@@ -748,6 +783,7 @@ export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect,
         <td className="co" title={original.company ?? undefined}>{flexRender(cellsById.get("company")!.column.columnDef.cell, cellsById.get("company")!.getContext())}</td>
         <td className="ti" title={original.title ?? undefined}>
           <TerminalBadge row={original} />
+          <RelatedBadge row={original} />
           {flexRender(cellsById.get("title")!.column.columnDef.cell, cellsById.get("title")!.getContext())}
         </td>
         <td className="payloc">

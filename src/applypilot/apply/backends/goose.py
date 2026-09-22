@@ -45,6 +45,7 @@ from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 from applypilot.ats import detect_ats
 from applypilot.apply.chrome import get_worker_proxy, reset_worker_dir, _kill_process_tree
+from applypilot.apply import network_stats
 from applypilot.apply.dashboard import accumulate_usage, add_event, add_worker_action, update_state
 from applypilot.scoring.router import resume_paths_for_job
 
@@ -60,7 +61,7 @@ _goose_lock = threading.Lock()
 # Command construction
 # ---------------------------------------------------------------------------
 
-def _extension_args(cdp_port: int) -> list[str]:
+def _extension_args(cdp_port: int, dry_run: bool = False) -> list[str]:
     """Playwright + Gmail + applytools MCP servers, as Goose ``--with-extension`` specs.
 
     Same servers the Claude backend declares in its MCP config file, but
@@ -88,11 +89,12 @@ def _extension_args(cdp_port: int) -> list[str]:
         "gmail:npx -y @gongrzhe/server-gmail-autoauth-mcp",
         "--with-extension",
         f"applytools:{sys.executable} -m applypilot.apply.mcp_tools.server "
-        f"--cdp-endpoint=http://localhost:{cdp_port}",
+        f"--cdp-endpoint=http://localhost:{cdp_port}" + (" --dry-run" if dry_run else ""),
     ]
 
 
-def _build_command(cdp_port: int, model: str, provider: str, settings: dict | None = None) -> list[str]:
+def _build_command(cdp_port: int, model: str, provider: str, settings: dict | None = None,
+                    dry_run: bool = False) -> list[str]:
     """Assemble the full ``goose run`` argv.
 
     Deliberately does NOT pass ``-n/--name`` to set a readable Langfuse trace
@@ -128,7 +130,7 @@ def _build_command(cdp_port: int, model: str, provider: str, settings: dict | No
         "--max-turns", str(settings.get("goose_max_turns") or config.DEFAULTS["goose_max_turns"]),
         "--max-tool-repetitions",
         str(settings.get("goose_max_tool_repetitions") or config.DEFAULTS["goose_max_tool_repetitions"]),
-        *_extension_args(cdp_port),
+        *_extension_args(cdp_port, dry_run=dry_run),
     ]
 
 
@@ -158,6 +160,30 @@ def _describe_tool(name: str, args: dict, extension: str) -> str:
     return label
 
 
+def _log_generation_ids(job: dict, generation_ids: list[str], stats: dict) -> None:
+    """Append one line for this job's OpenRouter generation IDs.
+
+    Doesn't resolve ids to a provider name here -- that's a live HTTP call
+    per id, and doing 50-140 of them on the hot path just adds latency to
+    every apply run for a diagnostic feature. Log the ids now, resolve later
+    (offline, batched) against whichever jobs are actually worth inspecting.
+    """
+    try:
+        log_path = config.LOG_DIR / "goose_generations.jsonl"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "url": job.get("url", ""),
+                "title": job.get("title", ""),
+                "cost_usd": stats.get("cost_usd"),
+                "input_tokens": stats.get("input_tokens"),
+                "cache_read_tokens": stats.get("cache_read"),
+                "generation_ids": generation_ids,
+            }) + "\n")
+    except OSError:
+        logger.warning("Failed to write goose_generations.jsonl", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -184,20 +210,42 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     goose_model = settings.get("goose_model") or config.DEFAULTS["goose_model"]
     goose_provider = settings.get("goose_provider") or config.DEFAULTS["goose_provider"]
 
+    # Chrome's DevTools port has to be up before spending a single LLM call --
+    # the CDP watchdog below only catches it dying mid-run. On 9/14, 155
+    # traces ran against a dead port and burned ~$0.50-0.75 on calls that
+    # could never succeed.
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=3)
+    except Exception:
+        return "failed:cdp_unreachable", 0
+
     # Resume text -- routed live if this job never went through `run tailor`.
     txt_path, _pdf_path = resume_paths_for_job(job)
     resume_text = txt_path.read_text(encoding="utf-8") if txt_path.exists() else ""
 
     # Identical prompt to the Claude path -- same profile, same eligibility
     # rules, same known-quirks cache for this job's ATS.
+    # Reset before build_prompt, not after: build_prompt stages the upload PDF
+    # into this directory, and reset_worker_dir rmtree's it.
+    worker_dir = reset_worker_dir(worker_id)
+
+    # worker_id is load-bearing, not cosmetic. Without it build_prompt stages
+    # the resume in the shared `apply-workers/current` dir, where two parallel
+    # workers overwrite each other's upload under the same filename -- and
+    # per-track routing means those are genuinely different PDFs, so a worker
+    # can upload another job's resume. It also puts the file outside the roots
+    # Playwright MCP is allowed to read (cwd + playwright-output), which is
+    # every one of browser_file_upload's "outside allowed roots" failures.
     agent_prompt = prompt_mod.build_prompt(
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
         proxy_string=get_worker_proxy(worker_id),
+        worker_id=worker_id,
     )
 
-    cmd = _build_command(port, goose_model, goose_provider, settings)
+    cmd = _build_command(port, goose_model, goose_provider, settings, dry_run=dry_run)
 
     env = os.environ.copy()
     # Goose reads the key from the environment; ~/.applypilot/.env is already
@@ -213,8 +261,30 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     env["GOOSE_THINKING_EFFORT"] = str(
         settings.get("goose_thinking_effort") or config.DEFAULTS["goose_thinking_effort"]
     )
-
-    worker_dir = reset_worker_dir(worker_id)
+    # Pin OpenRouter to xiaomi (falling back if it's down) instead of letting
+    # it round-robin across providers -- prompt caching lives on whichever
+    # physical backend served the previous turn, so bouncing between
+    # providers mid-run silently kills the cache hit rate. Goose reads this
+    # straight through to the OpenRouter request body (openrouter_def.rs's
+    # OPENROUTER_PARAMETERS config key). Belt-and-suspenders with the
+    # account-level provider allowlist in OpenRouter's dashboard, which
+    # doesn't support ordering/fallback -- only this does.
+    if goose_provider == "openrouter":
+        # `allow_fallbacks: True` was the expensive part, not the ordering.
+        # Six providers serve mimo-v2.5 and their cache-read rates span 28x:
+        # Xiaomi/GMICloud/DeepInfra are ~$0.0028/M, Venice is $0.08/M. Our
+        # runs are ~98% cache reads, so one fallback to Venice reprices the
+        # whole run. Measured 2026-09-17: 8 of 169 runs paid 1.8x-6.9x what
+        # mimo rates imply, $1.74 of overpay on $10.08 of spend, and the
+        # worst single run cost $1.24 against a $0.18 prediction.
+        # Listing the three cheap providers keeps the resilience that
+        # motivated fallbacks; `allow_fallbacks: False` is what stops the
+        # router reaching past them. A run that fails because all three are
+        # down costs ~$0; a run silently served by Venice costs 7x.
+        env["OPENROUTER_PARAMETERS"] = json.dumps(
+            {"provider": {"order": ["Xiaomi", "GMICloud", "DeepInfra"],
+                          "allow_fallbacks": False}}
+        )
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  # The employer, falling back to the source board only when
@@ -249,6 +319,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     done = threading.Event()
     cdp_dead = threading.Event()
     timed_out = threading.Event()
+    over_budget = threading.Event()
 
     try:
         # New process group on Unix so _kill_process_tree (os.killpg) tears
@@ -323,6 +394,24 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                  name=f"goose-clock-{worker_id}", daemon=True)
         clock.start()
 
+        # Byte cap: a run pulling far more than the ~2-3MB norm through the
+        # metered proxy is looping on heavy pages, not applying.
+        def _watch_bytes() -> None:
+            cap = (settings.get("goose_max_mb") or config.DEFAULTS["goose_max_mb"]) * 1_000_000
+            while not done.wait(15):
+                if proc.poll() is not None:
+                    return
+                used = network_stats.read(port).get("total_bytes") or 0
+                if used > cap:
+                    logger.error("[worker-%d] run used %.1fMB (cap %.0fMB); killing",
+                                 worker_id, used / 1e6, cap / 1e6)
+                    over_budget.set()
+                    _kill_process_tree(proc.pid)
+                    return
+
+        threading.Thread(target=_watch_bytes, name=f"goose-bytes-{worker_id}",
+                         daemon=True).start()
+
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
 
@@ -333,6 +422,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # RESULT:/QUIRK:/ISSUE: markers.
         pending_reasoning: list[str] = []
         navigated_urls: list[str] = []
+        # OpenRouter generation IDs, one per turn -- goose's own stream never
+        # says which physical backend (xiaomi vs deepinfra vs novita, etc.)
+        # served a turn, only that it went through "openrouter". Resolving an
+        # id via GET /api/v1/generation afterwards is the only way to know;
+        # logging the ids here is what makes that possible after the fact.
+        # See [[applypilot-llm-provider-limits]].
+        generation_ids: list[str] = []
         # Last few tool descriptions, for a synthesized known_issue if the run
         # gets killed before the model prints its own ISSUE: line (see below).
         last_actions: list[str] = []
@@ -371,6 +467,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 if msg_type != "message":
                     continue
 
+                # Only "gen-..." ids are real OpenRouter generation ids
+                # resolvable via GET /api/v1/generation -- goose also emits
+                # "msg_..." ids for follow-up chunks within the same turn,
+                # which aren't lookupable and would just be noise here.
+                gen_id = msg.get("message", {}).get("id")
+                if (gen_id and gen_id.startswith("gen-")
+                        and (not generation_ids or generation_ids[-1] != gen_id)):
+                    generation_ids.append(gen_id)
+
                 for block in msg.get("message", {}).get("content", []) or []:
                     bt = block.get("type")
                     if bt == "text":
@@ -406,7 +511,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc = None
         done.set()  # stop both watchdogs; leaves their diagnoses intact
 
-        if returncode and returncode < 0 and not timed_out.is_set() and not cdp_dead.is_set():
+        if returncode and returncode < 0 and not timed_out.is_set() and not cdp_dead.is_set() and not over_budget.is_set():
             return "skipped", int((time.time() - start) * 1000)
 
         output = "".join(text_parts)
@@ -475,7 +580,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # got far enough to have real signal -- a handful of tool calls before
         # stopping is more likely a slow page than a pattern worth caching.
         if not self_reported_issue and job_ats and "RESULT:" not in output and tool_calls >= 8:
-            if timed_out.is_set():
+            if over_budget.is_set():
+                reason = "byte cap"
+            elif timed_out.is_set():
                 reason = "wall-clock timeout"
             elif cdp_dead.is_set():
                 reason = "Chrome DevTools connection died"
@@ -501,7 +608,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     "cost_usd": stats.get("cost_usd"),
                 }
             accumulate_usage(worker_id, stats.get("cost_usd", 0) or 0, stats)
-        elif timed_out.is_set() or cdp_dead.is_set():
+            if goose_provider == "openrouter" and generation_ids:
+                _log_generation_ids(job, generation_ids, stats)
+        elif timed_out.is_set() or cdp_dead.is_set() or over_budget.is_set():
             # Goose only emits its "complete" stats line at graceful end of
             # session -- a run we killed ourselves (wall-clock or dead CDP
             # port) never gets there, so `stats` is empty here even though the
@@ -545,7 +654,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         else "unknown"
                     )
                     reason = _clean_reason(reason)
-                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
+                    PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue", "proxy_dropped"}
                     if reason in PROMOTE_TO_STATUS:
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
@@ -561,6 +670,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
             update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
             return "failed:timeout", duration_ms
+
+        if over_budget.is_set():
+            add_event(f"[W{worker_id}] OVER BYTE CAP ({elapsed}s)")
+            update_state(worker_id, status="failed", last_action="over byte cap")
+            return "failed:bandwidth", duration_ms
 
         if cdp_dead.is_set():
             add_event(f"[W{worker_id}] BROWSER DIED ({elapsed}s)")

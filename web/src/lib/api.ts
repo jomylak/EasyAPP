@@ -1,6 +1,8 @@
 import type {
   ApplicationRow,
   AtsStat,
+  DataStats,
+  IpStats,
   CompanyLimitStatus,
   CostEstimate,
   DayBucket,
@@ -8,6 +10,9 @@ import type {
   EnvKeyStatus,
   Facets,
   FailureReasonStat,
+  FingerprintRun,
+  FingerprintTrend,
+  GroupMember,
   JobDetail,
   JobsPage,
   QueueResponse,
@@ -68,7 +73,10 @@ export interface JobsQuery {
 }
 
 export const api = {
-  days: () => request<{ days: DayBucket[] }>("/api/days"),
+  days: (filters: Record<string, string | number | boolean | null | undefined> = {}) =>
+    request<{ days: DayBucket[] }>(`/api/days${qs(filters)}`),
+
+  jobGroup: (url: string) => request<{ members: GroupMember[] }>(`/api/job/group${qs({ url })}`),
 
   jobs: (query: JobsQuery) =>
     request<JobsPage>(`/api/jobs${qs(query as Record<string, string | number | boolean | null | undefined>)}`),
@@ -101,18 +109,16 @@ export const api = {
       body: JSON.stringify({ urls, revert_status: revertStatus }),
     }),
 
-  launch: (batch: string, opts: { workers?: number; dry_run?: boolean; backend?: string } = {}) =>
-    request<{ batch: string; pid: number; jobs: number; log: string }>("/api/launch", {
-      method: "POST",
-      body: JSON.stringify({ batch, ...opts }),
-    }),
+  // Makes sure the always-on manual-queue worker pool is running -- a no-op
+  // if it already is, since it drains every queued batch on its own. Fixed
+  // at 8 workers server-side; there's only ever one such process.
+  launch: (batch: string, opts: { dry_run?: boolean; backend?: string } = {}) =>
+    request<{ batch: string; pid: number | null; jobs: number; log?: string; already_running?: boolean }>(
+      "/api/launch",
+      { method: "POST", body: JSON.stringify({ batch, ...opts }) },
+    ),
 
   stats: () => request<{ stats: Stats; run: RunState | null; live: boolean }>("/api/stats"),
-
-  pendingBatches: () =>
-    request<{ batches: { batch: string; count: number; queued_at: string | null }[] }>(
-      "/api/queue/pending",
-    ),
 
   applications: (status?: string | null, limit = 500) =>
     request<{ rows: ApplicationRow[] }>(`/api/applications${qs({ status, limit })}`),
@@ -127,9 +133,15 @@ export const api = {
 
   atsStats: () => request<{ rows: AtsStat[] }>("/api/ats-stats"),
 
+  dataStats: () => request<DataStats>("/api/data-stats"),
+  ipStats: () => request<IpStats>("/api/ip-stats"),
+
   companyLimits: () => request<{ rows: CompanyLimitStatus[] }>("/api/company-limits"),
 
   failureReasons: () => request<{ rows: FailureReasonStat[] }>("/api/failure-reasons"),
+
+  fingerprintHistory: () =>
+    request<{ rows: FingerprintRun[]; trend: FingerprintTrend | null }>("/api/fingerprint-history"),
 
   reportIneligible: (url: string, note?: string) =>
     request<{ job_marked: boolean; company: string | null; broad_employer: boolean | null; siblings_softened: number; siblings_disqualified: number }>(
@@ -152,4 +164,15 @@ export const api = {
 
   setEnvKeys: (values: Partial<Record<EnvKeyName, string>>) =>
     request<{ updated: string[] }>("/api/env-keys", { method: "POST", body: JSON.stringify(values) }),
+
+  openLoginSession: (url: string) =>
+    request<{ ok: boolean }>("/api/login-session/open", { method: "POST", body: JSON.stringify({ url }) }),
+
+  closeLoginSession: (reseedWorkers = false) =>
+    request<{ ok: boolean; reseeded: number[] }>("/api/login-session/close", {
+      method: "POST",
+      body: JSON.stringify({ reseed_workers: reseedWorkers }),
+    }),
+
+  credentialCheck: () => request<{ alerts: string[] }>("/api/credential-check", { method: "POST" }),
 }

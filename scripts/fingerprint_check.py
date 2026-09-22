@@ -20,7 +20,6 @@ import asyncio
 import json
 import re
 import time
-from pathlib import Path
 
 from applypilot.config import load_env, ensure_dirs
 
@@ -28,9 +27,8 @@ load_env()
 ensure_dirs()
 
 from applypilot.apply import chrome  # noqa: E402
+from applypilot.apply.fingerprint_history import REPORTS_DIR  # noqa: E402
 from playwright.async_api import async_playwright  # noqa: E402
-
-REPORTS_DIR = Path(__file__).parent / "fingerprint_reports"
 
 CREEPJS_URL = "https://abrahamjuliot.github.io/creepjs/"
 SANNYSOFT_URL = "https://bot.sannysoft.com/"
@@ -65,8 +63,10 @@ SANNYSOFT_ROWS_JS = """
 """
 
 
-async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str] | None = None) -> dict:
-    proc = chrome.launch_chrome(worker_id, use_proxy=via_proxy, extra_args=extra_args)
+async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str] | None = None,
+              home_fallback: bool = False) -> dict:
+    proc = chrome.launch_chrome(worker_id, use_proxy=via_proxy, home_fallback=home_fallback,
+                                 extra_args=extra_args)
     port = chrome.BASE_CDP_PORT + worker_id
     report: dict = {"label": label, "via_proxy": via_proxy, "timestamp": time.time()}
 
@@ -78,9 +78,14 @@ async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str]
 
             report["webgl"] = await page.evaluate(WEBGL_JS)
 
-            await page.goto(SANNYSOFT_URL, wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(1500)
-            report["sannysoft_rows"] = await page.evaluate(SANNYSOFT_ROWS_JS)
+            # Non-fatal: sannysoft is slow/flaky through some proxies and must
+            # not stop CreepJS (the check that matters) from running.
+            try:
+                await page.goto(SANNYSOFT_URL, wait_until="load", timeout=30000)
+                await page.wait_for_timeout(1500)
+                report["sannysoft_rows"] = await page.evaluate(SANNYSOFT_ROWS_JS)
+            except Exception as e:
+                report["sannysoft_error"] = str(e).splitlines()[0]
 
             await page.goto(CREEPJS_URL, wait_until="load", timeout=30000)
             # CreepJS's scoring is async and has no reliable completion event;
@@ -89,6 +94,12 @@ async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str]
             # concrete numeric signals it does print as plain text instead --
             # the "N% like headless" heuristic and the leaked WebRTC IP.
             await page.wait_for_timeout(12000)
+            # Full-page screenshot as a visual record alongside the scraped
+            # text fields below -- CreepJS has no separate canvas-drawn score
+            # to chase, this is just for eyeballing anything the regexes miss.
+            screenshot_path = REPORTS_DIR / f"{int(time.time())}-{label}-creepjs.png"
+            REPORTS_DIR.mkdir(exist_ok=True)
+            await page.screenshot(path=str(screenshot_path), full_page=True)
             body_text = await page.evaluate(CREEPJS_RESULT_JS)
             headless_match = re.search(r"(\d{1,3})% like headless", body_text)
             webrtc_ip_match = re.search(r"foundation/ip:.*?\n.*?\nip: ([\d.]+)", body_text, re.S)
@@ -96,6 +107,7 @@ async def run(label: str, via_proxy: bool, worker_id: int, extra_args: list[str]
                 "pct_like_headless": int(headless_match.group(1)) if headless_match else None,
                 "webrtc_leaked_local_ip": webrtc_ip_match.group(1) if webrtc_ip_match else None,
                 "body_excerpt": body_text,
+                "screenshot": str(screenshot_path),
             }
 
             await page.close()
@@ -113,6 +125,7 @@ def summarize(report: dict) -> str:
     creepjs = report.get("creepjs") or {}
     lines.append(f"CreepJS 'like headless': {creepjs.get('pct_like_headless')}%")
     lines.append(f"WebRTC leaked local IP: {creepjs.get('webrtc_leaked_local_ip')}")
+    lines.append(f"CreepJS trust-gauge screenshot: {creepjs.get('screenshot')}")
     fails = [row for row in report.get("sannysoft_rows", []) if any("failed" in c.lower() for c in row)]
     lines.append(f"sannysoft flagged rows: {fails if fails else 'none'}")
     return "\n".join(lines)
@@ -121,14 +134,15 @@ def summarize(report: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", default="check", help="Run label, e.g. vm-direct, vm-proxy")
-    parser.add_argument("--via-proxy", action="store_true", help="Route through APPLY_PROXY")
+    parser.add_argument("--via-proxy", action="store_true", help="Route through APPLY_PROXY_<worker-id> (static)")
+    parser.add_argument("--home-fallback", action="store_true", help="Route through APPLY_PROXY (home-IP relay) instead")
     parser.add_argument("--worker-id", type=int, default=99, help="Worker id to use for the throwaway profile")
     parser.add_argument("--swiftshader", action="store_true",
                          help="Force software WebGL via --use-angle=swiftshader (experiment for GPU-less VMs)")
     args = parser.parse_args()
 
     extra_args = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] if args.swiftshader else None
-    report = asyncio.run(run(args.label, args.via_proxy, args.worker_id, extra_args))
+    report = asyncio.run(run(args.label, args.via_proxy, args.worker_id, extra_args, args.home_fallback))
 
     REPORTS_DIR.mkdir(exist_ok=True)
     out_path = REPORTS_DIR / f"{int(report['timestamp'])}-{args.label}.json"

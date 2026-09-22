@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { api } from "@/lib/api"
-import type { JobDetail, JobRow } from "@/lib/types"
+import type { GroupMember, JobDetail, JobRow } from "@/lib/types"
 import { formatDaysAgo, formatPay, sanitizeDescription } from "@/lib/utils"
 
 interface Props {
@@ -49,6 +49,15 @@ export function JobExpansion({ row, open, onDetailLoaded }: Props) {
     }
   }, [open, row.url])
 
+  const hasRelatives = !!(row.location_count || row.dup_count || row.applied_earlier)
+  const [members, setMembers] = useState<GroupMember[] | null>(null)
+  const groupStartedRef = useRef(false)
+  useEffect(() => {
+    if (!open || !hasRelatives || groupStartedRef.current) return
+    groupStartedRef.current = true
+    api.jobGroup(row.url).then((r) => setMembers(r.members)).catch(() => setMembers([]))
+  }, [open, hasRelatives, row.url])
+
   const description = detail
     ? sanitizeDescription(detail.full_description || detail.description)
     : ""
@@ -78,6 +87,35 @@ export function JobExpansion({ row, open, onDetailLoaded }: Props) {
           <>
             <h4 style={{ marginTop: 16 }}>Why this score</h4>
             <p className="reason">{detail.reasoning}</p>
+          </>
+        )}
+
+        {hasRelatives && (
+          <>
+            <h4 style={{ marginTop: 16 }}>Related postings</h4>
+            {!members && <p style={{ color: "var(--a-text-3)" }}>Loading…</p>}
+            {members?.map((m) => (
+              <div key={m.url} style={{ display: "flex", gap: 8, alignItems: "baseline", padding: "3px 0", fontSize: 13 }}>
+                <span
+                  className="tag"
+                  title={
+                    m.relation === "duplicate"
+                      ? `An earlier posting of this same job (${m.duplicate_reason === "ats_job_id" ? "same ATS requisition" : "identical text"}), hidden from the tables`
+                      : m.relation === "applied"
+                        ? "Your own record of applying to this job"
+                        : "The same posting listed for another location"
+                  }
+                >
+                  {m.relation === "duplicate" ? "earlier posting" : m.relation === "applied" ? "you applied" : "other location"}
+                </span>
+                <a href={m.url} target="_blank" rel="noreferrer">{m.title ?? m.url}</a>
+                <span style={{ color: "var(--a-text-3)" }}>
+                  {[m.location, formatDaysAgo(m.posted), m.apply_status, m.fit_score != null ? `fit ${m.fit_score}` : null]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </span>
+              </div>
+            ))}
           </>
         )}
 

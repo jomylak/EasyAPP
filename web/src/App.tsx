@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react"
 import { LaunchBar } from "@/components/LaunchBar"
 import { api } from "@/lib/api"
-import { useRunStream } from "@/lib/useRunStream"
 import { BrowseTab } from "@/tabs/BrowseTab"
 import { DashboardTab } from "@/tabs/DashboardTab"
 import { SettingsTab } from "@/tabs/SettingsTab"
@@ -75,9 +74,6 @@ export default function App() {
   const [launchError, setLaunchError] = useState(false)
   const [dryRun, setDryRun] = useState(false)
   const [removedUrls, setRemovedUrls] = useState<RemovedUrls>(EMPTY_REMOVED)
-  // Whether an apply run is already going -- if so, Launch must not attempt
-  // to spawn a second one (that's the /api/launch 409). See handleLaunch.
-  const { live } = useRunStream()
 
   function broadcastRemoved(entries: RemovedEntry[]) {
     if (!entries.length) return
@@ -138,15 +134,13 @@ export default function App() {
   async function handleLaunch() {
     // Two real HTTP calls, deliberately kept as two steps: /api/queue marks
     // the selection 'queued' and prices it (harmless, reversible), then
-    // /api/launch actually spawns `applypilot apply --queued <batch>` as a
-    // background subprocess -- the one call in this app that submits real
-    // forms and spends real money when dry_run is off.
+    // /api/launch makes sure the always-on manual-queue worker pool is
+    // running -- the one call in this app that submits real forms and
+    // spends real money when dry_run is off.
     //
-    // Only one run at a time, so if `live` says one is already going, this
-    // button must behave as "add to the queue" and stop there -- calling
-    // /api/launch anyway is a guaranteed 409, and the batch it would have
-    // launched is recoverable later from the Dashboard's pending-batches
-    // panel instead.
+    // Always call both: the worker pool drains every queued batch, FIFO, on
+    // its own, so a run already in progress just picks up these rows on its
+    // next poll -- /api/launch is then a cheap no-op, not a 409.
     setLaunching(true)
     setLaunchNote(null)
     setLaunchError(false)
@@ -171,22 +165,14 @@ export default function App() {
         return
       }
 
-      if (live) {
-        setLaunchNote(
-          `Queued ${queued.queued} job(s) as batch ${queued.batch} (est. ` +
-            `$${queued.estimate.expected.toFixed(2)}${queued.estimate.n_samples === 0 ? ", default" : ""}). ` +
-            `A run is already in progress -- launch this batch from the Dashboard's pending-batches ` +
-            `panel once it finishes.`,
-        )
-        clearSelection()
-        return
-      }
-
-      const launch = await api.launch(queued.batch, { workers: 1, dry_run: dryRun })
+      const launch = await api.launch(queued.batch, { dry_run: dryRun })
+      const costNote = `est. $${queued.estimate.expected.toFixed(2)}${queued.estimate.n_samples === 0 ? ", default" : ""}`
       setLaunchNote(
-        `${dryRun ? "[DRY RUN] " : ""}Launched batch ${queued.batch}: ${launch.jobs} job(s), ` +
-          `pid ${launch.pid} (est. $${queued.estimate.expected.toFixed(2)}` +
-          `${queued.estimate.n_samples === 0 ? ", default" : ""}). Watch it on the Dashboard tab.`,
+        launch.already_running
+          ? `${dryRun ? "[DRY RUN] " : ""}Queued ${launch.jobs} job(s) (${costNote}) -- picked up by the ` +
+              `worker pool that's already running. Watch it on the Dashboard tab.`
+          : `${dryRun ? "[DRY RUN] " : ""}Started the worker pool: ${launch.jobs} job(s) queued, ` +
+              `pid ${launch.pid} (${costNote}). Watch it on the Dashboard tab.`,
       )
       clearSelection()
       setTab("dashboard")
@@ -194,8 +180,7 @@ export default function App() {
       setLaunchError(true)
       setLaunchNote(
         `Failed to launch: ${String(e)}. Anything already queued is still queued -- ` +
-          `retry from here, launch it from the Dashboard's pending-batches panel, or run ` +
-          `\`applypilot apply --queued <batch>\` yourself.`,
+          `retry from here, or run \`applypilot apply --queued\` yourself.`,
       )
     } finally {
       setLaunching(false)
@@ -229,7 +214,6 @@ export default function App() {
           launching={launching}
           dryRun={dryRun}
           onDryRunChange={setDryRun}
-          queueOnly={live}
         />
       </div>
 

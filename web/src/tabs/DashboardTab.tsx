@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react"
 import { ApplicationsTable } from "@/components/ApplicationsTable"
+import { DataUsage } from "@/components/DataUsage"
 import { AtsBreakdown } from "@/components/AtsBreakdown"
 import { CompanyLimits } from "@/components/CompanyLimits"
 import { Donut } from "@/components/Donut"
 import { FailureBreakdown } from "@/components/FailureBreakdown"
+import { IpHealth } from "@/components/IpHealth"
+import { FingerprintTile } from "@/components/FingerprintTile"
 import { WorkerExpansion } from "@/components/WorkerExpansion"
 import { api } from "@/lib/api"
 import type { Stats } from "@/lib/types"
@@ -32,13 +35,6 @@ export function DashboardTab() {
   const [statsError, setStatsError] = useState<string | null>(null)
   const { run, live } = useRunStream()
   const [stopping, setStopping] = useState(false)
-  // Batches someone queued (from Browse, or a Launch that queued fine but
-  // then 409'd because a run was already going) that nobody has launched
-  // yet -- the recovery path for that race, so the batch id in a toast
-  // isn't the only way back to it.
-  const [pending, setPending] = useState<{ batch: string; count: number; queued_at: string | null }[]>([])
-  const [launchingBatch, setLaunchingBatch] = useState<string | null>(null)
-  const [pendingError, setPendingError] = useState<string | null>(null)
   // Which worker's row is expanded to show its live view, if any -- at most
   // one at a time, so opening a second live view doesn't quietly double the
   // number of screencast sessions running on the VM.
@@ -54,17 +50,9 @@ export function DashboardTab() {
       .catch((e) => setStatsError(String(e)))
   }
 
-  function refreshPending() {
-    api.pendingBatches().then((res) => setPending(res.batches)).catch(() => {})
-  }
-
   useEffect(() => {
     refreshStats()
-    refreshPending()
-    const id = setInterval(() => {
-      refreshStats()
-      refreshPending()
-    }, 4000)
+    const id = setInterval(refreshStats, 4000)
     return () => clearInterval(id)
   }, [])
 
@@ -75,20 +63,6 @@ export function DashboardTab() {
     } finally {
       setStopping(false)
       refreshStats()
-    }
-  }
-
-  async function launchPending(batch: string) {
-    setLaunchingBatch(batch)
-    setPendingError(null)
-    try {
-      await api.launch(batch, { workers: 1 })
-      refreshPending()
-      refreshStats()
-    } catch (e) {
-      setPendingError(String(e))
-    } finally {
-      setLaunchingBatch(null)
     }
   }
 
@@ -131,6 +105,7 @@ export function DashboardTab() {
             <div className="tile-value">{stats.scored}</div>
             <div className="tile-sub">{stats.pending_enrich} awaiting detail</div>
           </div>
+          <FingerprintTile />
         </div>
       )}
 
@@ -140,11 +115,12 @@ export function DashboardTab() {
             <div className="dayhead">
               <span className="dayname">Outcomes</span>
             </div>
+            <div className="dash-scroll">
             <div className="donut-row">
               <Donut
-                value={stats.applied + stats.failed > 0 ? stats.applied / (stats.applied + stats.failed) : 0}
+                value={stats.bot_applied + stats.failed > 0 ? stats.bot_applied / (stats.bot_applied + stats.failed) : 0}
                 label="Success rate"
-                sublabel={`${stats.applied} of ${stats.applied + stats.failed} attempts`}
+                sublabel={`${stats.bot_applied} of ${stats.bot_applied + stats.failed} attempts`}
                 color="var(--a-good)"
               />
               <div>
@@ -162,6 +138,9 @@ export function DashboardTab() {
                 <div className="tile-sub">${stats.spend.toFixed(2)} total spend</div>
               </div>
             </div>
+            <DataUsage />
+            <IpHealth />
+            </div>
           </section>
           <FailureBreakdown />
           <AtsBreakdown />
@@ -173,7 +152,7 @@ export function DashboardTab() {
         <div className="runpanel-head">
           <span className={`live-dot${live ? " on" : ""}`} />
           <span style={{ fontFamily: "var(--mono)", fontSize: 12.5, fontWeight: 600 }}>
-            {live ? `Run in progress · batch ${run?.batch ?? "—"}` : "No run in progress"}
+            {live ? "Queue worker pool running" : "No run in progress"}
           </span>
           {run?.dry_run && <span className="badge manual">dry run</span>}
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
@@ -189,29 +168,9 @@ export function DashboardTab() {
           </div>
         </div>
 
-        {!live && pending.length === 0 && (
-          <div className="runpanel-empty">Launch a queued batch from the terminal to see it here live.</div>
-        )}
-
-        {!live &&
-          pending.map((b) => (
-            <div className="worker-row" key={b.batch}>
-              <span className="worker-job" style={{ fontFamily: "var(--mono)" }}>
-                {b.count} job(s) queued as <b>{b.batch}</b>
-              </span>
-              <button
-                className="btn"
-                disabled={launchingBatch === b.batch}
-                onClick={() => launchPending(b.batch)}
-              >
-                {launchingBatch === b.batch ? "Launching…" : "Launch"}
-              </button>
-            </div>
-          ))}
-
-        {pendingError && (
-          <div style={{ color: "var(--a-bad)", fontSize: 12, padding: "4px 0" }}>
-            Failed to launch: {pendingError}
+        {!live && (
+          <div className="runpanel-empty">
+            Nothing in flight. Queue jobs from Browse and they'll start as soon as a worker slot opens.
           </div>
         )}
 

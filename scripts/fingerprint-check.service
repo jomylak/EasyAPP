@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily CreepJS/sannysoft fingerprint check (environment health, not per-job)
+After=xvfb.service
+Wants=xvfb.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ApplyPilot
+Environment=PATH=/home/ubuntu/ApplyPilot/.venv/bin:/usr/bin:/bin
+Environment=DISPLAY=:99
+# worker-id 50: well clear of the real worker id range (0-7 + the
+# home-fallback worker) so this never collides with a live apply job's
+# Chrome profile/CDP port.
+ExecStart=/home/ubuntu/ApplyPilot/.venv/bin/python scripts/fingerprint_check.py --label scheduled-vm --worker-id 50

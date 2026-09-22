@@ -1,4 +1,4 @@
-"""Goose backend: command construction, stream-json parsing, fallback routing.
+"""Goose backend: command construction, stream-json parsing, failure taxonomy.
 
 The parsing tests use envelopes captured from a real `goose run
 --output-format stream-json` session, since that shape is the contract this
@@ -18,6 +18,7 @@ from applypilot.apply import outcomes
 from applypilot.apply.backends import BACKEND_NAMES, get_backend
 from applypilot.apply.backends.goose import (
     _build_command, _describe_tool, _extension_args, _strip_extension_prefix,
+    run_job,
 )
 
 
@@ -27,10 +28,6 @@ from applypilot.apply.backends.goose import (
 
 def test_goose_is_the_default_backend():
     assert config.DEFAULT_SETTINGS["apply_backend"] == "goose"
-
-
-def test_claude_is_the_default_fallback():
-    assert config.DEFAULT_SETTINGS["apply_fallback_backend"] == "claude"
 
 
 def test_goose_is_listed_first_and_skyvern_is_gone():
@@ -86,8 +83,8 @@ def test_each_extension_spec_is_a_single_argv_entry():
     """Goose parses '[name:]command args...' itself -- splitting the spec on
     spaces would make it read the flags as separate extensions."""
     args = _extension_args(9222)
-    assert args.count("--with-extension") == 2
-    assert len(args) == 4
+    assert args.count("--with-extension") == 3  # playwright, gmail, applytools
+    assert len(args) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -180,33 +177,26 @@ def test_tool_request_shape():
 
 
 # ---------------------------------------------------------------------------
-# Fallback routing
+# Failure categorization (failure_taxonomy.py's dashboard grouping)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("result", [
-    "failed:stuck", "failed:no_result_line", "failed:page_error",
-    "failed:timeout", "failed:unknown",
-])
-def test_driver_gave_up_falls_back(result):
-    assert outcomes.should_fall_back(result) is True
-
-
-@pytest.mark.parametrize("result", [
-    # Terminal outcomes -- nothing to retry.
-    "applied", "skipped", "expired", "captcha",
-    # Permanent: dead for the stronger model too, so a retry burns quota.
-    "failed:expired", "failed:already_applied", "failed:sso_required",
-    "failed:not_eligible_location", "failed:unsafe_verification",
-    "failed:account_required", "failed:cloudflare_blocked",
-    # Handled by swapping the resume variant, not by another backend.
-    "failed:grad_date_mismatch",
-])
-def test_no_fallback_when_the_job_itself_is_the_problem(result):
-    assert outcomes.should_fall_back(result) is False
-
-
-def test_no_fallback_reason_is_also_a_permanent_failure():
-    """The two sets must not overlap: a permanent failure that fell back
-    would be retried on Claude and then marked never-retry anyway."""
+def test_driver_gave_up_reasons_are_not_also_permanent_failures():
+    """The two sets must not overlap, or the failure-reasons dashboard would
+    double-count a permanent failure under the "driver gave up" bucket too."""
     overlap = outcomes.FALLBACK_REASONS & outcomes.PERMANENT_FAILURES
     assert overlap == set()
+
+
+# ---------------------------------------------------------------------------
+# CDP preflight
+# ---------------------------------------------------------------------------
+
+def test_run_job_fails_fast_when_cdp_port_is_dead():
+    """A dead DevTools port must fail before any LLM call, not after --
+    on 9/14, 155 traces burned real spend against a port that was never up."""
+    job = {"title": "x", "url": "http://example.invalid", "site": "x"}
+    # Port 1 requires root and nothing listens there in CI/dev -- connection
+    # refused immediately, same shape as a genuinely dead Chrome.
+    status, duration_ms = run_job(job, port=1, worker_id=9999)
+    assert status == "failed:cdp_unreachable"
+    assert duration_ms == 0

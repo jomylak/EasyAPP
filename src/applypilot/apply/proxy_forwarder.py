@@ -20,6 +20,7 @@ import asyncio
 import base64
 import logging
 import threading
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,24 @@ async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
             pass
 
 
+async def _socks5_connect(host: str, port: int, target_host: str, target_port: int):
+    """Open a tunnel to target through a no-auth SOCKS5 proxy. The hostname is
+    sent unresolved, so DNS happens at the proxy's end, not here.
+    ponytail: no username/password SOCKS5 auth, add when a provider needs it."""
+    r, w = await asyncio.open_connection(host, port)
+    w.write(b"\x05\x01\x00")
+    if await r.readexactly(2) != b"\x05\x00":
+        raise OSError("socks5 proxy refused no-auth")
+    name = target_host.encode()
+    w.write(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + target_port.to_bytes(2, "big"))
+    _, status, _, atyp = await r.readexactly(4)
+    if status != 0:
+        raise OSError(f"socks5 connect failed (code {status})")
+    skip = {1: 4, 4: 16}.get(atyp) or (await r.readexactly(1))[0]
+    await r.readexactly(skip + 2)
+    return r, w
+
+
 async def _handle_client(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
@@ -48,6 +67,7 @@ async def _handle_client(
     upstream_port: int,
     auth_header: bytes,
     required_incoming_auth: bytes | None = None,
+    socks5: bool = False,
 ) -> None:
     try:
         request_line = await client_reader.readline()
@@ -83,6 +103,32 @@ async def _handle_client(
             return
 
         method = request_line.split(b" ", 1)[0]
+        if socks5:
+            target = request_line.split()[1].decode()
+            if method == b"CONNECT":
+                host, _, port = target.rpartition(":")
+                upstream_reader, upstream_writer = await _socks5_connect(
+                    upstream_host, upstream_port, host, int(port))
+                client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await client_writer.drain()
+            else:
+                # Plain-HTTP request in proxy form (GET http://host/path):
+                # tunnel to the host, then resend it in origin form.
+                u = urlsplit(target)
+                upstream_reader, upstream_writer = await _socks5_connect(
+                    upstream_host, upstream_port, u.hostname, u.port or 80)
+                path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+                version = request_line.split()[2]
+                upstream_writer.write(method + b" " + path.encode() + b" " + version + b"\r\n")
+                for h in headers:
+                    upstream_writer.write(h)
+                upstream_writer.write(b"\r\n")
+                await upstream_writer.drain()
+            await asyncio.gather(
+                _pipe(client_reader, upstream_writer),
+                _pipe(upstream_reader, client_writer),
+            )
+            return
         upstream_reader, upstream_writer = await asyncio.open_connection(
             upstream_host, upstream_port
         )
@@ -125,6 +171,7 @@ def start_forwarder(
     passwd: str,
     bind_host: str = "127.0.0.1",
     require_auth: tuple[str, str] | None = None,
+    socks5: bool = False,
 ):
     """Start the local forwarding proxy on a background thread.
 
@@ -161,7 +208,8 @@ def start_forwarder(
     async def _serve():
         server = await asyncio.start_server(
             lambda r, w: _handle_client(
-                r, w, upstream_host, upstream_port_int, auth_header, required_incoming_auth
+                r, w, upstream_host, upstream_port_int, auth_header, required_incoming_auth,
+                socks5,
             ),
             bind_host,
             local_port,

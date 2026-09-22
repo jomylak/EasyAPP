@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import { LoginWindow } from "@/components/LoginWindow"
 import { api } from "@/lib/api"
 import type { EnvKeyName, EnvKeyStatus, LaneWeights, Settings } from "@/lib/types"
 import { KNOWN_ENV_KEYS } from "@/lib/types"
@@ -62,6 +63,9 @@ export function SettingsTab() {
   const [error, setError] = useState<string | null>(null)
   const [savedNote, setSavedNote] = useState<string | null>(null)
   const [saving, setSaving] = useState<string | null>(null)
+  const [loginUrl, setLoginUrl] = useState<string | null>(null)
+  const [credChecking, setCredChecking] = useState(false)
+  const [credResult, setCredResult] = useState<string[] | null>(null)
 
   useEffect(() => {
     api
@@ -94,6 +98,18 @@ export function SettingsTab() {
       setError(String(e))
     } finally {
       setSaving(null)
+    }
+  }
+
+  async function runCredentialCheck() {
+    setCredChecking(true)
+    try {
+      const { alerts } = await api.credentialCheck()
+      setCredResult(alerts)
+    } catch (e) {
+      setCredResult([`check failed: ${e}`])
+    } finally {
+      setCredChecking(false)
     }
   }
 
@@ -148,8 +164,7 @@ export function SettingsTab() {
           <span className="dayname">Backend &amp; cost</span>
         </div>
         <p className="settings-hint">
-          Which engine drives the browser, what a run is estimated to cost before enough real history exists, and
-          whether a stuck Goose run gets one retry on Claude.
+          Which engine drives the browser, and what a run is estimated to cost before enough real history exists.
         </p>
 
         <div className="setting-row">
@@ -161,18 +176,6 @@ export function SettingsTab() {
           >
             <option value="goose">Goose (default, cheap)</option>
             <option value="claude">Claude Code</option>
-          </select>
-        </div>
-        <div className="setting-row">
-          <label>Fallback backend on stuck run</label>
-          <select
-            className="select-field setting-input"
-            value={settings.apply_fallback_backend ?? ""}
-            onChange={(e) => set("apply_fallback_backend", e.target.value || null)}
-          >
-            <option value="">Disabled</option>
-            <option value="claude">Claude</option>
-            <option value="goose">Goose</option>
           </select>
         </div>
         <div className="setting-row">
@@ -242,7 +245,6 @@ export function SettingsTab() {
               saveSettings(
                 {
                   apply_backend: settings.apply_backend,
-                  apply_fallback_backend: settings.apply_fallback_backend,
                   cost_defaults: settings.cost_defaults,
                   tailoring_enabled: settings.tailoring_enabled,
                   cover_letters_enabled: settings.cover_letters_enabled,
@@ -401,6 +403,37 @@ export function SettingsTab() {
           </button>
         </div>
       </section>
+
+      <section className="day-panel settings-section">
+        <div className="dayhead">
+          <span className="dayname">Logins</span>
+        </div>
+        <p className="settings-hint">
+          Opens a live remote window on the enrichment Chrome profile so you can sign in by hand -- the session
+          sticks around for enrichment/apply to reuse. Don't open this while enrichment is running: they share one
+          Chrome profile. Gmail's re-auth is a separate one-time terminal command (OAuth redirects to the VM's own
+          localhost), not a button here -- ask the assistant to walk you through it.
+        </p>
+        <div className="setting-actions">
+          <button className="btn" onClick={() => setLoginUrl("https://jobright.ai/")}>
+            Log into Jobright
+          </button>
+          <button className="btn" onClick={() => setLoginUrl("https://myaccount.google.com/")}>
+            Log into Google (then "sync to workers")
+          </button>
+          <button className="srch" disabled={credChecking} onClick={runCredentialCheck}>
+            {credChecking ? "Checking…" : "Check credentials now"}
+          </button>
+        </div>
+        {credResult && (
+          <div className={`settings-hint ${credResult.length ? "cred-alert" : "cred-ok"}`}>
+            {credResult.length === 0
+              ? "All clear as of the last check."
+              : credResult.map((line, i) => <div key={i}>{line}</div>)}
+          </div>
+        )}
+      </section>
+      {loginUrl && <LoginWindow url={loginUrl} onClose={() => setLoginUrl(null)} />}
     </div>
   )
 }

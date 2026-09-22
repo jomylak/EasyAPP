@@ -3,13 +3,14 @@ import { api } from "@/lib/api"
 import type { AtsStat } from "@/lib/types"
 
 /**
- * Success rate and cost per ATS/backend. A table with an inline bar per row,
+ * Success rate, median cost and avg MB per ATS/backend. A table with an inline bar per row,
  * not a row of small donuts -- comparing several proportions by angle across
  * separate charts is exactly the "pie chart forest" anti-pattern; a sortable
  * bar-per-row table is the legible version of the same comparison.
  */
 export function AtsBreakdown() {
   const [rows, setRows] = useState<AtsStat[] | null>(null)
+  const [avgMb, setAvgMb] = useState<Record<string, number>>({})
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -17,6 +18,7 @@ export function AtsBreakdown() {
       .atsStats()
       .then((res) => setRows(res.rows))
       .catch((e) => setError(String(e)))
+    api.dataStats().then((d) => setAvgMb(d.avg_by_ats)).catch(() => {})
   }, [])
 
   return (
@@ -45,8 +47,9 @@ export function AtsBreakdown() {
               <span className="ats-pct">{Math.round(r.success_rate * 100)}%</span>
               <span className="ats-n">{r.n_applied}/{r.n_runs}</span>
               <span className="ats-cost">
-                {r.median_cost_usd === null ? "—" : `$${r.median_cost_usd.toFixed(2)} med`}
+                {r.median_cost_usd === null ? "—" : `$${r.median_cost_usd.toFixed(2)}`}
               </span>
+              <span className="ats-mb">{avgMb[r.ats] === undefined ? "—" : `${avgMb[r.ats].toFixed(1)}MB`}</span>
             </div>
           ))}
         </div>

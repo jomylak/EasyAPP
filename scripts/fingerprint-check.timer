@@ -1,0 +1,10 @@
+[Unit]
+Description=Run fingerprint-check.service once a day
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

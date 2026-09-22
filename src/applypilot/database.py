@@ -323,6 +323,13 @@ _ALL_COLUMNS: dict[str, str] = {
     # 'gmail' (scan_gmail_status.py matched an email) or 'manual' (set from
     # the dashboard) -- lets the scanner skip rows a human already corrected.
     "post_apply_source": "TEXT",
+    # The date tied to whatever post_apply_status currently is -- an OA's
+    # stated deadline while status='oa', an interview's scheduled date/time
+    # once status='interview' -- read out of the same email, when it states
+    # one. Meaning shifts with status rather than getting a column each,
+    # since a job only ever has one "what's next" date at a time. NULL when
+    # the email didn't state one, or status is 'none'/'rejected'/'offer'.
+    "post_apply_event_date": "TEXT",
     # Which backend drove this application, and how many LLM requests it took.
     # Together with apply_duration_ms these make backend/model comparison
     # measurable instead of anecdotal.
@@ -345,6 +352,10 @@ _ALL_COLUMNS: dict[str, str] = {
     # underlying posting as another row that IS proceeding.
     "duplicate_of": "TEXT",
     "duplicate_reason": "TEXT",
+    # Shared by every row dedup.link() considers the same posting (hidden
+    # duplicates) or a possibly-related one (visible siblings), so browse can
+    # badge and expand them. NULL for a row with no relatives.
+    "group_id": "TEXT",
     # config.normalize_company(company), stored rather than recomputed per
     # lookup so dedup.find_company_duplicate can do an indexed equality
     # match instead of a full-table Python-side normalize-and-scan. Written
@@ -407,12 +418,11 @@ _ALL_COLUMNS: dict[str, str] = {
 # The day expression must be written character-for-character the way the query
 # writes it, or SQLite will not match the index to the query.
 #
-# employer_posted_date (the ATS/careers page's own JSON-LD datePosted, read
-# during enrichment) outranks posted_date (Jobright's postedAt, or -- for the
-# Airtable-sourced boards -- their grid's own Date column) because it comes
-# straight from the source instead of an aggregator's re-touched timestamp.
-# discovered_at is the last resort, for whatever neither source dated.
-_DAY_EXPR = "date(COALESCE(employer_posted_date, posted_date, discovered_at))"
+# posted_date is the date Intern List / NewGrad Jobs themselves show, which is
+# what the day buckets and Posted column must match. The employer's own
+# datePosted stays available in employer_posted_date but never drives the
+# view. discovered_at is the last resort for anything undated.
+_DAY_EXPR = "date(COALESCE(posted_date, discovered_at))"
 
 _ALL_INDEXES: dict[str, str] = {
     # Day bucketing: the browse tab groups by this and nothing else.
@@ -443,6 +453,8 @@ _ALL_INDEXES: dict[str, str] = {
     "idx_jobs_ats_job_id": "(ats_job_id)",
     # dedup.find_company_duplicate's WHERE company_normalized = ?.
     "idx_jobs_company_normalized": "(company_normalized)",
+    "idx_jobs_group_id": "(group_id)",
+    "idx_jobs_duplicate_of": "(duplicate_of)",
 }
 
 
@@ -566,7 +578,7 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
 
     # Enrichment stage
     stats["pending_detail"] = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL"
+        "SELECT COUNT(*) FROM jobs WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL"
     ).fetchone()[0]
 
     stats["with_description"] = conn.execute(
@@ -809,7 +821,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     conditions = {
         "discovered": "1=1",
-        "pending_detail": "detail_scraped_at IS NULL",
+        "pending_detail": "detail_scraped_at IS NULL AND duplicate_of IS NULL",
         "enriched": "full_description IS NOT NULL",
         "pending_score": "full_description IS NOT NULL AND fit_score IS NULL AND duplicate_of IS NULL",
         "scored": "fit_score IS NOT NULL",

@@ -43,8 +43,12 @@ import os
 import random
 import re
 import urllib.request
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import urlparse
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from playwright.async_api import Page, async_playwright
 
 mcp = MCPServer("applytools")
@@ -52,6 +56,251 @@ mcp = MCPServer("applytools")
 _cdp_endpoint: str | None = None
 _playwright = None
 _browser = None
+_dry_run = False
+_guarded_contexts: set[int] = set()
+
+# Free network-usage telemetry: real transferred bytes per apply run, broken
+# down by resource type/domain. Deliberately lives on THIS connection rather
+# than a separate connect_over_cdp() observer process -- a standalone
+# second CDP client (tried first) got TargetClosedError on every poll the
+# moment a THIRD client (the test driver) disconnected, so it never saw a
+# single byte. This module's _browser connection is already the proven
+# one: the dry-run guard's frame.evaluate() calls read state reliably here
+# across goose's whole run, so polling the same way for
+# performance.getEntriesByType() rides the same proven path instead of
+# opening a new connection with its own failure mode.
+_NETSTATS_POLL_JS = """
+() => {
+  const nav = performance.getEntriesByType('navigation');
+  const res = performance.getEntriesByType('resource');
+  const out = [...nav, ...res].map(e => ({
+    name: e.name,
+    type: e.initiatorType || 'navigation',
+    transferSize: e.transferSize || 0,
+  }));
+  performance.clearResourceTimings();
+  return out;
+}
+"""
+_netstats = {
+    "by_type": defaultdict(int),
+    "by_domain": defaultdict(int),
+    "requests": 0,
+    "pages_seen": 0,
+}
+_netstats_task = None
+
+
+def _netstats_path() -> Path:
+    port = (_cdp_endpoint or "").rsplit(":", 1)[-1]
+    return Path(f"/tmp/applypilot_netstats_{port}.json")
+
+
+def _netstats_write() -> None:
+    try:
+        result = {
+            "total_bytes": sum(_netstats["by_type"].values()),
+            "requests": _netstats["requests"],
+            "pages": _netstats["pages_seen"],
+            "by_type": dict(_netstats["by_type"]),
+            "by_domain": dict(
+                sorted(_netstats["by_domain"].items(), key=lambda kv: -kv[1])[:15]
+            ),
+        }
+        _netstats_path().write_text(json.dumps(result))
+    except Exception:
+        pass
+
+
+async def _netstats_poll_loop() -> None:
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            pages = [p for ctx in _browser.contexts for p in ctx.pages]
+            _netstats["pages_seen"] = max(_netstats["pages_seen"], len(pages))
+            for page in pages:
+                try:
+                    entries = await page.evaluate(_NETSTATS_POLL_JS)
+                except Exception:
+                    continue  # page navigating/closed mid-poll, skip this cycle
+                for e in entries or []:
+                    domain = urlparse(e["name"]).netloc
+                    _netstats["by_type"][e["type"]] += e["transferSize"]
+                    _netstats["by_domain"][domain] += e["transferSize"]
+                    _netstats["requests"] += 1
+            _netstats_write()
+        except Exception:
+            pass
+
+# Blocks the click/submit itself (capture-phase, before any handler the page
+# registered can run) instead of just asking the model not to do it -- a
+# prompt instruction is advice the model can ignore, this can't be. Confirmed
+# necessary 2026-09-17: a dry-run benchmark had the model click through to a
+# real "Thank you for applying" page on SpaceX's Greenhouse form despite the
+# prompt explicitly saying not to (see dry-run-not-enforced memory). Covers
+# three paths to a real submit: a click on a submit-like element, a native
+# `submit` event (also fires from pressing Enter in a field), and a direct
+# `form.submit()` call. Runs in every frame, not just the main one, since
+# Greenhouse/Workday-style embeds put the actual form in an iframe.
+_DRY_RUN_GUARD_JS = """
+(() => {
+  if (window.__applypilot_dry_run_guard__) return;
+  window.__applypilot_dry_run_guard__ = true;
+  window.__applypilot_dry_run_blocked__ = null;
+  const FINAL_SUBMIT_TEXT =
+    /^(submit|apply now|apply|send application|finish( and)? apply|submit application)$/;
+  const isSubmitLike = (el) => {
+    if (!el || !el.tagName) return false;
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    const text = (el.innerText || el.value || '').trim().toLowerCase();
+    if (tag === 'input' && type === 'submit') return true;
+    if ((tag === 'button' || el.getAttribute('role') === 'button')
+        && FINAL_SUBMIT_TEXT.test(text)) {
+      return true;
+    }
+    return false;
+  };
+  // Last real (OS-level, CDP-dispatched) click, regardless of what it hit --
+  // used below to let a framework's own submitter-less form.submit() through
+  // when it was clearly triggered by the agent clicking something that
+  // wasn't a final-submit button (e.g. Oracle HCM's "Send code" on the OTP
+  // screen). A model-scripted dispatchEvent/el.click() via
+  // browser_run_code_unsafe has isTrusted=false and never sets this, so it
+  // can't be used to manufacture the exemption -- only a real click can.
+  let lastTrustedClick = null;
+  document.addEventListener('click', (e) => {
+    if (e.isTrusted) {
+      lastTrustedClick = {
+        ts: Date.now(),
+        text: ((e.target && (e.target.innerText || e.target.value)) || '').trim(),
+      };
+    }
+    let el = e.target;
+    for (let i = 0; el && i < 6; i++, el = el.parentElement) {
+      if (isSubmitLike(el)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        window.__applypilot_dry_run_blocked__ =
+          {type: 'click', text: (el.innerText || el.value || '').trim()};
+        return;
+      }
+    }
+  }, true);
+  // A password field means this is a login/create-account form, not the
+  // real application -- account creation is a required, legitimate step on
+  // ATS's that gate the whole form behind a signup wall (confirmed on
+  // Workday: blocking that submit left the agent stuck at "Create Account"
+  // with no way to even reach the application form, at which point it
+  // started trying raw fetch() calls to route around what looked like a
+  // broken button). The real application form never has a password field.
+  // Page-scoped, not form-scoped: on Workday's Create Account screen the
+  // password inputs sit outside the <form> node the submit event fires on
+  // (React portal), so form.querySelector('input[type=password]') never
+  // matched and every real account-creation submit got misclassified as
+  // the final application submit. Confirmed 2026-09-18: two Workday dry-run
+  // benchmark jobs each retried Create Account 7-19 times (regular click,
+  // find_and_click, raw dispatchEvent, React native-setter hacks) after
+  // every attempt came back blocked, burning 100+ tool calls apiece before
+  // giving up. "is this a login/signup screen" is a fact about the page,
+  // not about which DOM subtree a given form node happens to nest under.
+  const isAuthForm = () => !!document.querySelector('input[type="password"]');
+  document.addEventListener('submit', (e) => {
+    if (isAuthForm()) return;
+    // A real click's SubmitEvent carries which button triggered it -- if
+    // that button's text doesn't read as a final submit (e.g. a multi-step
+    // wizard's "Next"/"Continue"), let it through. Confirmed necessary on
+    // Oracle HCM: blocking every intermediate step's submit stalled the
+    // agent on page 1, same failure shape as the Workday login case above.
+    if (e.submitter && !isSubmitLike(e.submitter)) return;
+    // No submitter means a framework did this programmatically (React/
+    // Knockout's own state-machine advancing the wizard, or a script's
+    // synthetic dispatchEvent) -- normally the one path with no positive
+    // signal it's safe, so it stays blocked. Exception: a real click landed
+    // in the last 500ms on something that doesn't read as a final submit
+    // (e.g. Oracle HCM's OTP-screen "Send code"/"Next" button, which posts
+    // via an internal handler with no SubmitEvent.submitter at all). That's
+    // a trusted, human-shaped action pointed at an intermediate step, not a
+    // scripted attempt to force a submit through -- browser_run_code_unsafe's
+    // dispatchEvent/el.click() has isTrusted=false and can't produce it.
+    // Single-use: consumed immediately below, so one real click can only
+    // ever wave through the one submit it actually triggered -- otherwise a
+    // scripted submit arriving shortly after some earlier, unrelated real
+    // click could ride along on it (own test caught this at a 2s window).
+    // Confirmed necessary 2026-09-18: Oracle's OTP send-code POST has no
+    // submitter and no password field, so neither existing exemption covers
+    // it, and it was getting blocked exactly like a real final submit.
+    if (lastTrustedClick && (Date.now() - lastTrustedClick.ts) < 500
+        && !FINAL_SUBMIT_TEXT.test(lastTrustedClick.text.toLowerCase())) {
+      lastTrustedClick = null;
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    window.__applypilot_dry_run_blocked__ =
+      {type: 'form-submit', action: e.target && e.target.action};
+  }, true);
+  const origFormSubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function () {
+    if (isAuthForm()) return origFormSubmit.apply(this, arguments);
+    window.__applypilot_dry_run_blocked__ =
+      {type: 'form.submit()', action: this.action};
+  };
+  // The click/submit handlers above only catch a real form submission or a
+  // button whose text we recognise. A React form posts with fetch() from its
+  // own onClick and does neither, so it would sail straight through. Block
+  // the write request itself: same-origin POST/PUT/PATCH is the application
+  // being sent, and a GET (analytics, autocomplete, session ping) is not.
+  const isWrite = (m) => /^(POST|PUT|PATCH)$/i.test(m || 'GET');
+  const sameOrigin = (u) => {
+    try { return new URL(u, location.href).origin === location.origin; }
+    catch (e) { return false; }
+  };
+  const origFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = (typeof input === 'string') ? input : (input && input.url);
+    const method = (init && init.method) || (input && input.method) || 'GET';
+    if (isWrite(method) && sameOrigin(url)) {
+      window.__applypilot_dry_run_blocked__ = {type: 'fetch', action: url};
+      return Promise.reject(new Error('blocked by applypilot dry run'));
+    }
+    return origFetch.apply(this, arguments);
+  };
+  const origOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__applypilot_blocked__ = isWrite(method) && sameOrigin(url);
+    if (this.__applypilot_blocked__) {
+      window.__applypilot_dry_run_blocked__ = {type: 'xhr', action: url};
+    }
+    return origOpen.apply(this, arguments);
+  };
+  const origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function () {
+    if (this.__applypilot_blocked__) return;
+    return origSend.apply(this, arguments);
+  };
+})();
+"""
+
+
+async def _install_dry_run_guard(page: Page) -> None:
+    """Idempotently arm the submit-blocking guard on every frame of ``page``.
+
+    Installs via ``add_init_script`` on the context too, so frames created or
+    navigated *after* this call (a multi-step Workday flow, an SSO redirect)
+    get it automatically -- ``add_init_script`` only covers documents loaded
+    after it's registered, not the one already sitting in the frame, hence
+    also evaluating directly into every current frame.
+    """
+    context = page.context
+    if id(context) not in _guarded_contexts:
+        _guarded_contexts.add(id(context))
+        await context.add_init_script(_DRY_RUN_GUARD_JS)
+    for frame in page.frames:
+        try:
+            await frame.evaluate(_DRY_RUN_GUARD_JS)
+        except Exception:
+            pass  # detached/cross-origin frame mid-navigation; init_script covers it on reload
 
 
 async def _get_page() -> Page:
@@ -61,16 +310,29 @@ async def _get_page() -> Page:
     redirects, a "review application" popup), and the one it's actually
     looking at is whichever was opened or focused last.
     """
-    global _playwright, _browser
-    if _playwright is None:
-        _playwright = await async_playwright().start()
-    if _browser is None or not _browser.is_connected():
-        _browser = await _playwright.chromium.connect_over_cdp(_cdp_endpoint)
+    global _playwright, _browser, _netstats_task
+    # ToolError, not a bare raise: the SDK strips the message off any other
+    # exception and hands the model "Error executing tool <name>" with no
+    # reason (mcpserver/tools/base.py). 32 such blanks in one week of traces
+    # were all this function failing on a dead browser, and neither the model
+    # nor the logs could tell that apart from a real tool bug.
+    try:
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+        if _browser is None or not _browser.is_connected():
+            _browser = await _playwright.chromium.connect_over_cdp(_cdp_endpoint)
+    except Exception as exc:
+        raise ToolError(f"browser not reachable at {_cdp_endpoint}: {exc}") from exc
+    if _netstats_task is None:
+        _netstats_task = asyncio.create_task(_netstats_poll_loop())
     for context in reversed(_browser.contexts):
         pages = context.pages
         if pages:
-            return pages[-1]
-    raise RuntimeError("no open page found on the CDP-connected browser")
+            page = pages[-1]
+            if _dry_run:
+                await _install_dry_run_guard(page)
+            return page
+    raise ToolError("no open page found on the CDP-connected browser")
 
 
 @mcp.tool()
@@ -247,10 +509,24 @@ async def fill_searchable_combobox(label_or_selector: str, value: str, occurrenc
     trigger = await _locate_combobox(page, label_or_selector, occurrence)
     if trigger is None:
         return f"error: could not locate a combobox trigger for {label_or_selector!r} (occurrence={occurrence})"
+    option_text = await _select_combobox_option(page, trigger, value)
+    if option_text is None:
+        return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}"
+    return f"ok: selected {option_text!r} in combobox {label_or_selector!r}"
+
+
+async def _select_combobox_option(page: Page, trigger, value: str) -> str | None:
+    """Core of `fill_searchable_combobox`, minus the locate/error-message
+    wrapping -- shared with `human_fill_form` so a batched combobox field
+    goes through the exact same static-then-searchable fallback path as the
+    standalone tool.
+
+    Returns the selected option's text, or None on any failure.
+    """
     try:
         await _click_jittered(trigger)
-    except Exception as exc:
-        return f"error: could not open combobox {label_or_selector!r}: {exc}"
+    except Exception:
+        return None
 
     option = page.get_by_role("option", name=value, exact=False).first
     try:
@@ -260,15 +536,15 @@ async def fill_searchable_combobox(label_or_selector: str, value: str, occurrenc
             await page.keyboard.type(value, delay=40)
             await page.wait_for_timeout(400)
             await option.wait_for(state="visible", timeout=5000)
-        except Exception as exc:
-            return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}: {exc}"
+        except Exception:
+            return None
 
     try:
         option_text = (await option.text_content() or value).strip()
         await _click_jittered(option)
-    except Exception as exc:
-        return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}: {exc}"
-    return f"ok: selected {option_text!r} in combobox {label_or_selector!r}"
+    except Exception:
+        return None
+    return option_text
 
 
 def _keystroke_delay_s() -> float:
@@ -292,32 +568,43 @@ async def _human_type(page: Page, value: str) -> None:
         await asyncio.sleep(_keystroke_delay_s())
 
 
+_TRUTHY = {"true", "yes", "1", "checked", "on"}
+
+
 @mcp.tool()
 async def human_fill_form(fields: list[dict]) -> str:
-    """Fill several text fields in one call, each with real per-keystroke
-    typing (jittered delay) and a jittered click position -- the human-typing
-    counterpart to browser_fill_form, which sets values instantly with no
-    keystroke events at all.
+    """Fill a whole page of mixed-type fields -- text boxes, dropdowns,
+    radios, checkboxes, and comboboxes -- in ONE call, with a read-back of
+    what actually landed for each. This is the fill-AND-verify replacement
+    for filling one field per turn then read_field-ing it: both steps used
+    to cost their own turn per field (2N turns for N fields); this is one.
 
-    Same batching contract as browser_fill_form: pass every field you want
-    typed in ONE call, not one call per field -- that's what keeps this at
-    the same LLM turn/token cost as browser_fill_form. The only added cost
-    is real wall-clock time (typing at ~70ms/char), not tool calls or
-    tokens -- a handful of fields adds a couple of seconds, not minutes.
+    Text fields get real per-keystroke typing (jittered delay) and a
+    jittered click position, the human-typing counterpart to
+    browser_fill_form, which sets values instantly with no keystroke events
+    at all. The only added cost over browser_fill_form is real wall-clock
+    time (~70ms/char), not tool calls or tokens.
 
-    Not a wholesale browser_fill_form replacement: reach for this on the
-    fields worth the realism (e.g. right before a submit, or an ATS known to
-    fingerprint keystroke timing), and keep browser_fill_form for the bulk
-    of a long form where that's not worth the extra seconds.
+    Field type is auto-detected from the located element -- a native
+    <select> gets select_option, a checkbox/radio gets checked/unchecked,
+    anything matching a custom combobox trigger (role=combobox,
+    aria-haspopup=listbox, or a <div>/<input> wrapping a listbox -- same
+    detection `fill_searchable_combobox` relies on structurally) goes
+    through that tool's open-and-pick logic, and everything else is typed
+    as text. Override with an explicit "type" if auto-detection ever guesses
+    wrong: "text", "select", "checkbox", "radio", or "combobox".
 
     Args:
         fields: list of {"label_or_selector": str, "value": str,
-            "occurrence": int (optional, default 0)} -- same label/
-            placeholder/text/CSS-selector resolution as
-            fill_searchable_combobox.
+            "occurrence": int (optional, default 0),
+            "type": str (optional, auto-detected if omitted)}.
+            Same label/placeholder/text/CSS-selector resolution as
+            fill_searchable_combobox. For checkbox/radio, value is
+            "true"/"yes"/"1" to check, anything else to uncheck. For
+            select/combobox, value is the option's visible text.
 
-    Returns ``ok: filled N field(s)`` (with any per-field errors appended)
-    or ``error: ...`` if every field failed.
+    Returns ``ok: filled N field(s): label=<read-back state>, ...`` (with
+    any per-field errors appended) or ``error: ...`` if every field failed.
     """
     page = await _get_page()
     filled: list[str] = []
@@ -326,24 +613,100 @@ async def human_fill_form(fields: list[dict]) -> str:
         label = f.get("label_or_selector", "")
         value = f.get("value", "")
         occurrence = f.get("occurrence", 0)
+        field_type = f.get("type", "")
         locator = await _locate_combobox(page, label, occurrence)
         if locator is None:
             errors.append(f"{label!r}: not found")
             continue
         try:
-            await _click_jittered(locator)
-            await locator.fill("", timeout=3000)  # clear any existing/autofilled value
-            await _human_type(page, value)
+            if not field_type:
+                tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+                input_type = await locator.evaluate("el => el.type || ''")
+                role = await locator.evaluate("el => el.getAttribute('role') || ''")
+                haspopup = await locator.evaluate("el => el.getAttribute('aria-haspopup') || ''")
+                if tag == "select":
+                    field_type = "select"
+                elif input_type in ("checkbox", "radio"):
+                    field_type = input_type
+                elif role == "combobox" or haspopup == "listbox":
+                    field_type = "combobox"
+                else:
+                    field_type = "text"
+
+            if field_type == "select":
+                await locator.select_option(label=value, timeout=3000)
+            elif field_type in ("checkbox", "radio"):
+                if value if isinstance(value, bool) else str(value).strip().lower() in _TRUTHY:
+                    await locator.check(timeout=3000)
+                else:
+                    await locator.uncheck(timeout=3000)
+            elif field_type == "combobox":
+                option_text = await _select_combobox_option(page, locator, value)
+                if option_text is None:
+                    errors.append(f"{label!r}: combobox fill failed for {value!r}")
+                    continue
+            else:
+                await _click_jittered(locator)
+                await locator.fill("", timeout=3000)  # clear any existing/autofilled value
+                await _human_type(page, value)
+
+            parts = await _read_field_parts(page, locator)
+            filled.append(f"{label}={' '.join(parts)}")
         except Exception as exc:
             errors.append(f"{label!r}: {exc}")
             continue
-        filled.append(label)
     if not filled:
         return "error: no fields filled -- " + "; ".join(errors)
     out = f"ok: filled {len(filled)} field(s): {', '.join(filled)}"
     if errors:
         out += " | errors: " + "; ".join(errors)
     return out
+
+
+async def _read_field_parts(page: Page, locator) -> list[str]:
+    """Value/checked state + validation state for one located field, as the
+    short ``value="..." invalid=false`` fragments `read_field` and the
+    batched `human_fill_form` read-back both return. Factored out so a
+    caller filling N fields doesn't need a second read_field-shaped call per
+    field to get the same information -- see `human_fill_form`.
+    """
+    tag = await locator.evaluate("el => el.tagName.toLowerCase()")
+    input_type = await locator.evaluate("el => el.type || ''")
+    parts = []
+    if tag in ("input", "textarea", "select") and input_type not in ("checkbox", "radio"):
+        value = await locator.input_value(timeout=3000)
+        parts.append(f'value="{value}"')
+    elif input_type in ("checkbox", "radio"):
+        checked = await locator.is_checked(timeout=3000)
+        parts.append(f"checked={str(checked).lower()}")
+    else:
+        text = (await locator.text_content() or "").strip()
+        parts.append(f'text="{text[:200]}"')
+    invalid = await locator.evaluate(
+        "el => el.getAttribute('aria-invalid') === 'true' || el.classList.contains('error')"
+    )
+    parts.append(f"invalid={str(invalid).lower()}")
+    if invalid:
+        # aria-describedby is the standard way a form points a field at
+        # its own error message -- cheaper than scanning the whole page
+        # for red text, and it's what check_for_errors below also uses.
+        described_by = await locator.evaluate("el => el.getAttribute('aria-describedby') || ''")
+        if described_by:
+            for id_ in described_by.split():
+                try:
+                    # An attribute selector, not a `#id` CSS token: real
+                    # ids from these forms are often UUIDs (leading
+                    # digit, colons) that `#id` rejects outright with a
+                    # SyntaxError, taking down the whole read over what
+                    # should just be a missing error message.
+                    err_el = page.locator(f'[id="{id_}"]')
+                    if await err_el.count() > 0:
+                        err_text = (await err_el.first.text_content() or "").strip()
+                        if err_text:
+                            parts.append(f'error_text="{err_text[:200]}"')
+                except Exception:
+                    continue
+    return parts
 
 
 @mcp.tool()
@@ -374,42 +737,7 @@ async def read_field(label_or_selector: str, occurrence: int = 0) -> str:
     if locator is None:
         return f"error: could not locate a field for {label_or_selector!r} (occurrence={occurrence})"
     try:
-        tag = await locator.evaluate("el => el.tagName.toLowerCase()")
-        input_type = await locator.evaluate("el => el.type || ''")
-        parts = []
-        if tag in ("input", "textarea", "select") and input_type not in ("checkbox", "radio"):
-            value = await locator.input_value(timeout=3000)
-            parts.append(f'value="{value}"')
-        elif input_type in ("checkbox", "radio"):
-            checked = await locator.is_checked(timeout=3000)
-            parts.append(f"checked={str(checked).lower()}")
-        else:
-            text = (await locator.text_content() or "").strip()
-            parts.append(f'text="{text[:200]}"')
-        invalid = await locator.evaluate(
-            "el => el.getAttribute('aria-invalid') === 'true' || el.classList.contains('error')"
-        )
-        parts.append(f"invalid={str(invalid).lower()}")
-        if invalid:
-            # aria-describedby is the standard way a form points a field at
-            # its own error message -- cheaper than scanning the whole page
-            # for red text, and it's what check_for_errors below also uses.
-            described_by = await locator.evaluate("el => el.getAttribute('aria-describedby') || ''")
-            if described_by:
-                for id_ in described_by.split():
-                    try:
-                        # An attribute selector, not a `#id` CSS token: real
-                        # ids from these forms are often UUIDs (leading
-                        # digit, colons) that `#id` rejects outright with a
-                        # SyntaxError, taking down the whole read_field call
-                        # over what should just be a missing error message.
-                        err_el = page.locator(f'[id="{id_}"]')
-                        if await err_el.count() > 0:
-                            err_text = (await err_el.first.text_content() or "").strip()
-                            if err_text:
-                                parts.append(f'error_text="{err_text[:200]}"')
-                    except Exception:
-                        continue
+        parts = await _read_field_parts(page, locator)
     except Exception as exc:
         return f"error: read failed for {label_or_selector!r}: {exc}"
     return "ok: " + " ".join(parts)
@@ -421,24 +749,52 @@ async def check_for_errors() -> str:
 
     Looks only at the standard places a form puts an error: elements with
     role="alert", aria-invalid="true", or a class containing "error"/
-    "invalid". Returns just those (name + message), which is normally a
-    handful of short lines, instead of a full `browser_snapshot` whose whole
-    purpose was to spot exactly this after a failed submit.
+    "invalid" that also sits inside a field wrapper (so permanent helper
+    text like "File exceeds the maximum upload size of 100MB" or a country
+    dial-code hint, which also carry "error"/"invalid" classes for styling
+    but aren't validation state, don't get reported as errors). Returns just
+    the real matches (name + message), which is normally a handful of short
+    lines, instead of a full `browser_snapshot` whose whole purpose was to
+    spot exactly this after a failed submit.
 
     Returns ``ok: no errors found`` or a newline-separated list of
     ``field: message`` (or ``message`` alone when no associated field name
     is found), capped at 15 entries.
     """
     page = await _get_page()
+    if _dry_run:
+        for frame in page.frames:
+            try:
+                blocked = await frame.evaluate("() => window.__applypilot_dry_run_blocked__")
+            except Exception:
+                continue
+            if blocked:
+                return (
+                    f"error: DRY RUN -- a {blocked.get('type')} on "
+                    f"{blocked.get('text') or blocked.get('action') or '(submit)'} was blocked. "
+                    "This run must not submit. Stop trying to click Submit -- output "
+                    "RESULT:APPLIED with a note that this was a dry run."
+                )
     try:
         found = await page.evaluate("""
             () => {
                 const seen = new Set();
                 const out = [];
+                function isVisible(el) {
+                    if (el.offsetParent === null) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                }
                 const nodes = document.querySelectorAll(
                     '[role="alert"], [aria-invalid="true"], [class*="error" i], [class*="invalid" i]'
                 );
                 for (const el of nodes) {
+                    if (!isVisible(el)) continue;
+                    const isClassOnly = el.getAttribute('role') !== 'alert'
+                        && el.getAttribute('aria-invalid') !== 'true';
+                    if (isClassOnly && !el.closest(
+                        'label, [class*="field" i], [class*="form-group" i], [class*="form-row" i]'
+                    )) continue;
                     const text = (el.textContent || '').trim().replace(/\\s+/g, ' ');
                     if (!text || text.length > 300 || seen.has(text)) continue;
                     seen.add(text);
@@ -1080,11 +1436,13 @@ async def handle_captcha(proxy_string: str = "") -> str:
 
 
 def main() -> None:
-    global _cdp_endpoint
+    global _cdp_endpoint, _dry_run
     parser = argparse.ArgumentParser()
     parser.add_argument("--cdp-endpoint", required=True)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     _cdp_endpoint = args.cdp_endpoint
+    _dry_run = args.dry_run
     mcp.run(transport="stdio")
 
 

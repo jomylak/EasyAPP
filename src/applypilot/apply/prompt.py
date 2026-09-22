@@ -603,7 +603,8 @@ def build_prompt(job: dict, tailored_resume: str,
                  dry_run: bool = False,
                  email_override: str | None = None,
                  password_override: str | None = None,
-                 proxy_string: str | None = None) -> str:
+                 proxy_string: str | None = None,
+                 worker_id: int | None = None) -> str:
     """Build the full instruction prompt for the apply agent.
 
     Loads the user profile and search config internally. All personal data
@@ -627,7 +628,7 @@ def build_prompt(job: dict, tailored_resume: str,
         Complete prompt string for the AI agent.
     """
     ctx = _prepare_context(job, cover_letter=cover_letter, email_override=email_override,
-                           password_override=password_override)
+                           password_override=password_override, worker_id=worker_id)
     personal = ctx["personal"]
     pdf_path = ctx["pdf_path"]
     cl_upload_path = ctx["cl_upload_path"]
@@ -647,7 +648,7 @@ def build_prompt(job: dict, tailored_resume: str,
 
     # Dry-run: override submit instruction
     if dry_run:
-        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run."
+        submit_instruction = "IMPORTANT: Do NOT click the final Submit/Apply button. Review the form, verify all fields, then output RESULT:APPLIED with a note that this was a dry run. (A guard will block any Submit click and tell you so via check_for_errors -- if that happens, stop retrying and output the dry-run result.)"
     else:
         submit_instruction = "BEFORE clicking Submit/Apply, take a snapshot and review EVERY field on the page. Verify all data matches the APPLICANT PROFILE and TAILORED RESUME -- name, email, phone, location, work auth, resume uploaded, cover letter if applicable. If anything is wrong or missing, fix it FIRST. Once everything is confirmed correct, call applytools__human_pause() ONCE, then click Submit."
 
@@ -770,6 +771,16 @@ RESULT:FAILED:not_eligible_location -- onsite outside acceptable area, no remote
 RESULT:FAILED:not_eligible_work_auth -- requires unauthorized work location
 RESULT:FAILED:grad_date_mismatch -- form/posting requires a graduation date that
   conflicts with the attached resume (see GRADUATION DATE section above)
+RESULT:FAILED:proxy_dropped -- a browser_* tool call errored with a network-level
+  connection failure (net::ERR_PROXY_CONNECTION_FAILED, ERR_TUNNEL_CONNECTION_FAILED,
+  ERR_CONNECTION_RESET, ERR_CONNECTION_CLOSED, ERR_EMPTY_RESPONSE, ERR_SOCKS_CONNECTION_FAILED,
+  or similar -- the proxy's connection dying, not a site returning an error page).
+  Output this IMMEDIATELY, do not retry the navigation or action, do not attempt
+  login/resume-upload/recovery first. A session that resumes on a different
+  network path mid-flow looks exactly like session hijacking to the ATS's own
+  fraud detection -- worse than just stopping cleanly. Output the code bare,
+  with NO trailing note (unlike other FAILED reasons) -- this one is retried
+  automatically on a clean connection, nobody reads the detail.
 RESULT:FAILED:<brief_reason> -- any other failure. Replace <brief_reason> with
   a short snake_case description of what actually went wrong (e.g.
   RESULT:FAILED:pay_below_floor, RESULT:FAILED:no_resume_field_on_form).
@@ -816,21 +827,24 @@ layout.
     skipping verification -- still confirm every value you set; just don't
     confirm the same thing twice.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
-- Fill ALL plain text fields in ONE browser_fill_form call. Not one at a time.
-  Custom comboboxes are the exception -- see TOOL DISCIPLINE below; batching them
-  into fill_form leaves them unset and poisons the field for the retry.
-  Optional: applytools__human_fill_form(fields) does the same batching but
-  types real keystrokes instead of setting the value instantly -- costs a
-  couple extra seconds of real time, not extra turns, since it's still ONE
-  call for every field passed. Use it for the last field or two before a
-  submit, not the whole form.
+- Fill a WHOLE PAGE in ONE applytools__human_fill_form(fields) call, whatever
+  the mix of field types -- text boxes, dropdowns, radios, checkboxes, AND
+  comboboxes all go in the same call, each with its "type" set (or left out
+  for auto-detect). It also does the read-back for you: the result lists
+  what actually landed in each field, so you don't need a separate
+  read_field/read_form_state pass right after -- one call fills AND
+  verifies the whole page. Types with real keystrokes instead of setting
+  values instantly (browser_fill_form's failure mode), at the cost of a
+  couple of real seconds, not extra turns, since it's still ONE call for the
+  whole page. Plain browser_fill_form is the fallback only if this tool
+  errors on a field it can't classify.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 
 == FORM TRICKS ==
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. applytools__upload_resume with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
-- File upload not working? applytools__upload_resume should be your first and second try (it targets the first <input type=file> even when hidden behind a styled button, so a retry after a click that reveals the real input can succeed where the first call didn't). If it still fails, fall back to: (1) browser_click the upload button/area, (2) browser_file_upload with the path.
+- File upload not working? applytools__upload_resume should be your first and second try (it targets the first <input type=file> even when hidden behind a styled button, so a retry after a click that reveals the real input can succeed where the first call didn't). Do NOT click the upload button/area as a fallback -- that opens a real native file-chooser dialog that gets stuck as a blocking modal state for every subsequent browser_* tool call, permanently (see the upload-resume section above). If applytools__upload_resume genuinely fails twice, report the exact error rather than clicking anything near the upload control.
 - TOOL DISCIPLINE (this is the difference between a 4-minute run and a 20-minute one):
   Read page state ONLY through browser_snapshot / browser_find. Do NOT use a
   shell/terminal tool to cat, grep, or sed the Playwright MCP's own on-disk
@@ -843,37 +857,40 @@ layout.
   correct after browser_navigate or a real page transition (new form, new
   modal), wasteful when you just want to confirm one thing worked. For those
   narrower checks, use the cheaper targeted tools instead:
-  * Just filled/clicked ONE field and want to confirm it took?
-    applytools__read_field(label_or_selector) -- returns that field's value
-    or checked state in a couple of lines, not the whole page.
+  * EVERY TOOL CALL IS A PAID TURN, REGARDLESS OF ITS OUTPUT SIZE. A cheap
+    one-line read still costs the same as a full snapshot. So verify PER
+    PAGE, not per field: fill everything on the page in one batch, THEN call
+    applytools__read_form_state() ONCE, right before clicking Next/Submit.
+    It dumps every visible field's current value/checked state in one
+    compact list, including fields inside same-origin iframes (the whole
+    form on iCIMS lives in one) -- read the whole list and fix only the
+    fields it flags as wrong or empty, instead of re-checking fields one at
+    a time as you fill them.
   * Just clicked Submit/Next/Continue and want to know if it was rejected?
     applytools__check_for_errors() -- scans standard error markers
-    (role="alert", aria-invalid, .error/.invalid classes) and returns only
-    those, or "ok: no errors found". Try this BEFORE a full snapshot; only
-    fall back to browser_snapshot if it comes back clean but something still
-    seems wrong (e.g. the page plainly didn't move on).
-  * Filled a WHOLE PAGE of fields (radios, checkboxes, text inputs) and want
-    to double-check everything landed before hitting Submit?
-    applytools__read_form_state() -- dumps every visible field's current
-    value/checked state in one compact list, including fields inside
-    same-origin iframes (the whole form on iCIMS lives in one). Use this
-    instead of a full browser_snapshot for a pre-submit review pass.
-  * Know exactly which button/link/field you want by its label or visible
-    text and just need to click it? applytools__find_and_click(text) does
-    the locate-and-click in one call instead of browser_find then
-    browser_click as two separate turns.
-  * Just want to confirm a click/fill actually changed something, with no
-    need to click anything new afterward? applytools__snapshot_diff() --
-    EXPERIMENTAL, not yet verified on a live page, so sanity-check its
-    output against what you actually see before trusting it. Returns only
-    what changed since the last time it was called this session (headings,
-    alerts, buttons, field states), not the whole tree. It cannot give you
-    click targets (no ref= system) -- if the next step is clicking something
-    new, use browser_snapshot instead.
+    (role="alert", aria-invalid, .error/.invalid classes inside a field)
+    and returns only those, or "ok: no errors found". Try this BEFORE a full
+    snapshot; only fall back to browser_snapshot if it comes back clean but
+    something still seems wrong (e.g. the page plainly didn't move on).
+  * Need a one-off read of a single field outside that pre-submit pass?
+    applytools__read_field(label_or_selector) -- returns that field's value
+    or checked state in a couple of lines. Reach for this rarely; the
+    per-page read_form_state pass above should cover almost every case.
   Reach for a full browser_snapshot when you actually need the whole page's
   layout -- right after navigating somewhere new, or when you're locating
   multiple elements to act on next. Don't reach for it just to re-verify a
   single action you already have a cheaper tool for.
+  Clicking ONE specific element (a button, a link, a checkbox you can name by
+  its label or visible text)? Use applytools__find_and_click(text_or_selector)
+  instead of browser_click. It resolves the element fresh from the live page
+  every time, so it can't fail with "Ref not found in the current page
+  snapshot" the way browser_click does when the page changed since your last
+  snapshot -- that stale-ref error is one of the most common ways a run burns
+  an extra turn recovering (re-snapshot, re-locate, retry) instead of just
+  succeeding the first time. Reach for browser_click only when you already
+  have a fresh ref from the snapshot you just took and want to act on it
+  immediately, or for a widget find_and_click can't resolve (e.g. an element
+  identified only by position/icon, with no label or text).
   Set values with browser_type, browser_click, browser_fill_form and
   browser_file_upload. Use browser_evaluate ONLY to READ state you cannot see in
   a snapshot -- never to set a value. Assigning `el.value` and firing a synthetic
@@ -881,6 +898,11 @@ layout.
   HCM and Workday commit values through their own event bus, so the field silently
   keeps its old value and you will loop writing JS that never takes effect. Real
   keyboard and mouse events from browser_type/browser_click do commit.
+  Whatever you pass to browser_evaluate or browser_run_code_unsafe runs INSIDE
+  THE PAGE, not in Node: there is no `require`, no `import()`, no `process`,
+  no `module`. Reaching for any of them throws instead of running, and that
+  is the single most common way these two tools fail -- write plain browser
+  JS against `document`/`window` or don't use them.
 - A FIELD THAT RESISTS: do NOT retry the same action. Retrying is what burns runs.
   Snapshot the element and look at what it actually is, then match the pattern:
   * role="combobox" on an <input> (not a <select>) -> it is a FILTERABLE combobox.
@@ -1013,7 +1035,13 @@ F. Reset mail never arrives after ~2 minutes, or the reset page errors ->
 == WHEN TO GIVE UP ==
 - Same page after 3 attempts with no progress -> RESULT:FAILED:stuck
 - Job is closed/expired/page says "no longer accepting" -> RESULT:EXPIRED
-- Page is broken/500 error/blank -> RESULT:FAILED:page_error
+- Page is broken/500 error/blank, upload fails with "Network Error", or a
+  button's click handler does nothing (no navigation, no network request) ->
+  reload the page (browser_navigate to the same URL, or browser_press_key
+  F5) ONCE and retry the step. If it's still broken after that one reload,
+  give up: RESULT:FAILED:page_error. Do NOT close the tab to "recover" --
+  if it's the only tab, this can kill the whole browser session (and the
+  run) outright, which is worse than just failing this one job.
 Stop immediately. Output your RESULT code. Do not loop."""
 
     return prompt

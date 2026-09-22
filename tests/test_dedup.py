@@ -1,30 +1,29 @@
-"""Tests for duplicate-posting detection (dedup.py).
-
-Covers the three checkpoints' matching helpers directly, plus the two
-correctness fixes made alongside the new company-level checkpoint:
-location normalization (NULL vs "") and URL canonicalization.
-"""
+"""Tests for dedup.link: strict duplicates, visible related groups, newest-visible."""
 
 import pytest
 
 from applypilot import dedup
 from applypilot.database import init_db
 
+DESC = "Build things with Python and SQL for the data platform team. " * 4
+OTHER = "Design and deploy machine learning applications on the cloud. " * 4
+ORACLE = ("https://x.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/LazardStudentCareers"
+          "/job/6606?jr_id={}")
+
 
 def _insert(conn, url, **cols):
-    row = {
-        "url": url,
-        "title": "Software Engineer Intern",
-        "location": "Remote",
-        "description": "A" * 50,
-    }
+    row = {"url": url, "title": "Data Engineer Intern", "location": "New York, NY",
+           "description": "blurb " * 10, "company": "Lazard",
+           "company_normalized": "lazard", "discovered_at": "2026-09-01T00:00:00+00:00"}
     row.update(cols)
-    cols_sql = ", ".join(row)
-    conn.execute(
-        f"INSERT INTO jobs ({cols_sql}) VALUES ({', '.join('?' * len(row))})",
-        list(row.values()),
-    )
+    conn.execute(f"INSERT INTO jobs ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                 list(row.values()))
     conn.commit()
+
+
+def _row(conn, url):
+    return conn.execute("SELECT duplicate_of, group_id, fit_score, full_description "
+                        "FROM jobs WHERE url = ?", (url,)).fetchone()
 
 
 @pytest.fixture
@@ -32,115 +31,144 @@ def db(tmp_path):
     return init_db(tmp_path / "test.db")
 
 
-# ---------------------------------------------------------------------------
-# normalize_location
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("raw,expected", [
-    (None, None),
-    ("", None),
-    ("   ", None),
-    ("Remote", "Remote"),
-    ("  Remote  ", "Remote"),
-])
-def test_normalize_location(raw, expected):
-    assert dedup.normalize_location(raw) == expected
-
-
-def test_normalize_location_collapses_null_and_empty_string_to_the_same_key(db):
-    """The bug this fixes: workday.py used to default missing location to
-    "" while jobspy.py defaulted the same case to None, so
-    find_exact_text_duplicate's `location IS ?` (NULL-safe, not ""-safe)
-    silently failed to match otherwise-identical postings across sources."""
-    _insert(db, "https://a.example/1", location=dedup.normalize_location(""))
-    match = dedup.find_exact_text_duplicate(
-        db, "Software Engineer Intern", "A" * 50, dedup.normalize_location(None),
-    )
-    assert match == "https://a.example/1"
+def test_reposted_ats_job_id_keeps_newest_visible_and_never_cycles(db):
+    _insert(db, "old", ats="Oracle HCM", application_url=ORACLE.format("a"),
+            posted_date="2026-09-01T00:00:00+00:00")
+    dedup.link(db, "old")
+    _insert(db, "new", ats="Oracle HCM", application_url=ORACLE.format("b"),
+            posted_date="2026-09-15T00:00:00+00:00")
+    dedup.link(db, "new")
+    assert _row(db, "old")["duplicate_of"] == "new"
+    assert _row(db, "new")["duplicate_of"] is None
+    # Re-running any row (e.g. after a rebuild) must not flip anything.
+    dedup.link(db, "old")
+    dedup.link(db, "new")
+    assert _row(db, "old")["duplicate_of"] == "new"
+    assert _row(db, "new")["duplicate_of"] is None
+    assert _row(db, "old")["group_id"] == _row(db, "new")["group_id"] is not None
 
 
-# ---------------------------------------------------------------------------
-# canonicalize_url
-# ---------------------------------------------------------------------------
-
-def test_canonicalize_url_strips_tracking_params_only():
-    assert (dedup.canonicalize_url("https://x.example/job?utm_source=a&jr_id=1&token=keep")
-            == "https://x.example/job?token=keep")
-
-
-# ---------------------------------------------------------------------------
-# find_company_duplicate
-# ---------------------------------------------------------------------------
-
-def test_find_company_duplicate_matches_same_company_similar_title_and_text(db):
-    _insert(db, "https://a.example/1", company="ByteDance",
-            company_normalized="bytedance",
-            full_description="We are looking for a Software Engineer Intern " * 5)
-    match = dedup.find_company_duplicate(
-        db, "TikTok", "Software Engineer Intern",
-        "We are looking for a Software Engineer Intern " * 5, "Remote",
-    )
-    # "TikTok" and "ByteDance" are NOT unified by normalize_company (no
-    # alias map exists) -- confirms the matcher relies on company_normalized
-    # being written identically for true reposts of the same req, not on
-    # cross-brand alias resolution it doesn't attempt.
-    assert match is None
+def test_same_ats_id_but_different_title_is_not_a_duplicate(db):
+    _insert(db, "a", ats="Oracle HCM", application_url=ORACLE.format("a"))
+    _insert(db, "b", ats="Oracle HCM", application_url=ORACLE.format("b"), title="AI Engineer Intern")
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["duplicate_of"] is None and _row(db, "b")["duplicate_of"] is None
 
 
-def test_find_company_duplicate_matches_same_normalized_company(db):
-    _insert(db, "https://a.example/1", company="TikTok Inc.",
-            company_normalized="tiktok",
-            full_description="We are looking for a Software Engineer Intern " * 5)
-    match = dedup.find_company_duplicate(
-        db, "TikTok", "Software Engineer Intern",
-        "We are looking for a Software Engineer Intern " * 5, "Remote",
-    )
-    assert match == "https://a.example/1"
+def test_similar_titles_at_same_company_are_separate_jobs(db):
+    # The Lazard case: two different roles you apply to separately.
+    _insert(db, "de", full_description=DESC, title="2027 Data Engineer Summer Internship")
+    _insert(db, "ai", full_description=DESC + "AI", title="2027 AI Engineer Summer Internship")
+    dedup.link(db, "de")
+    dedup.link(db, "ai")
+    for u in ("de", "ai"):
+        assert _row(db, u)["duplicate_of"] is None and _row(db, u)["group_id"] is None
 
 
-def test_find_company_duplicate_requires_exact_location_match(db):
-    """A genuinely different office for the same role at the same company
-    is a different req, not a repost -- location is never allowed to be
-    fuzzy here, per dedup.py's own stated philosophy."""
-    _insert(db, "https://a.example/1", company="TikTok",
-            company_normalized="tiktok", location="New York, NY",
-            full_description="We are looking for a Software Engineer Intern " * 5)
-    match = dedup.find_company_duplicate(
-        db, "TikTok", "Software Engineer Intern",
-        "We are looking for a Software Engineer Intern " * 5, "San Jose, CA",
-    )
-    assert match is None
+def test_identical_text_but_different_ats_requisitions_stay_separate(db):
+    _insert(db, "a", full_description=DESC, ats="Oracle HCM", application_url=ORACLE.format("a"))
+    _insert(db, "b", full_description=DESC, ats="Oracle HCM",
+            application_url=ORACLE.format("b").replace("/job/6606", "/job/7777"))
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["duplicate_of"] is None and _row(db, "b")["duplicate_of"] is None
+    assert _row(db, "a")["group_id"] is None
 
 
-def test_find_company_duplicate_requires_similar_description_not_just_title(db):
-    """Same company, same title, genuinely different description (a
-    different req that happens to share a common title like "SWE Intern")
-    must not be flagged -- title similarity alone isn't enough."""
-    _insert(db, "https://a.example/1", company="TikTok",
-            company_normalized="tiktok",
-            full_description="Work on the recommendation systems team " * 5)
-    match = dedup.find_company_duplicate(
-        db, "TikTok", "Software Engineer Intern",
-        "Work on the payments infrastructure team " * 5, "Remote",
-    )
-    assert match is None
+def test_exact_text_same_company_title_location_is_duplicate(db):
+    _insert(db, "a", full_description=DESC, discovered_at="2026-09-01T00:00:00+00:00")
+    _insert(db, "b", full_description=DESC, discovered_at="2026-09-05T00:00:00+00:00")
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["duplicate_of"] == "b"
 
 
-# ---------------------------------------------------------------------------
-# check_duplicate: company_repost wired in as a third fallback
-# ---------------------------------------------------------------------------
+def test_same_title_different_description_is_left_alone(db):
+    _insert(db, "a", full_description=DESC, description="first blurb " * 8)
+    _insert(db, "b", full_description=OTHER, description="second blurb " * 8)
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["group_id"] is None and _row(db, "b")["group_id"] is None
 
-def test_check_duplicate_uses_company_repost_as_last_resort(db):
-    # Titles differ slightly (still >=0.7 similar) so the exact_text
-    # checkpoint doesn't fire first -- this isolates the company_repost path.
-    _insert(db, "https://a.example/1", company="TikTok",
-            company_normalized="tiktok", title="Software Engineer Intern",
-            full_description="We are looking for a Software Engineer Intern " * 5)
-    _insert(db, "https://a.example/2", company="TikTok",
-            company_normalized="tiktok", title="Software Engineer Intern - Summer",
-            full_description="We are looking for a Software Engineer Intern " * 5)
 
-    result = dedup.check_duplicate(db, "https://a.example/2")
+def test_same_posting_in_other_cities_is_grouped_despite_location_lines(db):
+    _insert(db, "a", full_description=DESC + "Location: New York, NY.", location="New York, NY")
+    _insert(db, "b", full_description=DESC + "Location: Chicago, IL.", location="Chicago, IL")
+    _insert(db, "c", full_description=DESC + "Location: Austin, TX.", location="Austin, TX")
+    for u in ("a", "b", "c"):
+        dedup.link(db, u)
+    assert all(_row(db, u)["duplicate_of"] is None for u in ("a", "b", "c"))
+    assert _row(db, "a")["group_id"] == _row(db, "b")["group_id"] == _row(db, "c")["group_id"] is not None
 
-    assert result["duplicate_of"] == "https://a.example/1"
-    assert result["reason"] == "company_repost"
+
+def test_never_matches_across_companies(db):
+    _insert(db, "a", full_description=DESC)
+    _insert(db, "b", full_description=DESC, company="Other Co", company_normalized="other")
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["group_id"] is None and _row(db, "b")["duplicate_of"] is None
+
+
+def test_discovery_time_repost_inherits_enrichment_and_score(db):
+    _insert(db, "old", full_description=DESC, fit_score=9,
+            discovered_at="2026-09-01T00:00:00+00:00")
+    _insert(db, "new", discovered_at="2026-09-10T00:00:00+00:00")  # same blurb, not enriched
+    result = dedup.link(db, "new")
+    assert result["duplicate_of"] is None
+    assert _row(db, "old")["duplicate_of"] == "new"
+    new = _row(db, "new")
+    assert new["fit_score"] == 9 and new["full_description"] == DESC
+
+
+def test_backfill_rebuilds_from_scratch(db):
+    _insert(db, "a", full_description=DESC, discovered_at="2026-09-01T00:00:00+00:00")
+    _insert(db, "b", full_description=DESC, discovered_at="2026-09-05T00:00:00+00:00")
+    db.execute("UPDATE jobs SET duplicate_of = 'a' WHERE url = 'a'")  # stale/corrupt link
+    db.commit()
+    stats = dedup.backfill(db)
+    assert _row(db, "a")["duplicate_of"] == "b" and _row(db, "b")["duplicate_of"] is None
+    assert stats["duplicates_found"] == 1
+
+
+def test_title_normalization_is_only_case_space_and_dash():
+    assert dedup.norm_title("  Data  Engineer – Intern ") == dedup.norm_title("data engineer - intern")
+    assert dedup.norm_title("Data Engineer Intern") != dedup.norm_title("Software Engineer Intern")
+
+
+def test_canonicalize_url_strips_tracking_but_keeps_ids():
+    assert dedup.canonicalize_url("https://a.com/x?utm_source=z&token=5") == "https://a.com/x?token=5"
+
+
+def test_normalize_location_collapses_blank():
+    assert dedup.normalize_location("  ") is None and dedup.normalize_location("NYC") == "NYC"
+
+
+def test_self_reported_application_shows_beside_the_real_posting(db):
+    _insert(db, "real", full_description=DESC, title="2027 Data Engineer Summer Internship")
+    _insert(db, "self-reported:lazard:x", title="2027 Data Engineer Summer Internship",
+            company="Lazard", company_normalized=None, location=None, description=None,
+            apply_status="applied", apply_backend="manual")
+    dedup.link(db, "real")
+    dedup.link(db, "self-reported:lazard:x")
+    assert _row(db, "real")["group_id"] == _row(db, "self-reported:lazard:x")["group_id"] is not None
+    assert _row(db, "real")["duplicate_of"] is None
+
+
+def test_workday_repost_suffix_and_non_prefixed_req_ids_resolve_to_one_job(db):
+    base = "https://monumenthealth.wd1.myworkdayjobs.com/{}/job/Rapid-City-SD-USA/Cybersecurity-Engineer-I_27_1439{}?jr_id={}"
+    _insert(db, "a", ats="Workday", application_url=base.format("Engagement", "", "a"),
+            full_description=DESC, posted_date="2026-09-07T00:00:00+00:00")
+    _insert(db, "b", ats="Workday", application_url=base.format("Goldcareers", "-1", "b"),
+            full_description=OTHER, posted_date="2026-09-12T00:00:00+00:00")  # text differs, id doesn't
+    dedup.link(db, "a")
+    dedup.link(db, "b")
+    assert _row(db, "a")["duplicate_of"] == "b" and _row(db, "b")["duplicate_of"] is None
+
+
+def test_generic_employer_id_extraction():
+    from applypilot.ats import job_key
+    assert job_key(None, "https://www.amazon.jobs/en/jobs/10412530/sde-intern?cmpid=X") == "amazon.jobs:10412530"
+    assert job_key(None, "https://careers.ibm.com/en_US/careers/JobDetail?jobId=130762&src=jobright") == "ibm.com:130762"
+    assert job_key(None, "https://jobs.spectrum.com/job/x/slug/4673/100133781152?jr_id=z") == "spectrum.com:100133781152"
+    assert job_key(None, "https://jobright.ai/jobs/info/6aad6f082e757fcb5c8b85ad") is None

@@ -925,6 +925,15 @@ def _finalize_detail_result(result: dict, page, t0: float, url: str) -> dict:
         if employer_posted_date:
             result["employer_posted_date"] = employer_posted_date
 
+    # `page` is now sitting on the real employer/ATS page (the resolve above
+    # already followed any aggregator redirect), so this is the one place we
+    # still have live HTML to fingerprint a vanity domain against -- by the
+    # time callers see `result`, the page is gone and all they have left is
+    # extracted description text, which never contains an ATS's markup/script
+    # fingerprints (see ats._HTML_PATTERNS).
+    from applypilot.ats import detect_ats
+    result["ats"] = detect_ats(result.get("application_url") or url, page.content())
+
     result["elapsed"] = time.time() - t0
     return result
 
@@ -1020,6 +1029,7 @@ def scrape_site_batch(
     max_jobs: int | None = None,
     remote_report: Callable[[str, dict], None] | None = None,
     jitter: float = 0.0,
+    stop_check: Callable[[], bool] | None = None,
 ) -> dict:
     """Process all jobs for one site using shared browser context.
 
@@ -1043,6 +1053,11 @@ def scrape_site_batch(
     delay*(1-jitter) to delay*(1+jitter) -- a fixed cadence for hours is a
     more obviously-mechanical shape than the same average rate with natural
     variance. Zero behavior change for existing callers, which never pass it.
+
+    stop_check, when given, is polled after each job finishes; a True return
+    ends the batch early (remaining jobs stay pending for next time) instead
+    of grinding through the rest -- used on the Pi to hand its shared browser
+    lock back to the Zoom bot fast instead of after a full 15-job batch.
     """
     stats: dict = {"processed": 0, "ok": 0, "partial": 0, "error": 0, "tiers": {1: 0, 2: 0, 3: 0}}
 
@@ -1103,13 +1118,10 @@ def scrape_site_batch(
                             "application_url": result.get("application_url"),
                             "employer_posted_date": result.get("employer_posted_date"),
                             "posted_date": result.get("posted_date"),
+                            "ats": result.get("ats"),
                         })
                     else:
-                        from applypilot.ats import detect_ats
-                        detected = detect_ats(
-                            result.get("application_url") or url,
-                            result.get("full_description"),
-                        )
+                        detected = result.get("ats")
                         conn.execute(
                             "UPDATE jobs SET full_description = ?, application_url = ?, "
                             "employer_posted_date = ?, posted_date = COALESCE(posted_date, ?), "
@@ -1199,6 +1211,11 @@ def scrape_site_batch(
                 if not remote_report:
                     conn.commit()
 
+                if stop_check and stop_check():
+                    log.info("stop_check signaled -- ending batch early (%d/%d done).",
+                             i + 1, len(jobs))
+                    break
+
                 if i < len(jobs) - 1:
                     if jitter:
                         time.sleep(random.uniform(delay * (1 - jitter), delay * (1 + jitter)))
@@ -1228,7 +1245,7 @@ def _run_detail_scraper(
     Returns aggregate stats dict.
     """
     skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
-    where = f"WHERE detail_scraped_at IS NULL AND {skip_filter}"
+    where = f"WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL AND {skip_filter}"
     rows = conn.execute(
         f"SELECT url, title, site FROM jobs {where} ORDER BY site"
     ).fetchall()
@@ -1342,7 +1359,7 @@ def stream_detail(
             skip_filter = " AND ".join(f"site != '{s}'" for s in SKIP_DETAIL_SITES)
             rows = conn.execute(
                 "SELECT url, title, site FROM jobs "
-                f"WHERE detail_scraped_at IS NULL AND {skip_filter} "
+                f"WHERE detail_scraped_at IS NULL AND duplicate_of IS NULL AND {skip_filter} "
                 "ORDER BY site LIMIT 200"
             ).fetchall()
 

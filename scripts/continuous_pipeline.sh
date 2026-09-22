@@ -46,7 +46,7 @@ SCORE_PAUSE_FLAG="/tmp/applypilot_score_paused"
 IDLE_POLL=30       # seconds between idle re-checks in enrich/score loops
 DISCOVER_INTERVAL=300  # seconds between discovery passes (a full re-crawl of
                         # both sites costs ~16s, so this is cheap even tight)
-GMAIL_SCAN_INTERVAL=86400  # once a day -- a poll, not a live feed; see
+GMAIL_SCAN_INTERVAL=7200  # every 2h -- incremental + one batched LLM call; see
                             # scripts/scan_gmail_status.py
 mkdir -p "$HOME/.applypilot/logs"
 rm -f "$STOP_FLAG"
