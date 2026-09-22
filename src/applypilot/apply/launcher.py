@@ -218,7 +218,6 @@ def _select_target(conn, target_url: str):
         SELECT {_JOB_COLUMNS}
         FROM jobs
         WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-          AND tailored_resume_path IS NOT NULL
           AND (apply_status IS NULL OR apply_status != 'in_progress')
         LIMIT 1
     """, (target_url, target_url, like, like)).fetchone()
@@ -284,8 +283,7 @@ def _select_ranked(conn, min_score: int, skip: set,
     cur = conn.execute(f"""
         SELECT {_JOB_COLUMNS}
         FROM jobs
-        WHERE tailored_resume_path IS NOT NULL
-          AND (apply_status IS NULL OR apply_status = 'failed')
+        WHERE (apply_status IS NULL OR apply_status = 'failed')
           -- A captcha hit on this row's primary static-proxy attempt is
           -- waiting for the dedicated home-fallback worker (see
           -- _select_captcha_backlog), not another primary worker on a

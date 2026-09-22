@@ -59,30 +59,13 @@ trap 'touch "$STOP_FLAG"' TERM INT
 
 echo "Continuous pipeline started: $(date)" | tee -a "$LOG"
 
-tailor_loop() {
-    while [ ! -f "$STOP_FLAG" ]; do
-        # Coarse over-count on purpose (real fit gate blends prestige tiers,
-        # too fiddly to replicate correctly in SQL here -- see score_loop's
-        # comment on why an exact-match predicate matters for the busy-loop
-        # case, not for this one): `applypilot run tailor` re-applies the
-        # real gate itself and just no-ops quickly if nothing qualifies.
-        pending=$(sqlite3 "$DB" "SELECT COUNT(*) FROM jobs WHERE fit_score IS NOT NULL AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5;")
-        if [ "$pending" -eq 0 ]; then
-            sleep "$IDLE_POLL"
-            continue
-        fi
-        echo "--- $(date) [tailor]: $pending jobs pending ---" | tee -a "$LOG"
-        applypilot run tailor >> "$LOG" 2>&1 || echo "tailor batch failed (see above), continuing" | tee -a "$LOG"
-        # The coarse count above over-counts (see comment): jobs it thinks
-        # are pending but that fail the real fit gate will never actually
-        # get tailored, so `applypilot run tailor` no-ops in ~0.1s and this
-        # loop would otherwise spin the CLI at ~1 iteration/sec forever with
-        # nothing to show for it. Sleep unconditionally, same as the
-        # idle branch, so a real batch (which takes far longer than
-        # IDLE_POLL anyway) isn't meaningfully delayed but a busy-loop is.
-        sleep "$IDLE_POLL"
-    done
-}
+# tailor_loop was removed 2026-09-22: resume tailoring was never actually
+# used -- apply always routes off resume_paths_for_job's live track routing
+# (scoring/router.py), which falls back to the same deterministic pick
+# whether or not a job was ever tailored. Scored jobs go straight to the
+# browse tab; queuing/applying only happens when you click Launch there.
+# The `applypilot run tailor` stage/CLI command still exists if this ever
+# needs to come back.
 
 discover_loop() {
     while [ ! -f "$STOP_FLAG" ]; do
@@ -153,12 +136,10 @@ DISCOVER_PID=$!
 # policy changes and local enrichment becomes viable again.
 score_loop &
 SCORE_PID=$!
-tailor_loop &
-TAILOR_PID=$!
 gmail_status_loop &
 GMAIL_STATUS_PID=$!
 
-wait "$DISCOVER_PID" "$SCORE_PID" "$TAILOR_PID" "$GMAIL_STATUS_PID"
+wait "$DISCOVER_PID" "$SCORE_PID" "$GMAIL_STATUS_PID"
 rm -f "$STOP_FLAG"
 
 echo "=== CONTINUOUS PIPELINE STOPPED: $(date) ===" | tee -a "$LOG"

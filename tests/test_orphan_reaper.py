@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import time
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location(
@@ -23,3 +25,16 @@ def test_orphans():
 def test_no_apply_process_means_all_orphaned():
     rows = [(10, 10, 600, CH.format(1))]
     assert r.orphans(rows, {1}, False) == {1: (10, 600)}
+
+
+def test_stale_profile_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(r.config, "CHROME_WORKER_DIR", tmp_path)
+    old, active, fresh = tmp_path / "worker-9", tmp_path / "worker-1", tmp_path / "worker-2"
+    for d in (old, active, fresh):
+        d.mkdir()
+    stale_t = time.time() - r.STALE_DIR_S - 60
+    os.utime(old, (stale_t, stale_t))
+    os.utime(active, (stale_t, stale_t))  # old mtime, but Chrome still has it open
+
+    rows = [(10, 10, 600, CH.format(1))]  # worker-1 has a live Chrome
+    assert [d.name for d in r.stale_profile_dirs(rows)] == ["worker-9"]
