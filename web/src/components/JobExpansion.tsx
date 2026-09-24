@@ -12,6 +12,12 @@ interface Props {
   // that fetch, so without this the list keeps showing "—" until the next
   // refetch even though this same job's expansion already has the answer.
   onDetailLoaded?: (url: string, detail: JobDetail) => void
+  // "Report ineligible" button below. Bound to this row's url/tableId by the
+  // caller (RowPair) -- takes no args here so this component doesn't need to
+  // know about tableId at all. Omitted (Applications tab's own JobExpansion
+  // usage) means don't render the button -- that tab has its own dedicated
+  // Report ineligible flow (company-wide sweep, only for applied jobs).
+  onReportIneligible?: () => Promise<void>
 }
 
 /**
@@ -19,9 +25,11 @@ interface Props {
  * parent toggles a class on the wrapping <tr> so the grid-rows transition can
  * animate shut; unmounting this would just snap it closed instead.
  */
-export function JobExpansion({ row, open, onDetailLoaded }: Props) {
+export function JobExpansion({ row, open, onDetailLoaded, onReportIneligible }: Props) {
   const [detail, setDetail] = useState<JobDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [reporting, setReporting] = useState(false)
+  const [reportError, setReportError] = useState<string | null>(null)
   // A ref, not state: putting a "have we started fetching" flag in the
   // effect's own dependency array made it re-run right after being set,
   // whose cleanup then marked the in-flight fetch `cancelled` before it ever
@@ -260,6 +268,46 @@ export function JobExpansion({ row, open, onDetailLoaded }: Props) {
           >
             Open original posting →
           </a>
+        )}
+        {onReportIneligible && (
+          <div>
+            <button
+              type="button"
+              disabled={reporting}
+              title="Hides this job and every future repost of it (same ATS requisition or identical text) from Browse for good. Doesn't touch anything else at this company -- for that, use Applications tab's Report ineligible instead."
+              style={{
+                display: "block",
+                marginTop: 10,
+                fontSize: 12,
+                padding: "5px 10px",
+                background: "var(--a-bad)",
+                color: "#fff",
+                border: "none",
+                borderRadius: 4,
+                cursor: reporting ? "default" : "pointer",
+                opacity: reporting ? 0.6 : 1,
+              }}
+              onClick={async (e) => {
+                e.stopPropagation()
+                if (!confirm("Report this job ineligible? It and every future repost of it will stop showing in Browse.")) return
+                setReporting(true)
+                setReportError(null)
+                try {
+                  await onReportIneligible()
+                } catch (err) {
+                  setReportError(String(err))
+                  setReporting(false)
+                }
+              }}
+            >
+              {reporting ? "Reporting…" : "Report ineligible"}
+            </button>
+            {reportError && (
+              <p style={{ color: "var(--a-bad)", fontSize: 12, marginTop: 4 }}>
+                Failed: {reportError}
+              </p>
+            )}
+          </div>
         )}
       </div>
     </div>

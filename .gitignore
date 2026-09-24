@@ -67,3 +67,4 @@ env/
 *.db-journal
 *.db-wal
 *.db-shm
+.schemathesis/

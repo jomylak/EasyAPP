@@ -70,6 +70,9 @@ export interface JobsQuery {
   include_tier?: boolean
   location?: string | null
   term?: string | null
+  // Narrows to jobs reposted at most this many times (0 = never reposted).
+  // Omitted/null = no filter, every job shows regardless of repost count.
+  max_reposts?: number | null
 }
 
 export const api = {
@@ -77,6 +80,15 @@ export const api = {
     request<{ days: DayBucket[] }>(`/api/days${qs(filters)}`),
 
   jobGroup: (url: string) => request<{ members: GroupMember[] }>(`/api/job/group${qs({ url })}`),
+
+  // Browse-only, one-job-scoped hide (plus every future repost of it) --
+  // distinct from reportIneligible below, which is Applications-tab-only and
+  // sweeps every other posting at the same company.
+  reportJobIneligible: (url: string) =>
+    request<{ ok: boolean; reported_ineligible_at: string }>("/api/job/report-ineligible", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
 
   jobs: (query: JobsQuery) =>
     request<JobsPage>(`/api/jobs${qs(query as Record<string, string | number | boolean | null | undefined>)}`),
@@ -175,4 +187,13 @@ export const api = {
     }),
 
   credentialCheck: () => request<{ alerts: string[] }>("/api/credential-check", { method: "POST" }),
+
+  // Manual trigger for the same incremental Gmail sweep the continuous
+  // pipeline runs on a timer -- for when a job applied to by hand should
+  // show up sooner than the next loop tick.
+  gmailScan: () =>
+    request<{ emails: number; updated: number; new_manual: number; ambiguous: number }>(
+      "/api/gmail-scan",
+      { method: "POST" },
+    ),
 }

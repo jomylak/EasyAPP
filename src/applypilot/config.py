@@ -375,7 +375,11 @@ DEFAULTS = {
     # ~20s per action on a cheap model, with 45+ actions in a real form.
     "goose_timeout": 2400,
     # Kill a run that has pulled this many MB through the browser (norm ~2-3).
-    "goose_max_mb": 25,
+    # None disables the check entirely -- set None on 2026-09-22: this was
+    # protecting a metered/limited proxy plan, which is no longer the setup
+    # (see webshare plan notes); goose_timeout (above) is still the backstop
+    # against a genuinely stuck page, just on wall-clock instead of bytes.
+    "goose_max_mb": None,
     # --- Post-apply Gmail status scan (scripts/scan_gmail_status.py) ---
     # Gemini's free API tier (same GEMINI_API_KEY used for scoring), via
     # goose's native "google" provider -- read-and-classify doesn't need the

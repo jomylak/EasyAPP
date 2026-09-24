@@ -131,6 +131,27 @@ export default function App() {
     setSelectionOrder([])
   }
 
+  // Browse's "Report ineligible" button (JobExpansion). Drops it from
+  // selection first in case it happened to be ticked -- a hidden row has no
+  // business still counting toward the launch bar's selection.
+  async function reportIneligible(url: string, tableId: string) {
+    await api.reportJobIneligible(url)
+    setSelected((prev) => {
+      if (!prev.has(url)) return prev
+      const next = new Set(prev)
+      next.delete(url)
+      return next
+    })
+    setSelectedTypes((prev) => {
+      if (!prev.has(url)) return prev
+      const next = new Map(prev)
+      next.delete(url)
+      return next
+    })
+    setSelectionOrder((prev) => prev.filter((e) => e.url !== url))
+    broadcastRemoved([{ url, tableId }])
+  }
+
   async function handleLaunch() {
     // Two real HTTP calls, deliberately kept as two steps: /api/queue marks
     // the selection 'queued' and prices it (harmless, reversible), then
@@ -237,6 +258,7 @@ export default function App() {
           selectedTypes={selectedTypes}
           onToggleSelect={toggleSelect}
           removedUrls={removedUrls}
+          onReportIneligible={reportIneligible}
         />
       )}
       {tab === "dashboard" && <DashboardTab />}

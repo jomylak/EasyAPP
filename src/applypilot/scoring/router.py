@@ -175,15 +175,9 @@ def resume_paths_for_job(job: dict) -> tuple[Path, Path]:
     "Tailoring" here is bookkeeping (which file got attached, timestamped,
     for audit), not a prerequisite: the routing decision is deterministic and
     free, so there is no reason a job selected straight out of scoring can't
-    be applied to. Prefers a completed tailor pass's files when they're both
-    on disk (so a job that WAS explicitly routed to something other than its
-    live-computed track -- e.g. hand-corrected -- keeps that choice); falls
-    back to routing the job live otherwise.
+    be applied to. Always routes live to a track resume.
     """
-    tailored = job.get("tailored_resume_path")
-    if tailored:
-        txt_path = Path(tailored)
-        pdf_path = txt_path.with_suffix(".pdf")
-        if txt_path.exists() and pdf_path.exists():
-            return txt_path, pdf_path
+    # Legacy tailored_resume_path values (old per-job tailored files) are
+    # deliberately ignored: the three track resumes are the source of truth,
+    # so swapping them in settings takes effect on the very next apply.
     return config.get_resume_paths(route_resume_track(job))

@@ -1,23 +1,25 @@
 name: CI
 
 on:
-  workflow_dispatch:  # manual trigger only
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.13"]
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
@@ -26,4 +28,53 @@ jobs:
         run: ruff check src/
 
       - name: Test
-        run: pytest tests/ -v
+        run: pytest tests/ --ignore=tests/e2e -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - name: Typecheck + build
+        run: npm run build
+
+  # Boots the real server on a seeded temp DB, then fuzzes the API
+  # (schemathesis) and clicks around the UI (Playwright smoke + monkey).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend from source
+        working-directory: web
+        run: npm ci && npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          playwright install --with-deps chromium
+
+      - name: E2E
+        run: pytest tests/e2e -q

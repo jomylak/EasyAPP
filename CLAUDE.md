@@ -1,5 +1,26 @@
 # ApplyPilot
 
+## Tests (CI runs these on every push/PR — `.github/workflows/ci.yml`)
+
+- Unit: `pytest tests/ --ignore=tests/e2e` and `ruff check src/`.
+- E2E: `pytest tests/e2e` boots the real server on a seeded temp DB, fuzzes
+  the API with schemathesis (any 5xx fails) and clicks through the UI with
+  Playwright (any JS/console error or 5xx fails).
+- Frontend: `cd web && npm run lint && npm run build` (build = typecheck).
+
+When you change code:
+- **Bug fix → first write a test that fails, then fix it.** The test is the
+  proof the bug existed and the guard against it coming back.
+- **New logic (a branch, parser, SQL filter, state transition) → add a test**
+  in the matching `tests/test_<module>.py`. Trivial one-liners don't need one.
+- **New API endpoint or query param →** bound it (`Query(ge=, le=)`) and let
+  `tests/e2e/test_api_fuzz.py` cover it. If it starts real work (spawns
+  processes, touches Gmail/Chrome/credentials), add it to the exclusion
+  lists in `test_api_fuzz.py` *and* `test_ui_smoke.py`'s `BLOCKED`.
+- Tests must never read the real `~/.applypilot` — CI has none. Monkeypatch
+  `config` paths/loaders or use `tmp_path`.
+- Run the relevant tests before calling a change done; deploy only on green.
+
 ## Deploying to the live VM
 
 The live pipeline and web dashboard run on Oracle Cloud (`ssh oracle-applypilot`,

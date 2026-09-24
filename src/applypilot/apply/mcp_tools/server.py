@@ -434,6 +434,61 @@ async def _locate_combobox(page: Page, label_or_selector: str, occurrence: int =
     return None
 
 
+async def _visible_texts(page: Page, css: str, limit: int = 15) -> list[str]:
+    """Distinct visible text of elements matching `css`, in DOM order.
+
+    Used to turn a bare "could not find X" into "here is what IS there", so the
+    agent's next attempt picks a real option/label instead of guessing. Measured
+    2026-09-23: fill_searchable_combobox failed 45% of the time (243/542) with
+    no hint of which options existed, and each miss cost a snapshot + retry.
+    """
+    try:
+        texts = await page.evaluate(
+            """([css, limit]) => {
+                const out = [];
+                for (const el of document.querySelectorAll(css)) {
+                    const r = el.getBoundingClientRect();
+                    if (!r.width || !r.height) continue;
+                    const t = (el.innerText || el.getAttribute('aria-label') || el.value || '')
+                        .trim().replace(/\\s+/g, ' ').slice(0, 80);
+                    if (t && !out.includes(t)) out.push(t);
+                    if (out.length >= limit) break;
+                }
+                return out;
+            }""", [css, limit])
+    except Exception:
+        return []
+    return texts
+
+
+_OPTION_CSS = "[role=option], [role=listbox] li, li[id*=option], [class*=option]:not([class*=options])"
+_COMBOBOX_LABEL_CSS = "label, [role=combobox], [aria-haspopup=listbox]"
+_CLICKABLE_CSS = "button, a[href], [role=button], input[type=submit], input[type=button], [role=tab], [role=link]"
+
+
+async def _hint(page: Page, css: str, what: str) -> str:
+    texts = await _visible_texts(page, css)
+    return f" -- visible {what}: {texts}" if texts else f" -- no visible {what} found"
+
+
+async def _options_hint(page: Page) -> str:
+    """Options of the combobox that just failed, then close it. The failed fill
+    typed `value` as a live filter, which usually leaves the list at "No
+    options" -- clear that text first so the list shows what it really holds."""
+    try:
+        await page.keyboard.press("Control+a")
+        await page.keyboard.press("Backspace")
+        await page.wait_for_timeout(400)
+    except Exception:
+        pass
+    hint = await _hint(page, _OPTION_CSS, "options")
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return hint
+
+
 async def _click_jittered(locator, timeout: int = 5000) -> None:
     """Click at a randomized point inside the element instead of dead-center.
 
@@ -508,10 +563,13 @@ async def fill_searchable_combobox(label_or_selector: str, value: str, occurrenc
     page = await _get_page()
     trigger = await _locate_combobox(page, label_or_selector, occurrence)
     if trigger is None:
-        return f"error: could not locate a combobox trigger for {label_or_selector!r} (occurrence={occurrence})"
+        return (f"error: could not locate a combobox trigger for {label_or_selector!r} "
+                f"(occurrence={occurrence})" + await _hint(page, _COMBOBOX_LABEL_CSS, "labels"))
     option_text = await _select_combobox_option(page, trigger, value)
     if option_text is None:
-        return f"error: combobox fill failed for {label_or_selector!r} -> {value!r}"
+        hint = await _options_hint(page)
+        return (f"error: combobox fill failed for {label_or_selector!r} -> {value!r}{hint}. "
+                "Retry with the closest option text exactly as listed.")
     return f"ok: selected {option_text!r} in combobox {label_or_selector!r}"
 
 
@@ -643,7 +701,8 @@ async def human_fill_form(fields: list[dict]) -> str:
             elif field_type == "combobox":
                 option_text = await _select_combobox_option(page, locator, value)
                 if option_text is None:
-                    errors.append(f"{label!r}: combobox fill failed for {value!r}")
+                    hint = await _options_hint(page)
+                    errors.append(f"{label!r}: combobox fill failed for {value!r}{hint}")
                     continue
             else:
                 await _click_jittered(locator)
@@ -916,7 +975,8 @@ async def find_and_click(text_or_selector: str) -> str:
     page = await _get_page()
     locator = await _locate_combobox(page, text_or_selector)
     if locator is None:
-        return f"error: could not locate a clickable element for {text_or_selector!r}"
+        return (f"error: could not locate a clickable element for {text_or_selector!r}"
+                + await _hint(page, _CLICKABLE_CSS, "buttons/links"))
     try:
         await _click_jittered(locator)
     except Exception as exc:
@@ -1312,7 +1372,12 @@ async def handle_captcha(proxy_string: str = "") -> str:
     sitekey = detection.get("sitekey")
     page_url = detection.get("url") or page.url
     if not sitekey:
-        return f"error: detected {ctype} but no sitekey found -- cannot solve, try manual fallback"
+        # No sitekey = nothing any solver can work with, and the manual
+        # fallback never works on these either: 2026-09-23 traces show runs
+        # that got this verdict kept going for a median 85 more tool calls
+        # before giving up anyway.
+        return (f"error: detected {ctype} but no sitekey found -- unsolvable. "
+                "Output RESULT:CAPTCHA now; do not attempt a manual fallback")
 
     instance_key = f"{ctype}:{sitekey}"
 

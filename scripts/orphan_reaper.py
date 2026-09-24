@@ -28,6 +28,8 @@ STALE_DIR_S = 60 * 60  # a profile dir untouched an hour with no Chrome on it
                         # --workers N larger than the current 8), not a
                         # worker slot anything will reuse.
 WORKER_RE = re.compile(r"chrome-workers/worker-(\d+)")
+CDP_RE = re.compile(r"--cdp-endpoint=http://localhost:(\d+)")
+BASE_CDP_PORT = 9222  # chrome.BASE_CDP_PORT; worker N drives port 9222 + N
 WORKER_DIR_RE = re.compile(r"^worker-(\d+)$")
 
 
@@ -57,6 +59,16 @@ def orphans(rows, live_workers: set[int], apply_running: bool) -> dict[int, tupl
             continue
         found[w] = (pgid, max(age, found.get(w, (0, 0))[1]))
     return found
+
+
+def driven_workers(rows) -> set[int]:
+    """Workers whose agent (goose's playwright/applytools MCP servers) is still
+    attached to their Chrome's CDP port. The DB row is only bookkeeping; a live
+    agent process is proof the Chrome is in use. Reaping on the row alone
+    killed live runs mid-submit on 2026-09-22, when a claim race left several
+    workers on one job but only one of them owning its row."""
+    return {int(m.group(1)) - BASE_CDP_PORT
+            for _pid, _pgid, _age, cmd in rows if (m := CDP_RE.search(cmd))}
 
 
 def stale_profile_dirs(rows) -> list:
@@ -106,7 +118,7 @@ def main() -> None:
     conn = get_connection()
     live = {int(r[0].split("-")[1]) for r in conn.execute(
         "SELECT agent_id FROM jobs WHERE apply_status='in_progress' "
-        "AND agent_id LIKE 'worker-%'")}
+        "AND agent_id LIKE 'worker-%'")} | driven_workers(rows)
 
     for w, (pgid, age) in orphans(rows, live, apply_running).items():
         print(f"reap worker-{w} chrome pgid={pgid} age={age}s dry_run={args.dry_run}")

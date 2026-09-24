@@ -37,6 +37,9 @@ PERMANENT_FAILURES: set[str] = {
     # a clean connection. Only final when the home-fallback worker itself
     # hits it -- there's no further tier to escalate to.
     "proxy_dropped",
+    # The dashboard's per-job Stop button. Permanent so the queue doesn't
+    # just re-claim the job the user deliberately stopped; Retry resets it.
+    "user_stopped",
 }
 
 # Clean, understood reasons this job will never be applicable -- no human
@@ -101,3 +104,19 @@ FALLBACK_REASONS: set[str] = {
     "stuck", "no_result_line", "unknown", "page_error", "timeout",
     "bandwidth", "orphaned",
 }
+
+
+# The browser the agent drives died or never came up -- nothing to do with the
+# job. Observed spellings (the agent phrases these freely): browser_down,
+# browser_unreachable, browser_unavailable, browser_runtime_down/_unreachable/
+# _unavailable, browser_transport_closed, no_browser_tools, no_browser_navigation.
+# Counting these as job attempts, and re-queueing instantly, let a dead Chrome
+# burn the same 4 jobs ~180 times in 30 minutes on 2026-09-14.
+INFRA_PREFIXES: tuple[str, ...] = (
+    "browser_down", "browser_unreachable", "browser_unavailable",
+    "browser_runtime", "browser_transport", "no_browser",
+)
+
+
+def is_infra_failure(reason: str) -> bool:
+    return (reason or "").strip().lower().startswith(INFRA_PREFIXES)

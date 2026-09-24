@@ -19,10 +19,6 @@ from applypilot.scoring.scorer import terminal_evidence
     "Currently pursuing or have recently completed a degree in Computer Science, Web Development",
     "Must be currently enrolled or recently graduated (start date must be within 6 months of graduation date)",
     "We welcome graduating seniors to apply.",
-    # UPPER bounds. An earlier graduate satisfies one by definition, and a
-    # role you must graduate *before* is one you don't return to school after.
-    "Must graduate before December 2027.",
-    "The program is open to students graduating from undergraduate or Master's programs by June 2027",
 ])
 def test_explicit_acceptance_is_terminal(text):
     assert terminal_evidence(text) == "yes"
@@ -35,6 +31,11 @@ def test_explicit_acceptance_is_terminal(text):
     "Students must be enrolled at an accredited university.",
     "You will work with a team of engineers on production services.",
     "",
+    # UPPER bounds on graduation -- retired 2026-09-08 (see scorer.py): a
+    # regex can't compare the bound to the role's own term, and 2/2 audited
+    # hits were still-enrolled juniors/seniors.
+    "Must graduate before December 2027.",
+    "The program is open to students graduating from undergraduate or Master's programs by June 2027",
 ])
 def test_silence_is_not_evidence(text):
     assert terminal_evidence(text) == "no"

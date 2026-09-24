@@ -38,7 +38,9 @@ def _prompt_for(job) -> str:
             seen["p"] = "\n".join(m.get("content", "") for m in messages)
             return _REPLY
 
-    with patch.object(scorer, "get_client", lambda *a, **k: FakeClient()):
+    # load_profile is patched so the test doesn't need a real ~/.applypilot (CI has none).
+    with patch.object(scorer, "get_scoring_client", lambda *a, **k: FakeClient()), \
+            patch("applypilot.config.load_profile", lambda: {}):
         scorer.score_job("resume", job)
     return seen["p"]
 

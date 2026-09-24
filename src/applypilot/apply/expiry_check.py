@@ -18,8 +18,11 @@ must never cost a legitimately open job its place in the queue.
 """
 
 import logging
+import re
 
 import httpx
+
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.S | re.I)
 
 log = logging.getLogger(__name__)
 
@@ -64,14 +67,28 @@ _BOT_CHALLENGE_MARKERS = [
     "attention required",
     "verify you are human",
     "cf-chl",
+    # DataDome's SmartRecruiters-hosted challenge -- seen live on AbbVie and
+    # Bertelsmann/Penguin Random House listings that were both actually open.
+    "please enable js and disable any ad blocker",
+    # Azure WAF's JS challenge page -- seen live on a General Dynamics Mission
+    # Systems listing that was actually open.
+    "azure waf",
 ]
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApplyPilotExpiryCheck/1.0)"}
 
 
 def _heuristic(status_code: int, text: str) -> str:
-    """Return 'expired', 'open', or 'inconclusive'."""
-    lowered = text.lower()
+    """Return 'expired', 'open', or 'inconclusive'.
+
+    Matches against script/style-stripped text only. Raw HTML from a
+    JS-rendered SPA ships its whole client bundle in <script> tags, and that
+    bundle carries generic strings ("no longer available", "page not found")
+    for the app's own 404/error components regardless of whether *this*
+    listing is expired -- matched a live Rippling and a live Viasat posting
+    on exactly that, both false positives.
+    """
+    lowered = _SCRIPT_STYLE_RE.sub(" ", text).lower()
     if status_code in (404, 410):
         return "expired"
     if status_code >= 400:
@@ -84,19 +101,29 @@ def _heuristic(status_code: int, text: str) -> str:
         return "inconclusive"
     if any(phrase in lowered for phrase in _CLOSED_PHRASES):
         return "expired"
-    if len(text.strip()) < _MIN_TEXT_LEN:
+    if len(lowered.strip()) < _MIN_TEXT_LEN:
         return "inconclusive"
     return "open"
 
 
 def _llm_classify(text: str) -> str:
-    """Return 'expired' or 'open' via a cheap LLM call. Fails open."""
+    """Return 'expired' or 'open' via a cheap LLM call. Fails open.
+
+    `text` is already script/style-stripped -- an unrendered SPA shell was
+    landing raw <script> soup in the model's first 4000 chars otherwise.
+    """
     from applypilot.llm import get_client
 
     prompt = (
-        "You are looking at the raw text of a job application page. Decide "
-        "whether the listing is still open for applications, or whether it "
-        "has been closed/filled/expired/removed.\n\n"
+        "You are looking at the text of a job application page, fetched "
+        "without running JavaScript. Decide whether the listing is still "
+        "open for applications.\n\n"
+        "If the text is a bot-detection challenge, CAPTCHA, WAF block page, "
+        "or any other page that isn't the job listing itself, answer OPEN -- "
+        "that means the check couldn't see the real page, not that the job "
+        "is closed.\n\n"
+        "Only answer CLOSED if the text itself is the job page and says the "
+        "listing has been closed/filled/expired/removed.\n\n"
         f"PAGE TEXT:\n{text[:4000]}\n\n"
         "Answer with exactly one word: OPEN or CLOSED."
     )
@@ -124,7 +151,7 @@ def check_listing_expired(url: str | None) -> str | None:
 
     verdict = _heuristic(resp.status_code, resp.text)
     if verdict == "inconclusive":
-        verdict = _llm_classify(resp.text)
+        verdict = _llm_classify(_SCRIPT_STYLE_RE.sub(" ", resp.text))
 
     if verdict == "expired":
         # Prefix must stay literally "expired" -- failure_taxonomy.py and

@@ -173,14 +173,33 @@ def _classify(conn, me, other, cache) -> str | None:
     diff_reqs = bool(me_ats and other_ats)  # both known (equal ids returned above)
     me_full, me_blurb = _texts(conn, me["url"], cache)
     ot_full, ot_blurb = _texts(conn, other["url"], cache)
-    # Compare full text only when both sides have it, otherwise the short
-    # discovery blurbs; never a full text against a blurb.
+    is_manual = "manual" in (me["apply_backend"], other["apply_backend"])
+    if not is_manual and bool(me_full) != bool(ot_full):
+        # One side has already been scraped for real, the other hasn't yet --
+        # comparing a real description against the other's short discovery
+        # blurb is an apples-to-oranges guess. This matters because dedup.link
+        # runs at discovery time, before enrichment (see smartextract.py's
+        # _safe_link) -- if the still-unscraped side matched here, it would
+        # silently inherit the older side's (possibly weeks-stale) description
+        # and eligibility scoring, and permanently skip its own enrichment
+        # pass, since detail_scraped_at IS NULL is what the enrichment queue
+        # checks for pending work. Confirmed live: a Booz Allen "Summer Games"
+        # repost inherited a 3-week-old description whose graduation-window
+        # text ("Winter 2027/2028") had since rolled forward on the real
+        # posting ("Summer 2028/2029") -- same title/company/blurb, matched
+        # and merged before ever getting its own scrape. Returning None here
+        # leaves the unscraped side to earn a real enrichment pass; dedup.link
+        # runs again right after that scrape and can compare full-to-full.
+        # Exempted when either side is a self-reported (Gmail-scan) row --
+        # those never get a full_description at all, by design, and must
+        # still fall through to the no-text "related" case below.
+        return None
     a, b = (me_full, ot_full) if me_full and ot_full else (me_blurb, ot_blurb)
     if not a or not b:
         # A self-reported application (Gmail scan) has no text or location to
         # compare. Same company and exact title is enough to show it beside the
         # real posting, so its "you applied" record is visible there.
-        return "related" if "manual" in (me["apply_backend"], other["apply_backend"]) else None
+        return "related" if is_manual else None
     if same_loc:
         return "exact_text" if a == b and not diff_reqs else None
     return "related" if _text_similar(a, b, _RELATED_DESC_SIMILARITY) else None
@@ -188,7 +207,7 @@ def _classify(conn, me, other, cache) -> str | None:
 
 _COLS = ("url, title, location, application_url, ats, ats_job_id, company, "
          "company_normalized, discovered_at, posted_date, duplicate_of, group_id, fit_score, "
-         "apply_backend")
+         "apply_backend, reported_ineligible_at")
 
 
 def _copy_missing(conn: sqlite3.Connection, dest: str, donor: str, cols: tuple) -> None:
@@ -202,6 +221,16 @@ def link(conn: sqlite3.Connection, url: str) -> dict:
     Returns {"duplicate_of": url|None (this row's visible replacement),
              "reason": str|None, "ats_job_id": str|None, "group_id": str|None}.
     """
+    # acquire_job calls this from inside its own BEGIN IMMEDIATE claim
+    # transaction (see launcher._live_duplicate_already_committed). An
+    # unconditional commit here would release that transaction's write lock
+    # before the row is flipped to in_progress, letting a second worker
+    # re-select and claim the same still-queued row -- reproduced 3/3 with 8
+    # threads on 2026-09-23, and the cause of at least one real double
+    # application. Only commit when we're not already inside someone else's
+    # transaction; a caller with its own open transaction owns the commit.
+    already_in_transaction = conn.in_transaction
+
     me = conn.execute(f"SELECT {_COLS} FROM jobs WHERE url = ?", (url,)).fetchone()
     if me is None:
         return {"duplicate_of": None, "reason": None, "ats_job_id": None, "group_id": None}
@@ -267,6 +296,17 @@ def link(conn: sqlite3.Connection, url: str) -> dict:
                 key=_recency, default=None)
             if have is None and donor:
                 _copy_missing(conn, rep, donor["url"], cols)
+        # Sticky manual override: unlike the fill-in-what's-missing loop
+        # above, "reported ineligible" must carry onto the rep even when the
+        # rep already has its own fit_score/full_description from its own
+        # scrape -- a fresh repost normally wins _recency and becomes the new
+        # rep, and it would otherwise silently un-hide a job the user already
+        # said never to show again.
+        already_flagged = any(m["reported_ineligible_at"] for m in members if m["url"] == rep)
+        flagged_donor = next((m for m in members if m["reported_ineligible_at"]), None)
+        if not already_flagged and flagged_donor:
+            conn.execute("UPDATE jobs SET reported_ineligible_at = ? WHERE url = ?",
+                         (flagged_donor["reported_ineligible_at"], rep))
         touched_urls = touched
     else:
         touched_urls = {url}
@@ -283,7 +323,8 @@ def link(conn: sqlite3.Connection, url: str) -> dict:
             f"OR url IN ({rel_marks}) OR duplicate_of IN ({rel_marks}) OR url IN ({tch_marks})",
             (target, *gids, *related, *related, *touched_urls))
 
-    conn.commit()
+    if not already_in_transaction:
+        conn.commit()
     row = conn.execute("SELECT duplicate_of, duplicate_reason, group_id FROM jobs WHERE url = ?",
                        (url,)).fetchone()
     return {"duplicate_of": row["duplicate_of"], "reason": row["duplicate_reason"],

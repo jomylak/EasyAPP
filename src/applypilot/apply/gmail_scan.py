@@ -201,14 +201,34 @@ def find_job(jobs: list[dict], company: str, title: str | None):
 
 # --- Apply results to the DB -------------------------------------------
 
+def _record(conn, e: dict, v: dict, outcome: str, url: str | None = None) -> None:
+    """Keep every verdict so misclassifications and ambiguous matches can be audited later."""
+    conn.execute(
+        "INSERT OR REPLACE INTO gmail_verdicts (msg_id, sent, sender, subject, kind, company, title, deadline, outcome, job_url) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (e["id"], e["sent"].isoformat(), e["from"][:200], e["subject"][:200], v["kind"],
+         v.get("company"), v.get("title"), v.get("deadline"), outcome, url))
+
+
 def scan(conn, client, since: date) -> dict:
     conn.execute("CREATE TABLE IF NOT EXISTS gmail_seen (msg_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE IF NOT EXISTS gmail_verdicts (msg_id TEXT PRIMARY KEY, sent TEXT, sender TEXT, "
+                 "subject TEXT, kind TEXT, company TEXT, title TEXT, deadline TEXT, "
+                 "outcome TEXT, job_url TEXT, recorded_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     seen = {r[0] for r in conn.execute("SELECT msg_id FROM gmail_seen")}
     emails = fetch_emails(since, seen)
     verdicts = classify(emails, client) if emails else {}
+    # 'failed' is in the pool too, not just 'applied'/'manual': a bot failure
+    # doesn't mean the candidate gave up on the job, and a real status email
+    # (confirmation/OA/interview/etc.) for one of these is proof they applied
+    # by hand afterward. Without this, that email had no existing row to
+    # match and always spawned a brand-new self-reported:... row below --
+    # the original job stayed stuck showing 'failed' forever, duplicating
+    # the posting and hiding that the failure was actually recovered from.
     jobs = [dict(r) for r in conn.execute(
-        "SELECT url, company, title, applied_at, post_apply_status, post_apply_event_date, post_apply_source "
-        "FROM jobs WHERE apply_status IN ('applied','manual') AND company IS NOT NULL")]
+        "SELECT url, company, title, applied_at, apply_status, "
+        "post_apply_status, post_apply_event_date, post_apply_source "
+        "FROM jobs WHERE apply_status IN ('applied','manual','failed') AND company IS NOT NULL")]
     stats = dict(emails=len(emails), updated=0, new_manual=0, ambiguous=0)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -219,11 +239,13 @@ def scan(conn, client, since: date) -> dict:
         conn.execute("INSERT OR IGNORE INTO gmail_seen VALUES (?)", (e["id"],))
         company, title, kind = (v.get("company") or "").strip(), v.get("title"), v["kind"]
         if kind == "other" or not company:
+            _record(conn, e, v, "ignored")
             continue
         job, ambiguous = find_job(jobs, company, title)
         if ambiguous:
             stats["ambiguous"] += 1  # several roles at this company, can't tell which
             log.info("ambiguous %s / %s (%s)", company, title, e["subject"][:60])
+            _record(conn, e, v, "ambiguous")
             continue
         if job is None:
             url = f"self-reported:{company.lower()}:{(title or 'unknown').lower()}"
@@ -236,7 +258,19 @@ def scan(conn, client, since: date) -> dict:
                    "post_apply_event_date": None, "post_apply_source": None}
             jobs.append(job)
             stats["new_manual"] += 1
+        elif job.get("apply_status") == "failed":
+            # The bot gave up on this one, but a real status email means the
+            # candidate applied by hand afterward. apply_error/apply_error_category
+            # are deliberately left alone -- the failure still happened and
+            # stays visible on the row, it just isn't the last word anymore.
+            conn.execute(
+                "UPDATE jobs SET apply_status = 'applied', apply_backend = 'manual', "
+                "applied_at = COALESCE(applied_at, ?) WHERE url = ?",
+                (e["sent"].isoformat(), job["url"]))
+            job["apply_status"] = "applied"
+            stats["new_manual"] += 1
         if kind == "confirmation" or job["post_apply_source"] == "manual" or kind not in STATUSES:
+            _record(conn, e, v, "matched_no_update", job["url"])
             continue
         deadline = v["deadline"] or (job["post_apply_event_date"] if job["post_apply_status"] == kind else None)
         conn.execute(
@@ -244,6 +278,7 @@ def scan(conn, client, since: date) -> dict:
             "post_apply_event_date=?, post_apply_source='gmail' WHERE url=?",
             (kind, now, e["subject"][:200], deadline, job["url"]))
         job.update(post_apply_status=kind, post_apply_event_date=deadline, post_apply_source="gmail")
+        _record(conn, e, v, "updated", job["url"])
         stats["updated"] += 1
     conn.commit()
     return stats

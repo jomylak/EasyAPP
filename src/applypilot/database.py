@@ -9,8 +9,39 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from applypilot.config import DB_PATH
+
+# Every stored timestamp (discovered_at, posted_date when it has a time
+# component) is UTC -- see smartextract.py's datetime.now(timezone.utc). The
+# single user of this install is US Eastern, and UTC crosses midnight at 8pm
+# EDT/7pm EST, so bucketing by the raw UTC date used to show tomorrow's jobs
+# hours before it was tomorrow locally. Fixed to Eastern specifically (not a
+# generic per-install timezone setting) since that's the one timezone this
+# runs for; ZoneInfo tracks DST automatically, unlike a fixed UTC offset.
+_LOCAL_TZ = ZoneInfo("America/New_York")
+
+
+def _local_date(iso_ts: str | None) -> str | None:
+    """UTC timestamp -> its calendar date in US Eastern. Registered below as
+    the SQL function `local_date()`, used by database._DAY_EXPR.
+
+    A bare "YYYY-MM-DD" (no time component) is returned unchanged -- it
+    already names a calendar day with no UTC-vs-local ambiguity to resolve,
+    and treating it as UTC midnight would wrongly shift it a day earlier.
+    """
+    if not iso_ts:
+        return None
+    if len(iso_ts) == 10:
+        return iso_ts
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(_LOCAL_TZ).date().isoformat()
 
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
@@ -46,6 +77,9 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
+    # deterministic=True is required for SQLite to accept this function inside
+    # an index expression (idx_jobs_day and friends, below).
+    conn.create_function("local_date", 1, _local_date, deterministic=True)
     _local.connections[path] = conn
     return conn
 
@@ -138,6 +172,37 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             review_status         TEXT
         )
     """)
+    # One row per apply attempt. `jobs` keeps only the latest attempt's
+    # outcome, so attempt history (retries, duplicate claims, which harness
+    # version produced what) used to be recoverable only by parsing worker
+    # logs. `harness` is prompt.harness_version(), the same hash stamped into
+    # every prompt and logs/agent_deploys.tsv, which makes A/B and
+    # before/after comparisons a GROUP BY. Trace join: Langfuse trace input
+    # holds the URL and the same Harness line; trace time ~= started_at.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS apply_runs (
+            id            INTEGER PRIMARY KEY,
+            url           TEXT NOT NULL,
+            started_at    TEXT,
+            finished_at   TEXT,
+            worker        INTEGER,
+            outcome       TEXT,
+            reason        TEXT,
+            dry_run       INTEGER,
+            backend       TEXT,
+            model         TEXT,
+            harness       TEXT,
+            ab_arm        TEXT,
+            llm_requests  INTEGER,
+            input_tokens  INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cost_usd      REAL,
+            duration_ms   INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_apply_runs_url ON apply_runs (url)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_apply_runs_started ON apply_runs (started_at)")
     conn.commit()
 
     # Run migrations for any columns added after initial schema
@@ -407,6 +472,14 @@ _ALL_COLUMNS: dict[str, str] = {
     # invisible to any cost tracking even though it now runs against every
     # job in the DB, not just the ~20/day that go through apply.
     "score_cost_usd": "REAL",
+    # Manual override, set from the Browse expansion panel's "Report
+    # ineligible" button -- a human override of company/eligible for a
+    # posting the scorer let through but shouldn't have (T?/L? review). Timestamp
+    # rather than a boolean for the same audit-trail reason as scored_at/
+    # tailored_at. Excluded from Browse unconditionally (queries.py, same as
+    # duplicate_of) and carried forward onto future reposts of the same job
+    # (dedup.link's sticky-override step) so marking it once sticks for good.
+    "reported_ineligible_at": "TEXT",
 }
 
 
@@ -422,7 +495,7 @@ _ALL_COLUMNS: dict[str, str] = {
 # what the day buckets and Posted column must match. The employer's own
 # datePosted stays available in employer_posted_date but never drives the
 # view. discovered_at is the last resort for anything undated.
-_DAY_EXPR = "date(COALESCE(posted_date, discovered_at))"
+_DAY_EXPR = "local_date(COALESCE(posted_date, discovered_at))"
 
 _ALL_INDEXES: dict[str, str] = {
     # Day bucketing: the browse tab groups by this and nothing else.
@@ -474,6 +547,23 @@ def ensure_indexes(conn: sqlite3.Connection | None = None) -> list[str]:
     """
     if conn is None:
         conn = get_connection()
+
+    # Migration: the four day-bucketed indexes below were built on the old
+    # date(...) form of _DAY_EXPR (now local_date(...), see _local_date's
+    # docstring). SQLite matches an index to its name, not its expression, so
+    # CREATE INDEX IF NOT EXISTS would otherwise silently keep serving the
+    # stale UTC-bucketed index forever. Comparing sqlite_master.sql against
+    # what we'd create now makes this a true no-op once the index is current,
+    # not a rebuild on every startup.
+    existing_sql = {
+        row["name"]: row["sql"] for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        ).fetchall()
+    }
+    for stale in ("idx_jobs_day", "idx_jobs_day_prestige", "idx_jobs_day_fit", "idx_jobs_day_tier"):
+        cols = _ALL_INDEXES[stale]
+        if existing_sql.get(stale) not in (None, f"CREATE INDEX {stale} ON jobs {cols}"):
+            conn.execute(f"DROP INDEX IF EXISTS {stale}")
 
     existing = {
         row[0] for row in conn.execute(
@@ -780,11 +870,12 @@ def fit_gate_sql(min_score: int) -> tuple[str, list]:
     queue knew about the override, the extra jobs would never get a resume
     attached and so could never actually be picked up.
 
-    Also excludes confirmed duplicates (dedup.check_duplicate) here rather
-    than in each caller separately: a job can pick up a duplicate_of after
-    it was already scored (the dedup backfill, or a same-req repost that
-    resolves its ATS id later than this one did), so fit_score IS NOT NULL
-    is not proof a row is still safe to tailor/apply to.
+    Also excludes confirmed duplicates (dedup.check_duplicate) and anything
+    manually reported ineligible from Browse here rather than in each caller
+    separately: a job can pick up a duplicate_of after it was already scored
+    (the dedup backfill, or a same-req repost that resolves its ATS id later
+    than this one did), so fit_score IS NOT NULL is not proof a row is still
+    safe to tailor/apply to.
     """
     from applypilot.config import load_settings
 
@@ -798,7 +889,8 @@ def fit_gate_sql(min_score: int) -> tuple[str, list]:
         clauses.append("(company_prestige >= ? AND fit_score >= ?)")
         params.extend([min_prestige, min_fit])
 
-    return "((" + " OR ".join(clauses) + ") AND duplicate_of IS NULL)", params
+    return ("((" + " OR ".join(clauses) + ") AND duplicate_of IS NULL "
+            "AND reported_ineligible_at IS NULL)"), params
 
 
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,

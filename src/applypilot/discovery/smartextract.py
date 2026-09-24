@@ -31,7 +31,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from applypilot import config
 from applypilot.config import CONFIG_DIR, normalize_company
 from applypilot.database import init_db, get_stats, get_connection
-from applypilot.dedup import canonicalize_url, find_exact_text_duplicate, link, normalize_location
+from applypilot.dedup import canonicalize_url, link, normalize_location
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)

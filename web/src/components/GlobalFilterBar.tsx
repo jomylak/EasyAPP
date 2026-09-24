@@ -123,6 +123,27 @@ export function GlobalFilterBar({ facets, filters, onChange }: Props) {
         Eligible for me
       </span>
 
+      <label
+        className="repost-threshold"
+        title="Only show jobs reposted at most this many times (0 = never reposted). Blank = no limit, see every job. This narrows which canonical row shows -- reposts themselves are still never listed as separate rows, same as always."
+      >
+        Max reposts
+        <input
+          type="number"
+          min={0}
+          className="select-field"
+          style={{ width: "3.5em" }}
+          placeholder="∞"
+          value={filters.max_reposts ?? ""}
+          onChange={(e) => {
+            const raw = e.target.value
+            if (raw === "") return set("max_reposts", null)
+            const n = parseInt(raw, 10)
+            set("max_reposts", Number.isFinite(n) && n >= 0 ? n : null)
+          }}
+        />
+      </label>
+
       <input
         className="srch"
         type="search"

@@ -17,9 +17,11 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -62,6 +64,50 @@ def read_run_state() -> dict | None:
         return json.loads(config.RUN_STATE_PATH.read_text())
     except (OSError, ValueError):
         return None
+
+
+RUN_UNIT = "applypilot-run"
+
+
+def _systemd_run_cmd(cmd: list[str], log_path) -> list[str]:
+    """`cmd` wrapped so systemd runs it as its own transient unit.
+
+    A child of the server lives in the server's cgroup, so a hung/SIGKILLed
+    restart (the deploy) took the whole worker pool with it. Its own unit
+    survives any server restart. The fixed name doubles as a one-run-at-a-time
+    guard: systemd-run refuses while the previous run is still up.
+    """
+    wrap = ["sudo", "-n", "systemd-run", "--quiet", "--collect", f"--unit={RUN_UNIT}",
+            f"--uid={os.getuid()}", f"--working-directory={os.getcwd()}",
+            "-p", f"StandardOutput=append:{log_path}",
+            "-p", f"StandardError=append:{log_path}"]
+    for k in ("HOME", "PATH", "DISPLAY"):
+        if os.environ.get(k):
+            wrap.append(f"--setenv={k}={os.environ[k]}")
+    return wrap + cmd
+
+
+def _spawn_detached(cmd: list[str], log, log_path) -> int | None:
+    """Start the run outside the server's cgroup when systemd allows it,
+    else as a plain child in its own process group. Returns the run's pid."""
+    global _run_proc
+    if sys.platform.startswith("linux") and shutil.which("systemd-run"):
+        r = subprocess.run(_systemd_run_cmd(cmd, log_path), capture_output=True, text=True)
+        if r.returncode == 0:
+            time.sleep(1)  # systemd-run returns before exec; catch an instant exit
+            out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", RUN_UNIT],
+                                 capture_output=True, text=True).stdout.strip()
+            if out.isdigit() and int(out):
+                return int(out)
+        logger.warning("systemd-run gave no live unit (%s); falling back to a child process",
+                       r.stderr.strip()[:200])
+    _run_proc = subprocess.Popen(
+        cmd, stdout=log, stderr=subprocess.STDOUT,
+        # Its own process group, so stopping the run takes the Chrome
+        # processes it spawned with it instead of orphaning them.
+        start_new_session=(os.name != "nt"),
+    )
+    return _run_proc.pid
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -167,6 +213,7 @@ def api_days(
     tier_only: bool = False,
     location: str | None = None,
     term: str | None = None,
+    max_reposts: int | None = Query(None, ge=0, le=10**6),
 ) -> dict:
     """Day buckets with counts under the same global filters the tables use, so
     a search or filter that matches nothing on a day doesn't leave an empty
@@ -177,6 +224,7 @@ def api_days(
         "q": q, "above_pay_floor": above_pay_floor, "terminal_only": terminal_only,
         "likely_terminal_only": likely_terminal_only, "eligible_only": eligible_only,
         "tier_only": tier_only, "location": location, "term": term,
+        "max_reposts": max_reposts,
     })}
 
 
@@ -185,11 +233,11 @@ def api_jobs(
     day: str | None = None,
     sort: str = queries.DEFAULT_SORT,
     dir: str | None = None,
-    page: int = 0,
+    page: int = Query(0, ge=0, le=10**6),
     page_size: int = 30,
-    min_fit: int | None = None,
+    min_fit: int | None = Query(None, ge=0, le=100),
     min_desirability: float | None = None,
-    min_prestige: int | None = None,
+    min_prestige: int | None = Query(None, ge=0, le=100),
     min_pay: float | None = None,
     job_type: str | None = None,
     site: str | None = None,
@@ -199,11 +247,12 @@ def api_jobs(
     terminal_only: bool = False,
     likely_terminal_only: bool = False,
     eligible_only: bool = False,
-    posted_within_days: int | None = None,
+    posted_within_days: int | None = Query(None, ge=0, le=36500),
     tier_only: bool = False,
     include_tier: bool = False,
     location: str | None = None,
     term: str | None = None,
+    max_reposts: int | None = Query(None, ge=0, le=10**6),
 ) -> dict:
     """One page of one day's table. Every day asks for its own independently.
 
@@ -236,6 +285,7 @@ def api_jobs(
             "posted_within_days": posted_within_days,
             "tier_only": tier_only, "include_tier": include_tier,
             "location": location, "term": term,
+            "max_reposts": max_reposts,
         },
         sort=sort, direction=dir, page=page, page_size=page_size,
     )
@@ -254,6 +304,33 @@ def api_job(url: str = Query(..., description="The job's URL (its primary key)")
 @app.get("/api/job/group")
 def api_job_group(url: str = Query(..., description="The job's URL (its primary key)")) -> dict:
     return {"members": queries.job_group(url)}
+
+
+@app.post("/api/job/report-ineligible")
+def api_job_report_ineligible(payload: dict = Body(...)) -> dict:
+    """Browse's "Report ineligible" button -- a manual, one-job-scoped check
+    for postings the scorer let through but that fail something only a human
+    can see (T?/L? review). Deliberately narrower than POST
+    /api/report-ineligible (Applications tab, applied jobs only): this never
+    sweeps other postings at the same company, only this job and every
+    future repost of it (dedup.link's sticky-override step carries the flag
+    forward whenever a new repost's dedup cluster includes this row).
+    """
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(400, "No job given")
+
+    conn = get_connection()
+    row = conn.execute("SELECT url FROM jobs WHERE url = ?", (url,)).fetchone()
+    if not row:
+        raise HTTPException(404, "No such job")
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE jobs SET reported_ineligible_at = ? WHERE url = ?", (now, url)
+    )
+    conn.commit()
+    return {"ok": True, "reported_ineligible_at": now}
 
 
 @app.get("/api/facets")
@@ -393,10 +470,23 @@ def api_queue(payload: dict = Body(...)) -> dict:
             # Never re-queue something already applied or in flight, or a
             # confirmed duplicate of another row; the UI can be looking at a
             # stale page.
+            # apply_attempts also resets here, not just apply_status/apply_error:
+            # a permanent failure (precheck-expired, manual ATS, blocklist, a
+            # prior captcha-backlog dead end) stamps it to the 99 sentinel, and
+            # without this reset that stamp outlives the requeue -- the job
+            # goes back to 'queued' looking fresh, but the *next* failure of
+            # any kind pushes it straight past every attempts<99/<max_apply_
+            # attempts guard (acquire_job, _select_captcha_backlog) and it
+            # quietly falls out of every queue for good, no second chance, no
+            # captcha retry, nothing. Reproduced live: a job precheck had
+            # wrongly marked expired (permanent=True -> 99) got manually
+            # requeued, then hit a real captcha on its next attempt (+1 -> 100)
+            # and never reached the home-fallback worker's backlog.
             cur = conn.execute("""
                 UPDATE jobs
                    SET apply_status = 'queued', queue_batch = ?,
-                       queue_position = ?, queued_at = ?, apply_error = NULL
+                       queue_position = ?, queued_at = ?, apply_error = NULL,
+                       apply_attempts = 0
                  WHERE url = ?
                    AND (apply_status IS NULL OR apply_status IN ('failed', 'queued'))
                    AND duplicate_of IS NULL
@@ -583,14 +673,9 @@ def api_launch(payload: dict = Body(...)) -> dict:
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = open(log_path, "a")
 
-    _run_proc = subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT,
-        # Its own process group, so stopping the run takes the Chrome
-        # processes it spawned with it instead of orphaning them.
-        start_new_session=(os.name != "nt"),
-    )
-    logger.info("Launched manual queue worker pool as pid %d", _run_proc.pid)
-    return {"batch": batch, "pid": _run_proc.pid, "jobs": pending, "log": str(log_path)}
+    pid = _spawn_detached(cmd, log, log_path)
+    logger.info("Launched manual queue worker pool as pid %s", pid)
+    return {"batch": batch, "pid": pid, "jobs": pending, "log": str(log_path)}
 
 
 @app.post("/api/stop")
@@ -626,14 +711,22 @@ def api_stop(payload: dict = Body(...)) -> dict:
 
     state = read_run_state() or {}
     worker = next((w for w in state.get("workers", []) if w.get("url") == url), None)
-    if worker is None:
-        raise HTTPException(409, "That job is marked in progress but no worker owns it")
+    if worker is None or not run_is_live():
+        # Nothing is actually running this row (its run died, e.g. across a
+        # restart): just record the stop instead of leaving it in_progress.
+        with conn:
+            conn.execute(
+                "UPDATE jobs SET apply_status = 'failed', apply_error = 'user_stopped',"
+                " apply_attempts = 99, agent_id = NULL WHERE url = ?", (url,))
+        return {"action": "stopped", "url": url}
 
-    from applypilot.apply.chrome import BASE_CDP_PORT, _kill_on_port
-    _kill_on_port(BASE_CDP_PORT + int(worker["worker_id"]))
-    return {"action": "aborting", "url": url, "worker_id": worker["worker_id"],
-            "note": "The worker notices its browser is gone within ~20s and "
-                    "records the job as failed."}
+    # Only this worker's goose watchdog polls the flag (each second), kills
+    # that one session, and the launcher records failed:user_stopped. Chrome
+    # is cleaned up by the worker itself afterwards; no other worker is touched.
+    wid = int(worker["worker_id"])
+    (config.APP_DIR / f"stop-w{wid}").touch()
+    return {"action": "aborting", "url": url, "worker_id": wid,
+            "note": "Stopping within ~1-2s; the job is recorded as failed (user_stopped)."}
 
 
 @app.post("/api/stop-all")
@@ -739,6 +832,29 @@ def api_set_env_keys(payload: dict = Body(...)) -> dict:
 async def ws_screencast(websocket: WebSocket, worker_id: int) -> None:
     """Live-view a worker's headful Chrome -- see web/screencast.py."""
     await stream_worker(websocket, worker_id)
+
+
+@app.post("/api/gmail-scan")
+async def api_gmail_scan() -> dict:
+    """Manual trigger for the same incremental sweep continuous_pipeline.sh's
+    gmail_status_loop already runs on a timer (see scripts/scan_gmail_status.py) --
+    for when a job applied to by hand deserves to show up before the next tick.
+
+    Run in a worker thread: it's blocking httpx (Gmail API + LLM) and sqlite,
+    and a scan of a busy inbox can take tens of seconds.
+    """
+    from datetime import date, timedelta
+
+    from applypilot.apply.gmail_scan import scan
+    from applypilot.llm import get_client
+
+    def run() -> dict:
+        return scan(get_connection(), get_client(), date.today() - timedelta(days=14))
+
+    try:
+        return await asyncio.to_thread(run)
+    except Exception as e:
+        raise HTTPException(502, f"Gmail scan failed: {e}")
 
 
 @app.post("/api/credential-check")

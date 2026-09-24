@@ -19,7 +19,6 @@ import sys
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod

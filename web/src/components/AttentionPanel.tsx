@@ -44,6 +44,7 @@ interface Props {
   boxHeight: number
   onBoxHeightChange: (h: number) => void
   removedUrls: RemovedUrls
+  onReportIneligible: (url: string, tableId: string) => Promise<void>
 }
 
 /**
@@ -70,6 +71,7 @@ export function AttentionPanel({
   boxHeight,
   onBoxHeightChange,
   removedUrls,
+  onReportIneligible,
 }: Props) {
   const { sort, dir, onHeaderClick } = useTableSort(defaultSort)
   const [rows, setRows] = useState<JobRow[]>([])
@@ -311,6 +313,7 @@ export function AttentionPanel({
               onDetailLoaded={patchRow}
               expandedClusters={expandedClusters}
               onToggleCluster={toggleCluster}
+              onReportIneligible={onReportIneligible}
             />
           </tbody>
         </table>

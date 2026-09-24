@@ -247,6 +247,7 @@ interface Props {
   selected: Set<string>
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   removedUrls: RemovedUrls
+  onReportIneligible: (url: string, tableId: string) => Promise<void>
 }
 
 interface Preset {
@@ -266,6 +267,7 @@ export function DayTable({
   selected,
   onToggleSelect,
   removedUrls,
+  onReportIneligible,
 }: Props) {
   // Default sort is by posting date, newest first -- see queries.DEFAULT_SORT.
   const { sort, dir, setSort, onHeaderClick } = useTableSort("posted")
@@ -349,6 +351,7 @@ export function DayTable({
       eligible_only: globalFilters.eligible_only,
       location: globalFilters.location,
       term: globalFilters.term,
+      max_reposts: globalFilters.max_reposts,
       tier_only:
         globalFilters.tier_only ||
         (activeChip ? presets[activeChip]?.tierOnly : false) ||
@@ -651,6 +654,7 @@ export function DayTable({
               onDetailLoaded={patchRow}
               expandedClusters={expandedClusters}
               onToggleCluster={toggleCluster}
+              onReportIneligible={onReportIneligible}
             />
           </tbody>
         </table>
@@ -677,6 +681,7 @@ export interface RowPairProps {
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   onToggleOpen: (url: string) => void
   onDetailLoaded?: (url: string, detail: JobDetail) => void
+  onReportIneligible: (url: string, tableId: string) => Promise<void>
 }
 
 /**
@@ -758,7 +763,7 @@ function RelatedBadge({ row }: { row: JobRow }) {
   )
 }
 
-export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen, onDetailLoaded }: RowPairProps) {
+export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect, onToggleOpen, onDetailLoaded, onReportIneligible }: RowPairProps) {
   const cellsById = new Map(row.getVisibleCells().map((c) => [c.column.id, c]))
   return (
     <>
@@ -806,7 +811,12 @@ export function RowPair({ row, original, isSel, isOpen, tableId, onToggleSelect,
         <td colSpan={COL_COUNT}>
           <div className="slide">
             <div>
-              <JobExpansion row={original} open={isOpen} onDetailLoaded={onDetailLoaded} />
+              <JobExpansion
+                row={original}
+                open={isOpen}
+                onDetailLoaded={onDetailLoaded}
+                onReportIneligible={() => onReportIneligible(original.url, tableId)}
+              />
             </div>
           </div>
         </td>
@@ -826,6 +836,7 @@ export interface ClusteredTableBodyProps {
   onDetailLoaded?: (url: string, detail: JobDetail) => void
   expandedClusters: Set<string>
   onToggleCluster: (key: string) => void
+  onReportIneligible: (url: string, tableId: string) => Promise<void>
 }
 
 /**
@@ -847,6 +858,7 @@ export function ClusteredTableBody({
   onDetailLoaded,
   expandedClusters,
   onToggleCluster,
+  onReportIneligible,
 }: ClusteredTableBodyProps) {
   return (
     <>
@@ -896,6 +908,7 @@ export function ClusteredTableBody({
                       onToggleSelect={onToggleSelect}
                       onToggleOpen={onToggleOpen}
                       onDetailLoaded={onDetailLoaded}
+                      onReportIneligible={onReportIneligible}
                     />
                   )
                 })}
@@ -915,6 +928,7 @@ export function ClusteredTableBody({
             onToggleSelect={onToggleSelect}
             onToggleOpen={onToggleOpen}
             onDetailLoaded={onDetailLoaded}
+            onReportIneligible={onReportIneligible}
           />
         )
       })}

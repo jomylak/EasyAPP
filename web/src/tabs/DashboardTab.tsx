@@ -35,10 +35,19 @@ export function DashboardTab() {
   const [statsError, setStatsError] = useState<string | null>(null)
   const { run, live } = useRunStream()
   const [stopping, setStopping] = useState(false)
-  // Which worker's row is expanded to show its live view, if any -- at most
-  // one at a time, so opening a second live view doesn't quietly double the
-  // number of screencast sessions running on the VM.
-  const [expandedWorker, setExpandedWorker] = useState<number | null>(null)
+  const [resuming, setResuming] = useState(false)
+  // Which workers' rows are expanded to show their live view -- any number
+  // at once, so checking on one worker doesn't collapse another you already
+  // had open.
+  const [expandedWorkers, setExpandedWorkers] = useState<Set<number>>(new Set())
+  function toggleWorkerExpanded(workerId: number) {
+    setExpandedWorkers((prev) => {
+      const next = new Set(prev)
+      if (next.has(workerId)) next.delete(workerId)
+      else next.add(workerId)
+      return next
+    })
+  }
 
   function refreshStats() {
     api
@@ -62,6 +71,19 @@ export function DashboardTab() {
       await api.stopAll()
     } finally {
       setStopping(false)
+      refreshStats()
+    }
+  }
+
+  // A no-op if the worker pool is already running (see api.launch's doc
+  // comment) -- so this is safe to hit any time the queue looks stuck, not
+  // just when the pool has fully died.
+  async function resumeQueue() {
+    setResuming(true)
+    try {
+      await api.launch("")
+    } finally {
+      setResuming(false)
       refreshStats()
     }
   }
@@ -162,6 +184,9 @@ export function DashboardTab() {
                 {(run?.totals.cost ?? 0).toFixed(2)}
               </span>
             )}
+            <button className="btn" disabled={resuming} onClick={resumeQueue}>
+              {resuming ? "Resuming…" : "Resume queue"}
+            </button>
             <button className="btn" disabled={!live || stopping} onClick={stopAll}>
               {stopping ? "Stopping…" : "Stop all"}
             </button>
@@ -176,12 +201,12 @@ export function DashboardTab() {
 
         {live &&
           run?.workers.map((w) => {
-            const isOpen = expandedWorker === w.worker_id
+            const isOpen = expandedWorkers.has(w.worker_id)
             return (
               <div className={`worker-exp${isOpen ? " open" : ""}`} key={w.worker_id}>
                 <div
                   className="worker-row worker-row-clickable"
-                  onClick={() => setExpandedWorker(isOpen ? null : w.worker_id)}
+                  onClick={() => toggleWorkerExpanded(w.worker_id)}
                 >
                   <span className="worker-id">#{w.worker_id}</span>
                   <span className="worker-status">

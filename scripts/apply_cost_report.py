@@ -157,7 +157,9 @@ def _change_windows(since: str) -> list[tuple[str, str]]:
             for line in fh:
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) >= 3 and parts[0] > since:
-                    wins.append((parts[0], parts[2]))
+                    # 4th column (the deploy note) says what changed; older
+                    # lines only have the commit subject.
+                    wins.append((parts[0], f"{parts[1]} {parts[3] if len(parts) > 3 else parts[2]}"))
     return sorted(wins)
 
 

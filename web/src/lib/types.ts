@@ -212,6 +212,12 @@ export interface GlobalFilters {
   // Internship season: "spring" | "summer" | null.
   term: string | null
   q: string
+  // Narrows to jobs reposted at most this many times (0 = never reposted).
+  // null (default) applies no filter -- every job shows regardless of its
+  // repost count. Reposts themselves are never individually selectable or
+  // shown as separate rows either way -- this only narrows which canonical
+  // row shows, same as any other min/max pill. See queries.py's dup_count.
+  max_reposts: number | null
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +232,10 @@ export interface Stats {
   // applications) -- use this one for a success-rate calc, not `applied`.
   bot_applied: number
   failed: number
+  // Precheck/browser-discovered expired postings -- excluded from `failed`
+  // and the success-rate donut, since the posting was gone before the bot
+  // ever got a real attempt at it.
+  expired: number
   queued: number
   in_progress: number
   manual: number
@@ -431,6 +441,7 @@ export const EMPTY_GLOBAL_FILTERS: GlobalFilters = {
   location: null,
   term: null,
   q: "",
+  max_reposts: null,
 }
 
 export interface IpGroupStat {

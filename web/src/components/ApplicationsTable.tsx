@@ -10,6 +10,7 @@ const STATUS_LABEL: Record<string, string> = {
   queued: "Queued",
   in_progress: "In progress",
   manual: "Manual",
+  expired: "Expired",
 }
 
 const POST_APPLY_LABEL: Record<string, string> = {
@@ -28,6 +29,7 @@ const STATUS_PILLS: { id: string | null; label: string }[] = [
   { id: "queued", label: "Queued" },
   { id: "in_progress", label: "In progress" },
   { id: "manual", label: "Manual" },
+  { id: "expired", label: "Expired" },
 ]
 
 type SortKey = "when" | "applied_at" | "cost" | "status" | "backend" | "company" | "queue" | "outcome"
@@ -112,6 +114,8 @@ export function ApplicationsTable({ live }: { live: boolean }) {
   const [reportNote, setReportNote] = useState("")
   const [reportResult, setReportResult] = useState<{ url: string; text: string } | null>(null)
   const debouncedSearch = useDebounced(search, 200)
+  const [gmailScanning, setGmailScanning] = useState(false)
+  const [gmailResult, setGmailResult] = useState<string | null>(null)
 
   // Dragging only makes sense over the exact set the reorder call will
   // persist against -- the full queued list, in priority order, with
@@ -247,6 +251,26 @@ export function ApplicationsTable({ live }: { live: boolean }) {
     return sortKey === key ? (sortDesc ? " ▾" : " ▴") : ""
   }
 
+  // Manual trigger for the same Gmail sweep the pipeline runs on a timer --
+  // lives here rather than the run panel above since it's about applied/
+  // failed jobs, not the worker pool.
+  async function syncGmail() {
+    setGmailScanning(true)
+    setGmailResult(null)
+    try {
+      const res = await api.gmailScan()
+      setGmailResult(
+        `${res.emails} emails · ${res.updated} updated · ${res.new_manual} self-applied found` +
+          (res.ambiguous ? ` · ${res.ambiguous} ambiguous` : ""),
+      )
+      refresh()
+    } catch (e) {
+      setGmailResult(`Scan failed: ${String(e)}`)
+    } finally {
+      setGmailScanning(false)
+    }
+  }
+
   function selectQueuedPill() {
     setStatusFilter("queued")
     setSortKey("queue")
@@ -278,6 +302,16 @@ export function ApplicationsTable({ live }: { live: boolean }) {
         <span className="daycount">
           {visible.length} of {rows.length} rows{loading ? " · loading…" : ""}
         </span>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+          {gmailResult && (
+            <span style={{ fontSize: 11.5, color: "var(--a-text-3)", fontFamily: "var(--mono)" }}>
+              {gmailResult}
+            </span>
+          )}
+          <button className="btn" disabled={gmailScanning} onClick={syncGmail}>
+            {gmailScanning ? "Scanning Gmail…" : "Sync Gmail"}
+          </button>
+        </div>
       </div>
 
       <div className="gfilter" style={{ borderBottom: "none", paddingBottom: 4 }}>
@@ -357,6 +391,12 @@ export function ApplicationsTable({ live }: { live: boolean }) {
               // usual JobExpansion has nothing to show. See
               // scripts/scan_gmail_status.py's module docstring.
               const isSelfReported = r.apply_backend === "manual" && status === "applied"
+              // Not a real apply_status -- a precheck-expired posting is
+              // still stored as 'failed' (see queries.stats()'s same
+              // split), so it's read off apply_error instead.
+              const isExpired = status === "failed" && (r.apply_error ?? "").startsWith("expired")
+              const badgeClass = isExpired ? "expired" : status
+              const badgeLabel = isExpired ? "Expired" : STATUS_LABEL[status] ?? status
               return (
                 <Fragment key={r.url}>
                 <tr
@@ -396,7 +436,7 @@ export function ApplicationsTable({ live }: { live: boolean }) {
                     )}
                   </td>
                   <td>
-                    <span className={`badge ${status}`}>{STATUS_LABEL[status] ?? status}</span>
+                    <span className={`badge ${badgeClass}`}>{badgeLabel}</span>
                     {status === "failed" && r.apply_error && (
                       <div
                         title={r.apply_error}

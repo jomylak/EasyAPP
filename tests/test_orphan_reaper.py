@@ -38,3 +38,15 @@ def test_stale_profile_dirs(tmp_path, monkeypatch):
 
     rows = [(10, 10, 600, CH.format(1))]  # worker-1 has a live Chrome
     assert [d.name for d in r.stale_profile_dirs(rows)] == ["worker-9"]
+
+
+def test_worker_with_live_agent_is_never_reaped():
+    """No in_progress row, but its goose MCP server is still attached to the
+    CDP port -> the run is live, keep its Chrome."""
+    rows = [
+        (10, 10, 600, CH.format(3)),
+        (11, 11, 600, "node .../@playwright/mcp/cli.js --cdp-endpoint=http://localhost:9225 --viewport-size=1280,800"),
+    ]
+    live = set() | r.driven_workers(rows)
+    assert live == {3}
+    assert r.orphans(rows, live, True) == {}

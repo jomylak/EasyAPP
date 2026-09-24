@@ -95,8 +95,8 @@ def _swap(ip: str) -> list[dict]:
 
 
 def _write_env(px: list[dict]) -> None:
-    keep = [l for l in config.ENV_PATH.read_text().splitlines()
-            if not re.match(r"APPLY_PROXY_\d+=", l)]
+    keep = [ln for ln in config.ENV_PATH.read_text().splitlines()
+            if not re.match(r"APPLY_PROXY_\d+=", ln)]
     new = {}
     for w in range(SLOTS):
         p = px[w % len(px)]

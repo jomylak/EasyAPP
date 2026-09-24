@@ -66,6 +66,18 @@ _primaries_done = threading.Event()
 _busy: set[int] = set()
 # How often an idle queued worker re-checks for new jobs while a peer is busy.
 IDLE_POLL = 10
+# Empty polls the home-fallback worker will sit through waiting for
+# _primaries_done before giving up on its own. Primaries normally finish and
+# set that event within a poll or two (see worker_loop's other exit branch),
+# so this is a safety net for the case where they don't -- observed once
+# (2026-09-22) coinciding with a mid-run deploy, where the home worker polled
+# for 7.5h with the event never set, keeping run_is_live() true and silently
+# no-op'ing every /api/launch call in the meantime. 20 polls bounds that to
+# minutes instead of hours; the next /api/launch call starts a fresh run.
+HOME_FALLBACK_MAX_EMPTY_POLLS = 20
+# Consecutive browser-infrastructure failures (outcomes.is_infra_failure)
+# before a worker gives up for this run instead of re-claiming.
+INFRA_STREAK_LIMIT = 3
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -765,7 +777,11 @@ def mark_result(url: str, status: str, error: str | None = None,
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         error = error or "unknown"
         review_status = _classify_review_status(error)
-        conn.execute(f"""
+        # 'applied' is terminal: a failure reported later for the same row
+        # (a duplicate/killed sibling run finishing after the real success)
+        # must not erase it -- that happened to Roku on 2026-09-22 and left a
+        # genuinely submitted job eligible to be applied to again.
+        cur = conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_error_category = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
@@ -776,12 +792,15 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_output_tokens = COALESCE(apply_output_tokens, 0) + ?,
                            apply_cache_read_tokens = COALESCE(apply_cache_read_tokens, 0) + ?,
                            apply_cost_usd = COALESCE(apply_cost_usd, 0) + ?
-            WHERE url = ?
+            WHERE url = ? AND apply_status IS NOT 'applied'
         """, (status, error, normalize_failure_reason(error), duration_ms,
               task_id, review_status,
               backend, llm_requests or 0, stats.get("input_tokens") or 0,
               stats.get("output_tokens") or 0, stats.get("cache_read_tokens") or 0,
               stats.get("cost_usd") or 0, url))
+        if cur.rowcount == 0:
+            logger.warning("Not overwriting applied job with %s:%s -- %s",
+                           status, error, url[:80])
     conn.commit()
 
 
@@ -799,6 +818,31 @@ def _restore_status(job: dict) -> None:
         (job.get("prior_status"), job.get("prior_applied_at"), job["url"]),
     )
     conn.commit()
+
+
+def record_run(job: dict, worker_id: int, started_at: str, result: str,
+               duration_ms: int | None, backend: str, dry_run: bool,
+               stats: dict | None = None) -> None:
+    """Append one attempt to apply_runs (see database.init_db). Never raises:
+    losing a history row must not fail an apply that already happened."""
+    stats = stats or {}
+    outcome, _, reason = result.partition(":")
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO apply_runs (url, started_at, finished_at, worker, outcome, "
+            "reason, dry_run, backend, model, harness, llm_requests, input_tokens, "
+            "output_tokens, cache_read_tokens, cost_usd, duration_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job["url"], started_at, datetime.now(timezone.utc).isoformat(),
+             worker_id, outcome, reason or None, int(dry_run), backend,
+             stats.get("model"), prompt_mod.harness_version(),
+             stats.get("llm_requests"), stats.get("input_tokens"),
+             stats.get("output_tokens"), stats.get("cache_read_tokens"),
+             stats.get("cost_usd"), duration_ms))
+        conn.commit()
+    except Exception:
+        logger.exception("Could not record apply_runs row for %s", job["url"][:80])
 
 
 def release_lock(url: str) -> None:
@@ -1052,6 +1096,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     applied = 0
     failed = 0
     captcha_hits = 0  # this worker's static proxy hitting a captcha wall -- see below
+    infra_streak = 0  # consecutive browser-infra failures -- see INFRA_STREAK_LIMIT
     attempted: set[str] = set()  # this session only -- see acquire_job docstring
     continuous = limit == 0
     jobs_done = 0
@@ -1083,6 +1128,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 add_event(f"[W{worker_id}] Queue empty")
                 update_state(worker_id, status="done", last_action="queue empty")
                 break
+            if home_fallback and empty_polls >= HOME_FALLBACK_MAX_EMPTY_POLLS:
+                add_event(f"[W{worker_id}] Queue empty, giving up "
+                          f"(primaries never signalled done)")
+                update_state(worker_id, status="done", last_action="gave up waiting")
+                break
             empty_polls += 1
             update_state(worker_id, status="idle",
                          last_action=f"polling ({empty_polls})")
@@ -1095,6 +1145,17 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
         empty_polls = 0
         attempted.add(job["url"])
+        # Claimed but not yet handed to the backend -- goose.py only flips
+        # status to 'applying' once its subprocess is actually up (Chrome
+        # launch, proxy handshake, MCP extension install can all take real
+        # wall-clock time first). Without this, the dashboard keeps showing
+        # this worker's *previous* outcome (often 'failed') for that whole
+        # setup window even though it's visibly already working the new job.
+        update_state(worker_id, status="applying", job_title=job["title"],
+                     company=job.get("company") or "",
+                     company_tier=job.get("company_tier"),
+                     score=job.get("fit_score") or 0,
+                     last_action="claimed, starting up")
 
         if not dry_run:
             # Catch a closed/expired listing with a plain page fetch before
@@ -1122,8 +1183,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         # (2026-09-18: 3 of 8 simultaneous first-turn calls to the same cheap
         # model timed out). Unconditional and per-job rather than trying to
         # detect "are other workers also idle right now" -- correct either
-        # way, and 10-20s is nothing against jobs that run for minutes.
-        if _stop_event.wait(timeout=random.uniform(10, 20)):
+        # way, and jobs run for minutes so a bit more scatter costs nothing.
+        # Widened from 10-20s on 2026-09-22: with 8-9 workers each rolling
+        # independently in a 10s window, 2-3 landing in the same 60s bucket
+        # is the expected birthday-paradox outcome, not a jitter failure --
+        # confirmed against Webshare's own stats (peak proxy concurrency ~59
+        # and failure rate 5x'd in the same hour). A wider window spreads
+        # launches further apart without meaningfully delaying throughput.
+        if _stop_event.wait(timeout=random.uniform(15, 45)):
             break
 
         chrome_proc = None
@@ -1141,11 +1208,14 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             chrome_proc, humanizer_stop = _relaunch_chrome(
                 worker_id, port, headless, humanizer_stop, home_fallback=home_fallback)
 
+            started_at = datetime.now(timezone.utc).isoformat()
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                           model=model, dry_run=dry_run,
                                           backend=backend)
             run_stats = get_backend(backend).pop_run_stats(worker_id)
             used_backend = backend
+            record_run(job, worker_id, started_at, result, duration_ms,
+                       used_backend, dry_run, run_stats)
 
             if result.split(":", 1)[-1].strip().lower() == "captcha":
                 captcha_hits += 1
@@ -1176,13 +1246,31 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                     break
                 continue
             elif result == "applied":
+                infra_streak = 0
                 mark_result(job["url"], "applied", duration_ms=duration_ms,
                             backend=used_backend, llm_requests=llm_requests,
                             stats=run_stats)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+            elif outcomes.is_infra_failure(result.split(":", 1)[-1]):
+                # Our browser died, not the job: put the row back untouched
+                # (no attempt counted) and back off, and stop this worker if
+                # it keeps happening rather than burning the queue.
+                _restore_status(job)
+                infra_streak += 1
+                add_event(f"[W{worker_id}] Browser infra failure ({infra_streak}/"
+                          f"{INFRA_STREAK_LIMIT}), job released: {job['title'][:28]}")
+                if infra_streak >= INFRA_STREAK_LIMIT:
+                    add_event(f"[W{worker_id}] Stopping: browser keeps failing")
+                    update_state(worker_id, status="done",
+                                 last_action="stopped: repeated browser failures")
+                    break
+                if _stop_event.wait(timeout=30):
+                    break
+                continue
             else:
+                infra_streak = 0
                 reason = result.split(":", 1)[-1] if ":" in result else result
                 permanent = _is_permanent_failure(result)
                 if reason.strip().lower() in ("captcha", "proxy_dropped") and not home_fallback:
@@ -1288,6 +1376,13 @@ def main(limit: int = 1, target_url: str | None = None,
     except (ValueError, RuntimeError) as exc:
         console.print(f"[red]Cannot use --backend {backend}:[/red]\n{escape(str(exc))}")
         raise SystemExit(1)
+
+    if backend == "goose":
+        # Warm the shared npx cache once, serially, before any worker can
+        # race a concurrent install into it (see goose.py's docstring on
+        # PLAYWRIGHT_MCP_VERSION).
+        from applypilot.apply.backends.goose import ensure_playwright_mcp_cached
+        ensure_playwright_mcp_cached()
 
     if continuous:
         effective_limit = 0

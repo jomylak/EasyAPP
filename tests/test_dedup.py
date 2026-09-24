@@ -22,8 +22,8 @@ def _insert(conn, url, **cols):
 
 
 def _row(conn, url):
-    return conn.execute("SELECT duplicate_of, group_id, fit_score, full_description "
-                        "FROM jobs WHERE url = ?", (url,)).fetchone()
+    return conn.execute("SELECT duplicate_of, group_id, fit_score, full_description, "
+                        "reported_ineligible_at FROM jobs WHERE url = ?", (url,)).fetchone()
 
 
 @pytest.fixture
@@ -46,6 +46,24 @@ def test_reposted_ats_job_id_keeps_newest_visible_and_never_cycles(db):
     assert _row(db, "old")["duplicate_of"] == "new"
     assert _row(db, "new")["duplicate_of"] is None
     assert _row(db, "old")["group_id"] == _row(db, "new")["group_id"] is not None
+
+
+def test_reported_ineligible_carries_onto_a_newer_repost(db):
+    # A repost that shows up AFTER the manual flag was set normally wins
+    # _recency and becomes the new visible rep -- the flag must travel with
+    # it, or "report ineligible" would silently stop working after one repost.
+    _insert(db, "old", ats="Oracle HCM", application_url=ORACLE.format("a"),
+            posted_date="2026-09-01T00:00:00+00:00")
+    dedup.link(db, "old")
+    db.execute("UPDATE jobs SET reported_ineligible_at = ? WHERE url = ?",
+               ("2026-09-02T00:00:00+00:00", "old"))
+    db.commit()
+    _insert(db, "new", ats="Oracle HCM", application_url=ORACLE.format("b"),
+            posted_date="2026-09-15T00:00:00+00:00")
+    dedup.link(db, "new")
+    assert _row(db, "new")["reported_ineligible_at"] == "2026-09-02T00:00:00+00:00"
+    assert _row(db, "new")["duplicate_of"] is None
+    assert _row(db, "old")["duplicate_of"] == "new"
 
 
 def test_same_ats_id_but_different_title_is_not_a_duplicate(db):
@@ -110,15 +128,29 @@ def test_never_matches_across_companies(db):
     assert _row(db, "a")["group_id"] is None and _row(db, "b")["duplicate_of"] is None
 
 
-def test_discovery_time_repost_inherits_enrichment_and_score(db):
+def test_discovery_time_repost_does_not_inherit_before_its_own_enrichment(db):
+    # Regression: dedup.link runs at discovery time too (smartextract.py's
+    # _safe_link), before enrichment ever gets a chance to scrape a brand-new
+    # repost. A same-blurb match against an already-enriched older row used
+    # to merge here and silently inherit that older row's (possibly
+    # weeks-stale) full_description/score -- confirmed live on a Booz Allen
+    # posting whose graduation-window language had since changed. Both must
+    # stay visible and un-merged until "new" gets its own full_description.
     _insert(db, "old", full_description=DESC, fit_score=9,
             discovered_at="2026-09-01T00:00:00+00:00")
     _insert(db, "new", discovered_at="2026-09-10T00:00:00+00:00")  # same blurb, not enriched
     result = dedup.link(db, "new")
     assert result["duplicate_of"] is None
-    assert _row(db, "old")["duplicate_of"] == "new"
+    assert _row(db, "old")["duplicate_of"] is None
     new = _row(db, "new")
-    assert new["fit_score"] == 9 and new["full_description"] == DESC
+    assert new["fit_score"] is None and new["full_description"] is None
+
+    # Once "new" gets its own real scrape (identical text -- a genuine
+    # repost), re-running link() now correctly merges them full-to-full.
+    db.execute("UPDATE jobs SET full_description = ? WHERE url = 'new'", (DESC,))
+    db.commit()
+    dedup.link(db, "new")
+    assert _row(db, "old")["duplicate_of"] == "new"
 
 
 def test_backfill_rebuilds_from_scratch(db):
@@ -164,6 +196,17 @@ def test_workday_repost_suffix_and_non_prefixed_req_ids_resolve_to_one_job(db):
     dedup.link(db, "a")
     dedup.link(db, "b")
     assert _row(db, "a")["duplicate_of"] == "b" and _row(db, "b")["duplicate_of"] is None
+
+
+def test_link_does_not_commit_inside_a_callers_transaction(db):
+    # acquire_job calls link() from inside its own BEGIN IMMEDIATE claim
+    # transaction. A commit here would drop that lock early and let a second
+    # worker claim the same row -- see dedup.link's docstring comment.
+    _insert(db, "solo")
+    db.execute("BEGIN IMMEDIATE")
+    dedup.link(db, "solo")
+    assert db.in_transaction
+    db.rollback()
 
 
 def test_generic_employer_id_extraction():

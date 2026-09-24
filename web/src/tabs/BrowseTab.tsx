@@ -19,9 +19,10 @@ interface Props {
   selectedTypes: Map<string, string | null>
   onToggleSelect: (url: string, jobType: string | null, tableId: string, posted: string | null) => void
   removedUrls: RemovedUrls
+  onReportIneligible: (url: string, tableId: string) => Promise<void>
 }
 
-export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls }: Props) {
+export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls, onReportIneligible }: Props) {
   const [days, setDays] = useState<DayBucket[] | null>(null)
   const [facets, setFacets] = useState<Facets | null>(null)
   const [globalFilters, setGlobalFilters] = useState<GlobalFilters>(EMPTY_GLOBAL_FILTERS)
@@ -62,6 +63,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
         likely_terminal_only: filters.likely_terminal_only,
         eligible_only: filters.eligible_only, tier_only: filters.tier_only,
         location: filters.location, term: filters.term,
+        max_reposts: filters.max_reposts,
       })
       .then((d) => {
         setDays(d.days)
@@ -158,6 +160,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
             removedUrls={removedUrls}
+            onReportIneligible={onReportIneligible}
           />
           <AttentionPanel
             title="Top New Grad"
@@ -172,6 +175,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             boxHeight={attentionBoxHeight}
             onBoxHeightChange={setAttentionBoxHeight}
             removedUrls={removedUrls}
+            onReportIneligible={onReportIneligible}
           />
         </div>
       </div>
@@ -196,6 +200,7 @@ export function BrowseTab({ selected, selectedTypes, onToggleSelect, removedUrls
             selected={selected}
             onToggleSelect={onToggleSelect}
             removedUrls={removedUrls}
+            onReportIneligible={onReportIneligible}
           />
         ))}
       </div>

@@ -39,7 +39,6 @@ import sys
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
 
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod
@@ -55,6 +54,31 @@ logger = logging.getLogger(__name__)
 _goose_procs: dict[int, subprocess.Popen] = {}
 _goose_stats: dict[int, dict] = {}  # worker_id -> last run's token accounting
 _goose_lock = threading.Lock()
+
+# Pinned, not @latest: every worker's `npx @playwright/mcp@latest` re-resolves
+# and touches the *same* shared ~/.npm/_npx/<hash>/ cache dir. When several
+# workers cold-install concurrently (pipeline boot, or several jobs finishing
+# together), npm's install-then-rename races: one worker reads a file another
+# is still writing (SyntaxError: Unexpected end of input) or the rename
+# itself collides (ENOTEMPTY). A pinned version lets ensure_playwright_mcp_cached()
+# warm the cache once, serially, before workers start -- after that every
+# worker's npx is a cache hit, not an install, so there's nothing left to race.
+PLAYWRIGHT_MCP_VERSION = "0.0.82"
+
+
+def ensure_playwright_mcp_cached() -> None:
+    """Pre-warm the shared npx cache for PLAYWRIGHT_MCP_VERSION, serially,
+    before any worker launches. Best-effort -- if this fails, workers still
+    fall back to installing it themselves (just with the race described
+    above), so a network hiccup here shouldn't block pipeline startup.
+    """
+    try:
+        subprocess.run(
+            ["npx", "--yes", f"@playwright/mcp@{PLAYWRIGHT_MCP_VERSION}", "--version"],
+            capture_output=True, timeout=120,
+        )
+    except Exception as e:
+        logger.warning("Playwright MCP cache pre-warm failed (workers will install individually): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +106,7 @@ def _extension_args(cdp_port: int, dry_run: bool = False) -> list[str]:
     max_bytes = config.DEFAULTS["playwright_output_max_bytes"]
     return [
         "--with-extension",
-        f"playwright:npx @playwright/mcp@latest "
+        f"playwright:npx @playwright/mcp@{PLAYWRIGHT_MCP_VERSION} "
         f"--cdp-endpoint=http://localhost:{cdp_port} --viewport-size={viewport} "
         f"--output-dir={out_dir} --output-max-size={max_bytes}",
         "--with-extension",
@@ -320,6 +344,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     cdp_dead = threading.Event()
     timed_out = threading.Event()
     over_budget = threading.Event()
+    user_stopped = threading.Event()
 
     try:
         # New process group on Unix so _kill_process_tree (os.killpg) tears
@@ -342,6 +367,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             cwd=str(worker_dir),
             **popen_kwargs,
         )
+        (config.APP_DIR / f"stop-w{worker_id}").unlink(missing_ok=True)  # stale flag from a past click
         with _goose_lock:
             _goose_procs[worker_id] = proc
 
@@ -351,9 +377,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _watch_cdp() -> None:
             import socket
             misses = 0
-            while not done.wait(10):
+            ticks = 0
+            stop_flag = config.APP_DIR / f"stop-w{worker_id}"
+            while not done.wait(1):
                 if proc.poll() is not None:
                     return
+                if stop_flag.exists():
+                    stop_flag.unlink(missing_ok=True)
+                    logger.warning("[worker-%d] stop requested from dashboard", worker_id)
+                    user_stopped.set()
+                    cdp_dead.set()
+                    _kill_process_tree(proc.pid)
+                    return
+                ticks += 1
+                if ticks % 10:
+                    continue
                 sock = socket.socket()
                 try:
                     sock.settimeout(2)
@@ -397,7 +435,10 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # Byte cap: a run pulling far more than the ~2-3MB norm through the
         # metered proxy is looping on heavy pages, not applying.
         def _watch_bytes() -> None:
-            cap = (settings.get("goose_max_mb") or config.DEFAULTS["goose_max_mb"]) * 1_000_000
+            cap_mb = settings.get("goose_max_mb", config.DEFAULTS["goose_max_mb"])
+            if cap_mb is None:
+                return
+            cap = cap_mb * 1_000_000
             while not done.wait(15):
                 if proc.poll() is not None:
                     return
@@ -579,7 +620,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         # process just exits once goose decides to stop). Only for a run that
         # got far enough to have real signal -- a handful of tool calls before
         # stopping is more likely a slow page than a pattern worth caching.
-        if not self_reported_issue and job_ats and "RESULT:" not in output and tool_calls >= 8:
+        if not self_reported_issue and job_ats and not user_stopped.is_set() and "RESULT:" not in output and tool_calls >= 8:
             if over_budget.is_set():
                 reason = "byte cap"
             elif timed_out.is_set():
@@ -602,6 +643,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     # calls + the opening turn is the request count. Goose
                     # reports no turn counter of its own in stream-json.
                     "llm_requests": tool_calls + 1,
+                    "model": goose_model,
                     "input_tokens": stats.get("input_tokens"),
                     "output_tokens": stats.get("output_tokens"),
                     "cache_read_tokens": stats.get("cache_read"),
@@ -627,6 +669,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             with _goose_lock:
                 _goose_stats[worker_id] = {
                     "llm_requests": tool_calls + 1,
+                    "model": goose_model,
                     "input_tokens": None,
                     "output_tokens": None,
                     "cache_read_tokens": None,
@@ -675,6 +718,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             add_event(f"[W{worker_id}] OVER BYTE CAP ({elapsed}s)")
             update_state(worker_id, status="failed", last_action="over byte cap")
             return "failed:bandwidth", duration_ms
+
+        if user_stopped.is_set():
+            add_event(f"[W{worker_id}] STOPPED by user ({elapsed}s)")
+            update_state(worker_id, status="failed", last_action="stopped by user")
+            return "failed:user_stopped", duration_ms
 
         if cdp_dead.is_set():
             add_event(f"[W{worker_id}] BROWSER DIED ({elapsed}s)")

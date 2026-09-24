@@ -18,15 +18,26 @@ Two conventions matter here:
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from applypilot import company_limits
-from applypilot.database import _DAY_EXPR, get_connection
+from applypilot.database import _DAY_EXPR, _LOCAL_TZ, get_connection
 
 # What the browse table shows per row. Deliberately excludes full_description:
 # a day of 400 rows would carry megabytes of prose nobody has expanded yet.
 # view.py inlined every description into one page and produced a 21 MB file.
+# How many earlier postings of this exact job were merged into it (see
+# dedup.link) -- distinct (employer job id, or a Jobright id if no employer id
+# was resolved) + date combos, so the same repost re-scraped twice doesn't
+# double count. Shared between _ROW_COLUMNS (the "seen before" chip) and
+# _filter_clauses' max_reposts filter so the two can never disagree about
+# what a repost count means.
+_DUP_COUNT_EXPR = """
+    SELECT COUNT(DISTINCT COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at))) FROM jobs d WHERE d.duplicate_of = jobs.url
+       AND COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at)) != COALESCE(NULLIF(jobs.ats_job_id, ''), CASE WHEN instr(jobs.url, 'info/') > 0 THEN substr(jobs.url, instr(jobs.url, 'info/') + 5, 24) ELSE jobs.url END) || '|' || date(COALESCE(jobs.posted_date, jobs.discovered_at))
+"""
+
 _ROW_COLUMNS = f"""
     url, title, company, site, location, salary, pay_text,
     fit_score, desirability_score, company_prestige, company_tier,
@@ -39,8 +50,7 @@ _ROW_COLUMNS = f"""
     queue_batch, queue_position, tailored_resume_path,
     {_DAY_EXPR} AS day,
     COALESCE(posted_date, discovered_at) AS posted,
-    (SELECT COUNT(DISTINCT COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at))) FROM jobs d WHERE d.duplicate_of = jobs.url
-       AND COALESCE(NULLIF(d.ats_job_id, ''), CASE WHEN instr(d.url, 'info/') > 0 THEN substr(d.url, instr(d.url, 'info/') + 5, 24) ELSE d.url END) || '|' || date(COALESCE(d.posted_date, d.discovered_at)) != COALESCE(NULLIF(jobs.ats_job_id, ''), CASE WHEN instr(jobs.url, 'info/') > 0 THEN substr(jobs.url, instr(jobs.url, 'info/') + 5, 24) ELSE jobs.url END) || '|' || date(COALESCE(jobs.posted_date, jobs.discovered_at))) AS dup_count,
+    ({_DUP_COUNT_EXPR}) AS dup_count,
     (SELECT COUNT(DISTINCT COALESCE(NULLIF(g.ats_job_id, ''), CASE WHEN instr(g.url, 'info/') > 0 THEN substr(g.url, instr(g.url, 'info/') + 5, 24) ELSE g.url END) || '|' || date(COALESCE(g.posted_date, g.discovered_at))) FROM jobs g WHERE jobs.group_id IS NOT NULL
        AND g.group_id = jobs.group_id AND g.duplicate_of IS NULL AND g.url != jobs.url
        AND COALESCE(NULLIF(g.ats_job_id, ''), CASE WHEN instr(g.url, 'info/') > 0 THEN substr(g.url, instr(g.url, 'info/') + 5, 24) ELSE g.url END) || '|' || date(COALESCE(g.posted_date, g.discovered_at)) != COALESCE(NULLIF(jobs.ats_job_id, ''), CASE WHEN instr(jobs.url, 'info/') > 0 THEN substr(jobs.url, instr(jobs.url, 'info/') + 5, 24) ELSE jobs.url END) || '|' || date(COALESCE(jobs.posted_date, jobs.discovered_at))) AS location_count,
@@ -232,6 +242,11 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     # separate `applications()` query) is the only place these statuses are
     # meant to be visible.
     clauses.append("(apply_status IS NULL OR apply_status = 'failed')")
+    # Manual override from the "Report ineligible" button -- unconditional
+    # like the statuses above, not a pill, since the whole point is "stop
+    # showing me this and everything dedup ties to it" (dedup.link carries
+    # this onto future reposts of the same job, see its sticky-override step).
+    clauses.append("reported_ineligible_at IS NULL")
     # Same reasoning for confirmed duplicates: fit_gate_sql() already excludes
     # them from the ranked apply queue and from scoring/tailoring (see its
     # docstring), so Browse must exclude them unconditionally too -- otherwise
@@ -239,6 +254,15 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     # from its canonical row, even though nothing downstream re-checks
     # duplicate_of once a human, rather than the ranker, picked the job.
     clauses.append("duplicate_of IS NULL")
+    # "How many times has this survived posting been reposted" -- a narrowing
+    # filter on the canonical row itself (max_reposts=0 means "only jobs that
+    # have never been reposted"), not a way to unhide any individual repost
+    # row (those stay unconditionally hidden per the clause above; the "seen
+    # before" chip and JobExpansion's "Related postings" panel are still the
+    # only way to inspect them). None (the default) applies no filter.
+    if f.get("max_reposts") is not None:
+        clauses.append(f"({_DUP_COUNT_EXPR}) <= ?")
+        params.append(int(f["max_reposts"]))
     # A job with no scraped description can never be scored (scoring requires
     # full_description IS NOT NULL -- see scorer.py's pending_score gate) and
     # has nothing worth reviewing yet. Whether it's still queued for enrichment
@@ -249,10 +273,15 @@ def _filter_clauses(f: dict) -> tuple[str, list]:
     # counters are the right place to monitor these, not this table.
     clauses.append("full_description IS NOT NULL")
     if f.get("posted_within_days") is not None:
-        # Matches the expression `idx_jobs_day` is built on byte-for-byte, so
-        # this range scan can use that index instead of a full table scan.
-        clauses.append(f"{_DAY_EXPR} >= date('now', ?)")
-        params.append(f"-{int(f['posted_within_days'])} days")
+        # Compared against a literal Eastern-time cutoff date, not SQL's own
+        # date('now', ?) -- that's a UTC calendar date and would disagree
+        # with _DAY_EXPR (local_date(...), Eastern) by up to a day right
+        # around the UTC/Eastern midnight gap. Still hits idx_jobs_day: the
+        # index is built on the exact _DAY_EXPR text, and comparing that
+        # column to a bound parameter is exactly the range scan it's for.
+        cutoff = (datetime.now(_LOCAL_TZ) - timedelta(days=int(f["posted_within_days"]))).date().isoformat()
+        clauses.append(f"{_DAY_EXPR} >= ?")
+        params.append(cutoff)
     if f.get("q"):
         clauses.append("(title LIKE ? OR company LIKE ? OR keywords LIKE ?)")
         like = f"%{f['q']}%"
@@ -458,7 +487,15 @@ def stats(conn: sqlite3.Connection | None = None) -> dict:
                -- applied to this cycle regardless of who did it.
                SUM(apply_status = 'applied' AND (apply_backend IS NULL OR apply_backend != 'manual'))
                                                                           AS bot_applied,
-               SUM(apply_status = 'failed')                              AS failed,
+               -- Excludes precheck/browser-discovered expired postings: an
+               -- expired listing was never a bot failure to begin with (the
+               -- posting was gone before a worker even tried), so counting
+               -- it toward 'failed' understated the success rate for every
+               -- job the bot actually attempted. Tracked separately below.
+               SUM(apply_status = 'failed' AND apply_error_category != 'expired')
+                                                                          AS failed,
+               SUM(apply_status = 'failed' AND apply_error_category = 'expired')
+                                                                          AS expired,
                SUM(apply_status = 'queued')                              AS queued,
                SUM(apply_status = 'in_progress')                         AS in_progress,
                SUM(apply_status = 'manual')                              AS manual,
@@ -482,7 +519,16 @@ def applications(status: str | None = None, limit: int = 200,
     conn = conn or get_connection()
     where = "apply_status IS NOT NULL"
     params: list = []
-    if status:
+    # 'expired' isn't a real apply_status (precheck failures are still stored
+    # as 'failed' -- see stats()'s same split), so it needs its own clause
+    # rather than the plain equality below. 'failed' excludes them the same
+    # way stats() does, so the Applications tab's Failed pill matches what
+    # the dashboard tiles call a failure.
+    if status == "expired":
+        where += " AND apply_status = 'failed' AND apply_error_category = 'expired'"
+    elif status == "failed":
+        where += " AND apply_status = 'failed' AND (apply_error_category IS NULL OR apply_error_category != 'expired')"
+    elif status:
         where += " AND apply_status = ?"
         params.append(status)
     rows = conn.execute(
@@ -634,7 +680,9 @@ def data_stats(path: Path | None = None, bins: int = 12) -> dict:
     if not mbs:
         return {**out, "avg_mb": 0, "p50_mb": 0, "p90_mb": 0, "max_mb": 0, "histogram": []}
     s = sorted(mbs)
-    pct = lambda q: s[min(len(s) - 1, int(q * len(s)))]
+
+    def pct(q):
+        return s[min(len(s) - 1, int(q * len(s)))]
     # Equal-width bins up to p95 (last bin also holds the outlier tail), so one
     # 40MB job doesn't flatten the whole 2-3MB distribution into a single bar.
     hi = max(pct(0.95), 0.1)
@@ -661,7 +709,7 @@ def ip_stats(path: Path | None = None, cutoff: int = FRAUD_CUTOFF) -> dict:
     """
     path = path or IP_HEALTH_LOG
     try:
-        rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+        rows = [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
     except FileNotFoundError:
         rows = []
     rows = [r for r in rows if isinstance(r, dict)]

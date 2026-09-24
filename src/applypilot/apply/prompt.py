@@ -5,6 +5,7 @@ how to fill out a job application form using Playwright MCP tools. All
 personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
+import hashlib
 import os
 import shutil
 from datetime import datetime
@@ -387,6 +388,8 @@ Read the result:
   specifically built to defeat exactly the kind of model driving this
   session -- do not attempt to solve it visually, do not retry. Output
   RESULT:FAILED:captcha immediately.
+- "error: ... unsolvable ... Output RESULT:CAPTCHA now" -> do exactly that,
+  immediately. No manual fallback, no retries, no more form filling.
 - "error: capsolver budget exhausted ..." or any other CapSolver-side failure
   -> MANUAL FALLBACK: try the audio/accessibility button, or solve a simple
   text/logic puzzle if that's what's actually shown ("What is 3+7?" -> solve
@@ -598,6 +601,25 @@ def _prepare_context(job: dict, cover_letter: str | None = None,
     }
 
 
+# Files whose content defines how an apply run behaves. Same list and order as
+# scripts/deploy_to_vm.sh, so the hash stamped into every prompt (and therefore
+# every Langfuse trace input) matches the deploy log's -- runs can be grouped by
+# the exact harness they ran with, including edits made directly on the VM.
+_HARNESS_FILES = ("prompt.py", "mcp_tools/server.py", "backends/goose.py",
+                  "launcher.py", "chrome.py", "outcomes.py")
+
+
+def harness_version() -> str:
+    here = Path(__file__).parent
+    h = hashlib.sha1()
+    for name in _HARNESS_FILES:
+        try:
+            h.update((here / name).read_bytes())
+        except OSError:
+            pass
+    return h.hexdigest()[:12]
+
+
 def build_prompt(job: dict, tailored_resume: str,
                  cover_letter: str | None = None,
                  dry_run: bool = False,
@@ -655,6 +677,7 @@ def build_prompt(job: dict, tailored_resume: str,
     prompt = f"""You are an autonomous job application agent. Your ONE mission: get this candidate an interview. You have all the information and tools. Think strategically. Act decisively. Submit the application.
 
 == JOB ==
+Harness: {harness_version()}
 URL: {job.get('application_url') or job['url']}
 Title: {job['title']}
 Company: {job.get('site', 'Unknown')}
@@ -902,7 +925,8 @@ layout.
   THE PAGE, not in Node: there is no `require`, no `import()`, no `process`,
   no `module`. Reaching for any of them throws instead of running, and that
   is the single most common way these two tools fail -- write plain browser
-  JS against `document`/`window` or don't use them.
+  JS against `document`/`window` or don't use them. There is no `setTimeout`
+  in browser_run_code_unsafe either: to wait there, `await page.waitForTimeout(ms)`.
 - A FIELD THAT RESISTS: do NOT retry the same action. Retrying is what burns runs.
   Snapshot the element and look at what it actually is, then match the pattern:
   * role="combobox" on an <input> (not a <select>) -> it is a FILTERABLE combobox.
