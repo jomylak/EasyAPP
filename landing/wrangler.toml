@@ -1,0 +1,8 @@
+name = "easyapp"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-09-01"
+
+# Create once: `npx wrangler kv namespace create WAITLIST`, paste the id here.
+[[kv_namespaces]]
+binding = "WAITLIST"
+id = "ad9dfd20cd3d4107a7601a7d90c62c11"
