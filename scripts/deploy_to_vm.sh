@@ -37,6 +37,15 @@ rsync -az --exclude='.git' --exclude='node_modules' --exclude='__pycache__' \
 echo "Installing orphan-reaper timer..."
 ssh "$VM_HOST" "sudo cp ~/ApplyPilot/scripts/orphan-reaper.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now orphan-reaper.timer"
 
+echo "Installing langfuse-retention timer..."
+ssh "$VM_HOST" "sudo cp ~/ApplyPilot/scripts/langfuse-retention.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now langfuse-retention.timer"
+
+echo "Installing langfuse-ch-log-trim timer..."
+ssh "$VM_HOST" "sudo cp ~/ApplyPilot/scripts/langfuse-ch-log-trim.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now langfuse-ch-log-trim.timer"
+
+echo "Installing langfuse-filter proxy..."
+ssh "$VM_HOST" "sudo cp ~/ApplyPilot/scripts/langfuse-filter.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable langfuse-filter.service && sudo systemctl restart langfuse-filter.service"
+
 echo "Capping serve stop timeout (a hung stop ends in SIGKILL)..."
 ssh "$VM_HOST" "sudo mkdir -p /etc/systemd/system/applypilot-serve.service.d && printf '[Service]\nTimeoutStopSec=15\n' | sudo tee /etc/systemd/system/applypilot-serve.service.d/timeout.conf >/dev/null && sudo systemctl daemon-reload"
 
